@@ -141,6 +141,7 @@ const api = {
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
+  resetProjectSecurity: () => call<AppState>('projects:resetSecurity'),
   getSessionImage: (id: string, assetId: string) => call<string | null>('sessions:image', { id, assetId }),
   getSession: (id: string, options?: { from?: number; before?: number; limit?: number }) =>
     call<SessionDetail>('sessions:events', { id, ...options }),

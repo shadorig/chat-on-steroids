@@ -6,10 +6,10 @@
  * would do. That prefix is pure overhead — it costs tokens on every call, and it is the
  * part the model is most likely to get subtly wrong.
  *
- * So a chat's workspace is *learned* from the absolute paths it already uses, and later
- * relative paths resolve against it. An explicit durable session project can initialize
- * this same cwd through the kernel; subsequent learned paths use the same owner. No
- * model-facing tool exists to select another session's workspace.
+ * So an unbound chat's workspace is *learned* from the absolute paths it already uses, and later
+ * relative paths resolve against it. An explicit durable Local Project is stronger and remains
+ * separate: filesystem policy uses that exact directory instead of this cache and refuses targets
+ * outside it. No model-facing tool exists to select another session's workspace or project.
  *
  * ## Why this is keyed the way it is
  *
@@ -47,7 +47,7 @@ const MAX_WORKSPACES = 64;
  * and nothing has been saved. Walking up to the nearest marker is what makes a relative
  * path mean the same thing it means in a terminal at the project root.
  */
-const PROJECT_MARKERS = ['.git', 'package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml', 'pom.xml'];
+const WORKSPACE_MARKERS = ['.git', 'package.json', 'pyproject.toml', 'go.mod', 'Cargo.toml', 'pom.xml'];
 
 export interface Workspace {
   /** Virtual path of the folder, e.g. `/project/chat-on-steroids`. */
@@ -251,7 +251,7 @@ async function isDirectory(real: string): Promise<boolean> {
 }
 
 async function hasMarker(real: string): Promise<boolean> {
-  for (const marker of PROJECT_MARKERS) {
+  for (const marker of WORKSPACE_MARKERS) {
     try {
       await fs.lstat(path.join(real, marker));
       return true;
@@ -263,13 +263,13 @@ async function hasMarker(real: string): Promise<boolean> {
 }
 
 /**
- * The project a resolved path belongs to, as a folder to remember.
+ * The workspace a resolved path belongs to, as a folder to remember.
  *
  * Walks up from the path towards its approved root looking for a project marker, and stops
  * at the root: the search never leaves the folder the user approved, so a stray `.git` in a
  * parent directory outside the sandbox cannot pull the workspace out of it.
  */
-export async function projectFolderOf(
+export async function workspaceFolderOf(
   resolved: { real: string; virtual: string },
   rootReal: string
 ): Promise<{ real: string; virtual: string }> {
@@ -311,6 +311,6 @@ export async function learnWorkspace(resolved: { real: string; virtual: string; 
   } catch {
     return;
   }
-  const folder = await projectFolderOf(resolved, rootReal);
+  const folder = await workspaceFolderOf(resolved, rootReal);
   setCurrentWorkspace(folder);
 }

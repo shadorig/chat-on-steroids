@@ -52,6 +52,8 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
   };
   const state = {
     config: baseConfig,
+    browserBridgeRequired: true,
+    projectAuthority: { status: 'ready' as const, detail: null },
     status: { state: 'disconnected', detail: '', publicUrl: null, localUrl: null, handshakeAt: null, lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: [] },
     hasApiKey: false,
     hasGoalKey: false,
@@ -207,6 +209,8 @@ it('serializes settings intent so rapid toggles and later UI changes cannot undo
   };
   const appState = (config: typeof baseConfig) => ({
     config,
+    browserBridgeRequired: true,
+    projectAuthority: { status: 'ready' as const, detail: null },
     status: { state: 'disconnected', detail: '', publicUrl: null, localUrl: null, handshakeAt: null, lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: [] },
     hasApiKey: false,
     hasGoalKey: false,
@@ -357,6 +361,8 @@ async function mountChat(
   };
   const state: any = {
     config,
+    browserBridgeRequired: true,
+    projectAuthority: { status: 'ready' as const, detail: null },
     status: { state: 'disconnected', detail: '', publicUrl: null, localUrl: null, handshakeAt: null, lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: [] },
     hasApiKey: false,
     hasGoalKey: false,
@@ -762,6 +768,7 @@ it('requires a live browser only when a browser-backed feature is actually enabl
   browserFree.config.sessions.record = false;
   browserFree.config.multiAgent.enabled = false;
   browserFree.config.goal.enabled = true;
+  browserFree.browserBridgeRequired = false;
   browserFree.bridge = { running: false, port: null, paired: true, present: false, lastSeenAt: Date.now() };
   mounted.push(browserFree);
   expect(browserStep.hidden).toBe(true);

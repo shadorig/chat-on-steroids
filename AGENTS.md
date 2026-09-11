@@ -21,8 +21,8 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-09-10**, including current working-tree changes. App/extension **2.0.9**,
-bridge protocol **13** in the checked declarations (`package.json`, `src/main/version.ts`,
+Source alignment: **2026-09-11**, including current working-tree changes. App/extension **2.0.10**,
+bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
 ## 1. What the whole app is meant to do
@@ -221,7 +221,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Terminal custody | `src/main/codex/{manager,ownership,unified-exec,unified-exec-constants,shell,command-batch,head-tail-buffer,truncate,exec-output}.ts`. |
 | Patching/images | `src/main/codex/apply-patch/*`, `codex/{filesystem,read-backend,view-image}.ts`. |
 | ChatGPT downloads | `src/main/mcp/artifact-{download,fetch,target}.ts`: validate native file reference, bounded fetch, exclusive destination publication. |
-| Projects/cwd | `src/main/projects.ts`, `workspace.ts`, `src/shared/projects.ts`: explicit local folder catalog, session binding, inherited/learned workspaces. |
+| Projects/cwd | `src/main/local-projects/{service,model,store,legacy}.ts`, `mcp/filesystem-scope.ts`, `workspace.ts`, `src/shared/projects.ts`: durable Local Project authority, project-bound filesystem admission, migration and learned cwd convenience. |
 | Durable history | `src/main/session/{store,recorder,correlation,retention,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. |
 | Model history reads | `src/main/mcp/session-tool.ts`: explicit-session search/read and snapshot/update/detail cursors. |
 | Input | `src/main/session/{input,start-input,input-history,input-attachments,input-images,prompt}.ts`, `src/shared/{input,user-prompt}.ts`: outbox, native files, prompt frame and receipts. |
@@ -243,13 +243,13 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | --- | --- | --- |
 | Permissions and settings | `config.ts` / `config.json` | Validate every load/save; enforce effective current capabilities at use. |
 | Credentials | `secrets.ts` / encrypted `secrets.bin`; plugin OAuth's encrypted installation store | Main process only; publish updated cache after the encrypted write. |
-| Session/current chat/project | `store.ts` / `sessions/<id>/meta.json` | Rebind is the semantic A→B commit. |
+| Session/current chat | `store.ts` / `sessions/<id>/meta.json` | Rebind is the semantic A→B commit; projected `projectId` is derived from Local Project authority. |
 | Exact request ownership | `correlation.ts` / `state/request-correlations.json` plus recorded proof | First exact proof wins; retain local session epoch; reconcile from history on startup. |
 | Authored message | `store.ts` / canonical message shard | Replace by stable identity, preserving origin chronology. |
 | Agent progress plan | `store.ts::updateSessionPlan` / `sessions/<id>/plan.json` | Exact caller/session and invocation ordering; atomically replace the whole plan. |
 | Input and checkpoints | `input.ts` / `state/session-input.json` | Serialized acceptance, frozen payload, exclusive claim and receipt; stages belong here. |
 | Native upload originals | `input-attachments.ts` / `input-attachments/` | Immutable bytes, opaque ids; outbox owns membership and retention. |
-| Project catalog | `projects.ts` / `state/projects.json` | Serialized catalog mutation; session metadata owns association. |
+| Local Project authority | `local-projects/{service,model,store}.ts` / `state/local-project-authority.json` + `local-project-security.json` | Canonical identities, direct session/conversation bindings and unresolved-send fences commit before publication; malformed/mismatched state fails closed. |
 | Browser commands/results | `bridge.ts` / `state/bridge-commands.json`; extension ACK outbox | Intent and exact lease before text; receipt durable before ACK custody is retired. |
 | Workers and inboxes | `agents.ts` / swarm snapshot and retired-worker fences | Stage → critical durable snapshot → publish/open/report. |
 | Compaction | `continuation.ts` / continuation WAL + session metadata | Disk ownership decides restart outcome; transport phase alone does not. |
@@ -489,19 +489,25 @@ escapes, live revocation during an await, and preserving an unrelated user's new
 **Intent:** a chat consistently works in its selected local folder, and workers/resumed chats
 retain that choice. Sidebar organization must not destroy work or grant access.
 
-`projects.ts` owns a bounded catalog of canonical absolute local folders with stable UUIDs.
-Adding uses the native folder selection/approved-root flow, resolves the real directory and
-deduplicates it. Session metadata owns `projectId`. Before send/use, `projectWorkspace()` and
-`getSessionProject()` re-resolve it under current roots and reject moved/unavailable folders.
-Null means no project; a broken explicit binding is an error, not a reason to infer a new cwd.
+`local-projects/` owns a bounded, independently durable authority ledger of canonical absolute
+folders with stable UUIDs plus direct session/conversation bindings. Adding uses the native folder
+selection/approved-root flow, resolves the real directory and deduplicates it. Session metadata
+only projects `projectId` for compatibility/UI; it is not filesystem authority. Every project-aware
+tool call freezes one post-identity authority generation before resolving paths, then resolves
+against the selected project as a narrower boundary inside the approved roots. A broken binding,
+unresolved fresh-send fence or unavailable authority is an error, never permission to fall back to
+another approved root or a learned cwd.
 
 Removing a project marks the catalog row `ungrouped`. Existing and unloaded sessions, pending
 inputs and workers keep their durable project association; their chats return to the ordinary
 sidebar list. Adding that same folder again restores grouping. It does not delete files,
-sessions or the approved root. A local project is distinct from a ChatGPT project route.
+sessions, revoke the project identity or remove the approved root. The explicit security reset is
+the destructive authorization recovery path: it starts a new authority era and clears approved
+roots. A local project is distinct from a ChatGPT project route.
 
-`workspace.ts` is convenient learned/inherited cwd, keyed to proven chat/family/agent identity.
-Explicit session project binding takes precedence at kernel entry. Workers inherit only their
+`workspace.ts` is convenient learned/inherited cwd, keyed to proven chat/family/agent identity;
+it never grants filesystem permission. Explicit project authority takes precedence at kernel
+entry. Workers inherit only their
 exact prime's project/workspace. Different primes may each own `worker-1` in different folders.
 Compaction keeps local session/project identity and moves frontend workspace projection. A
 relative path without trusted ownership fails; a workspace never grants permission by itself.

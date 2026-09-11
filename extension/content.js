@@ -1232,6 +1232,10 @@
   async function flush() {
     if (temporaryPlannerPage()) { while (queue.length) removeQueueEntry(0); return true; }
     if (commandJournalGate) return false;
+    // A native send receipt outranks transcript delivery. If the worker could not take durable
+    // custody on the first attempt, keep the exact page-local receipt and retry it without ever
+    // retrying text submission. Request ownership must not overtake this security proof.
+    if (!(await retryDesktopInputReceiptCustody())) return false;
     if (queue.length === 0) return true;
     if (flushWork) return flushWork;
     flushing = true;
@@ -1248,7 +1252,7 @@
       const reply = await ask({
         type: 'events',
         entries: batch,
-        projectInput: desktopProjectInput,
+        projectInput: pendingProjectInputClaim,
         conversationId: conversationId || undefined
       });
       // `ok` means the service worker handled the message, not necessarily that its journal
@@ -1259,7 +1263,7 @@
       observed.sends += 1;
       if (!reply || reply.ok !== true) observed.failures += 1;
       if (reply && reply.ok === true && (reply.durable === true || reply.pending === 0)) {
-        if (desktopProjectInput && reply.projectBound === desktopProjectInput.id) desktopProjectInput = null;
+        if (pendingProjectInputClaim && reply.boundProjectInputId === pendingProjectInputClaim.id) pendingProjectInputClaim = null;
         for (const entry of batch) {
           if (entry?.event?.kind !== 'tool_evidence') continue;
           for (const call of entry.event.calls || []) traceStage(call && call.requestId, 'sent');
@@ -3288,6 +3292,7 @@
   async function confirmLiveRequestOwners(calls, ownerConversation, current = null) {
     if (current && !current()) return;
     if (!Array.isArray(calls) || calls.length === 0 || !ownerConversation) return;
+    if (!(await retryDesktopInputReceiptCustody())) return;
     const byRequest = new Map();
     for (const call of calls) {
       if (!call || !call.requestId || byRequest.has(call.requestId)) continue;
@@ -3303,10 +3308,12 @@
       const reply = await ask({
         type: 'correlate',
         conversationId: ownerConversation,
+        ...(pendingProjectInputClaim ? { projectInput: pendingProjectInputClaim } : {}),
         calls: batch
       }, current);
       if (current && !current()) return;
       const data = reply && reply.ok === true && reply.data && typeof reply.data === 'object' ? reply.data : null;
+      if (pendingProjectInputClaim && data?.boundProjectInputId === pendingProjectInputClaim.id) pendingProjectInputClaim = null;
       const confirmed = new Set(data && Array.isArray(data.confirmed) ? data.confirmed : []);
       for (const call of batch) {
         const key = `${ownerConversation}\u0000${call.requestId}`;
@@ -10060,7 +10067,32 @@
   let desktopDecisionSession = null;
   let desktopInputBusy = false;
   // The durable claim, never a project path/title guess, fences first tool evidence.
-  let desktopProjectInput = null;
+  let pendingProjectInputClaim = null;
+  // Exact native receipt retained only until the MV3 worker proves durable custody. This is not a
+  // resend queue: retrying this object can settle authorization but can never click Send again.
+  let pendingDesktopInputReceipt = null;
+  let desktopInputReceiptWork = null;
+  async function retryDesktopInputReceiptCustody() {
+    if (!pendingDesktopInputReceipt) return true;
+    if (desktopInputReceiptWork) return desktopInputReceiptWork;
+    const receipt = pendingDesktopInputReceipt;
+    const work = ask({
+      type: 'desktop_input',
+      id: receipt.id,
+      conversationId: receipt.conversationId,
+      messageId: receipt.messageId,
+      owner: receipt.owner,
+      ack: true
+    }).then((reply) => {
+      const accepted = reply?.data?.ok === true;
+      if (accepted && pendingDesktopInputReceipt === receipt) pendingDesktopInputReceipt = null;
+      return accepted;
+    }).catch(() => false).finally(() => {
+      if (desktopInputReceiptWork === work) desktopInputReceiptWork = null;
+    });
+    desktopInputReceiptWork = work;
+    return work;
+  }
   function temporaryPlannerPage() {
     if (!alive || !window.document) return false;
     return new URL(location.href).searchParams.get('temporary-chat') === 'true' &&
@@ -10244,7 +10276,7 @@
         decision = { id: input.id, owner: input.owner, messageId: null, text: input.text, temporary, onTarget: sendingTarget, conversationId: null, epoch: forEpoch, response: '', publishing: false };
         desktopDecision = decision;
       }
-      if (input.projectId) desktopProjectInput = { id: input.id, owner: input.owner };
+      if (input.projectId) pendingProjectInputClaim = { id: input.id, owner: input.owner };
       if (!(await sendSubmittedText(sendingTarget, false, async sendCurrent => {
         // Preserve the outbox's revocable claim until the actual native Send is ready.
         const authorized = await ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, authorize: true });
@@ -10274,8 +10306,13 @@
         completeDesktopDecision();
       }
       // The claim remains inert if this ACK is lost; no duplicate send after a reload.
-      const acknowledged = await ask({ type: 'desktop_input', id: message.id, conversationId: deliveredConversation, messageId: receipt.user?.id, owner: input.owner, lifetime: input.lifetime, ack: true });
-      const accepted = acknowledged?.data?.ok === true;
+      pendingDesktopInputReceipt = {
+        id: message.id,
+        conversationId: deliveredConversation,
+        messageId: receipt.user?.id,
+        owner: input.owner
+      };
+      const accepted = await retryDesktopInputReceiptCustody();
       // Stop/composer-clear may precede the exact user row. This receipt, not that early
       // native acceptance, owns retirement of the still-untouched prepared draft. A
       // rejected/cancelled claim, trusted edit, replacement editor or route preserves it.

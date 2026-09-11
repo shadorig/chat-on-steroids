@@ -96,6 +96,21 @@ export interface SurfaceDefinition {
  * `find` and the exec pair are mutually exclusive — `find` exists only when command
  * execution is off — so not all declarations are exposed together.
  */
+const CORE_TOOLS = [
+  'read',
+  'view_image',
+  'find',
+  'apply_patch',
+  'exec_command',
+  'write_stdin',
+  'download_artifact',
+  'session',
+  'update_plan',
+  'agents',
+  'session_finish',
+  'exec'
+] as const;
+
 const CORE: SurfaceDefinition = {
   id: 'core',
   serverName: 'chat-on-steroids-core',
@@ -109,8 +124,43 @@ const CORE: SurfaceDefinition = {
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
   cardSummary: 'Files, patches and the terminal. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'download_artifact', 'session', 'update_plan', 'agents', 'session_finish', 'exec']
+  tools: CORE_TOOLS
 };
+
+export type ProjectToolPolicy = 'none' | 'principal' | 'filesystem';
+
+/**
+ * Local Project sensitivity is declared beside the complete Core tool vocabulary.
+ * `satisfies Record<...>` makes a new Core tool a compile error until its security disposition is
+ * explicit; there is no positive allowlist whose omission silently widens a future tool.
+ */
+const CORE_PROJECT_POLICY = {
+  read: 'filesystem',
+  view_image: 'filesystem',
+  find: 'filesystem',
+  apply_patch: 'filesystem',
+  exec_command: 'filesystem',
+  write_stdin: 'principal',
+  download_artifact: 'filesystem',
+  session: 'none',
+  update_plan: 'none',
+  agents: 'none',
+  session_finish: 'none',
+  exec: 'principal'
+} as const satisfies Record<(typeof CORE_TOOLS)[number], ProjectToolPolicy>;
+
+/** Whether Local Project caller authority must be considered before this tool may run. */
+export function projectToolPolicy(surface: SurfaceId, name: string): ProjectToolPolicy {
+  if (surface !== 'core') return 'none';
+  return Object.prototype.hasOwnProperty.call(CORE_PROJECT_POLICY, name)
+    ? CORE_PROJECT_POLICY[name as keyof typeof CORE_PROJECT_POLICY]
+    : 'none';
+}
+
+/** Compatibility/readability helper for callers that care only about path scoping. */
+export function toolUsesProjectFilesystemScope(surface: SurfaceId, name: string): boolean {
+  return projectToolPolicy(surface, name) === 'filesystem';
+}
 
 /**
  * Desktop — seeing and driving the native desktop.

@@ -2,7 +2,7 @@
  * Orchestration for `download_artifact`: resolve → fetch → write → publish.
  *
  * Mirrors devspace `downloadIncomingArtifact` (src/artifact-tools.ts:127-218) with two
- * local adaptations: path resolution goes through `resolveIn` (approved roots +
+ * local adaptations: path resolution goes through `resolveScopedPath` (approved roots +
  * per-chat workspace, the sandbox remaining the single authority), and the secure
  * target is the koffi-free `artifact-target.ts`.
  */
@@ -10,7 +10,7 @@
 import { createHash } from 'node:crypto';
 import nodePath from 'node:path';
 import { rawPromises as fs } from '../rawfs.js';
-import { resolveIn } from './kernel.js';
+import { resolveScopedPath } from './filesystem-scope.js';
 import type { Root } from '../../shared/types.js';
 import {
   ArtifactFetchError,
@@ -58,7 +58,7 @@ export async function downloadArtifactFile(
   const reference = normalizeOpenAIFileReference(file);
   validateOpenAIFileUrl(reference.download_url);
   if (reference.size !== undefined && reference.size > maxFileBytes) throw new ArtifactFetchError('ChatGPT file exceeds the configured per-file limit.');
-  const resolved = await resolveIn(roots as Parameters<typeof resolveIn>[0], requestedPath, {
+  const resolved = await resolveScopedPath(roots, requestedPath, {
     allowMissing: true
   });
   const parentReal = nodePath.dirname(resolved.real);

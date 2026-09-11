@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushDurable, initDurableStore, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
+import { flushDurable, initDurableStore, readDurable, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
 import {
   appendEvent,
   createSession,
@@ -192,6 +192,49 @@ describe('request correlation ownership', () => {
     });
 
     expect(requestCorrelation(requestId)?.conversationId).toBe('conv-a');
+  });
+
+  it('never leaks a memory-only owner into a later durable snapshot and promotes it deliberately', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-memory-only-'));
+    try {
+      resetDurableForTests();
+      initDurableStore(dir);
+      const volatileOnly = {
+        requestId: 'wfr-memory-only',
+        conversationId: 'conv-memory-only',
+        sessionId: null,
+        messageId: 'message-memory-only',
+        tool: 'read',
+        observedAt: 10
+      };
+      observeRequestCorrelations([volatileOnly], { persistence: 'memory' });
+      observeRequestCorrelation({
+        requestId: 'wfr-durable-peer',
+        conversationId: 'conv-durable-peer',
+        sessionId: 'session-durable-peer',
+        messageId: 'message-durable-peer',
+        tool: 'read',
+        observedAt: 20
+      });
+      await flushDurable();
+      const first = await readDurable<{ entries: Array<{ requestId: string }> }>('request-correlations');
+      expect(first?.entries.map((row) => row.requestId)).toEqual(['wfr-durable-peer']);
+
+      observeRequestCorrelation({ ...volatileOnly, sessionId: 'session-now-durable', observedAt: 11 });
+      await flushDurable();
+      const promoted = await readDurable<{ entries: Array<{ requestId: string }> }>('request-correlations');
+      expect(promoted?.entries.map((row) => row.requestId)).toEqual([
+        'wfr-durable-peer',
+        'wfr-memory-only'
+      ]);
+      // First proof still owns its session semantics. Promotion makes the exact conversation join
+      // durable; it does not retroactively invent a session for the already-issued request.
+      expect(requestCorrelation('wfr-memory-only')?.sessionId).toBeNull();
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('evicts by latest same-owner observation rather than original insertion order', () => {

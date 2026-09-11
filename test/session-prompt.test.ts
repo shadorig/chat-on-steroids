@@ -3,7 +3,13 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
-import { addProject, assignSessionProject } from '../src/main/projects.js';
+import {
+  addLocalProject,
+  assignSessionProject,
+  initLocalProjects,
+  resetLocalProjectsForTests,
+  restoreLocalProjects
+} from '../src/main/local-projects/service.js';
 import { createSession, initSessionStore, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { fitSessionPrompt, prepareSessionPrompt } from '../src/main/session/prompt.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt, userPromptText } from '../src/shared/user-prompt.js';
@@ -14,9 +20,11 @@ beforeEach(async () => {
   directory = await makeTempDir('cos-session-prompt-');
   initConfigPath(directory); initDurableStore(directory); initSessionStore(directory);
   await saveConfig({ ...defaultConfig(), roots: [{ name: 'work', path: directory }] });
+  initLocalProjects(directory);
+  await restoreLocalProjects();
 });
 afterEach(async () => {
-  resetSessionStoreForTests(); resetDurableForTests();
+  resetSessionStoreForTests(); resetLocalProjectsForTests(); resetDurableForTests();
   await removeTempDir(directory);
 });
 
@@ -52,7 +60,7 @@ it('reads only the linked folder, refreshes its contents, and leaves unfiled cha
   await fs.mkdir(path.join(directory, 'project', 'nested'), { recursive: true });
   await fs.writeFile(path.join(directory, 'AGENTS.md'), 'PARENT_DO_NOT_INJECT');
   await fs.writeFile(path.join(directory, 'project', 'nested', 'AGENTS.md'), 'CHILD_DO_NOT_INJECT');
-  const project = await addProject(path.join(directory, 'project'));
+  const project = await addLocalProject(path.join(directory, 'project'));
   const file = path.join(project.path, 'AGENTS.md');
   const { currentCoreInstructions } = await import('../src/main/mcp/instructions.js');
   const core = await currentCoreInstructions();
@@ -72,7 +80,7 @@ it('reads only the linked folder, refreshes its contents, and leaves unfiled cha
 
 it('uses durable session ownership through resume and worker inheritance, never an unrelated selected project', async () => {
   await fs.mkdir(path.join(directory, 'one')); await fs.mkdir(path.join(directory, 'two'));
-  const one = await addProject(path.join(directory, 'one')), two = await addProject(path.join(directory, 'two'));
+  const one = await addLocalProject(path.join(directory, 'one')), two = await addLocalProject(path.join(directory, 'two'));
   await fs.writeFile(path.join(one.path, 'AGENTS.md'), 'PROJECT_ONE_ONLY');
   await fs.writeFile(path.join(two.path, 'AGENTS.md'), 'PROJECT_TWO_ONLY');
   const session = await createSession({ title: 'Bound', conversationId: 'original-chat' });
@@ -88,7 +96,7 @@ it('uses durable session ownership through resume and worker inheritance, never 
 });
 
 it('bounds a large file and refuses invalid file types and revoked access without injecting their contents', async () => {
-  const project = await addProject(directory);
+  const project = await addLocalProject(directory);
   const file = path.join(directory, 'AGENTS.md');
   await fs.writeFile(file, 'LARGE_HEAD\n' + 'x'.repeat(2_000_000) + 'LARGE_TAIL');
   const text = await prepareSessionPrompt('User message', { projectId: project.id });

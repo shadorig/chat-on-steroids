@@ -74,6 +74,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
     ctx.readOnly ? 'The local tools are read-only.' : 'Use the tools listed in this conversation.',
     'An approved root may be the parent of the project. Use the exact project path and keep every intermediate folder; do not guess a missing project level.',
     'Paths may be virtual under the roots above or absolute native paths inside them. Once this chat has a project, later paths may be relative to it. Use a full path to select another project.',
+    'A Local Project is fixed: built-in file paths and a command’s starting workdir stay within its directory tree. Losing browser identity or project state never widens access to another approved folder.',
   ];
 
   if (caps.read || caps.browse || caps.metadata) lines.push(
@@ -94,6 +95,9 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
       ...(LAUNCHES_WINDOWS_POWERSHELL_5 ? ['This is Windows PowerShell 5.1, without && or ||. Use cmds or A; if ($?) { B }.'] : [])
     );
     else lines.push('exec_command uses the host’s normal POSIX shell (zsh/bash/sh unless requested otherwise). The bundled ripgrep directory is first on PATH.');
+    if (config.multiAgent.allowUnattributedCalls && !ctx.readOnly) lines.push(
+      'Allow unattributed calls is enabled for self-contained unbound work. Such calls cannot borrow a chat’s workspace or terminal, and Local Project filesystem access still requires exact browser identity.'
+    );
   } else if (ctx.exposedFind ?? caps.search) {
     lines.push('find searches filenames or file contents without a shell. Narrow path and include patterns to the relevant area.');
   }
@@ -101,7 +105,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform): string {
     'Use apply_patch for manual file changes. It adds, updates, moves and deletes files atomically. Never copy read’s line-number prefixes into a patch.'
   );
   if (caps.saveArtifact) lines.push(
-    'download_artifact saves a user-supplied or ChatGPT-generated file using its native file value and an approved destination path. It refuses to overwrite. Do not recreate the file or put signed URLs, file objects or base64 into shell commands.'
+    'download_artifact saves a user-supplied or ChatGPT-generated file using its native file value and a destination inside the approved scope, including any Local Project. It refuses to overwrite. Do not recreate the file or put signed URLs, file objects or base64 into shell commands.'
   );
   if (sessionTools) lines.push(
     '',

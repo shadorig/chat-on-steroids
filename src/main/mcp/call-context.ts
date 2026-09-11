@@ -15,6 +15,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AssetRef, FileChange, ToolOutcome } from '../../shared/session.js';
 import type { OutputPublication } from '../codex/unified-exec.js';
+import type { Root } from '../../shared/types.js';
+import type { ProjectAuthoritySnapshot } from '../local-projects/service.js';
 
 export interface CallEvidence {
   changes: FileChange[];
@@ -89,6 +91,18 @@ export interface CallContext {
    * still running and reports it on its own tick, which is usually after the answer.
    */
   bindOnAttribution?: string;
+  /**
+   * Filesystem authorization is frozen only after exact caller identity has had its one chance to
+   * settle. Every path operation in this call then reuses that immutable authority epoch and,
+   * for one roots snapshot, the same resolved Local Project directory.
+   */
+  filesystemPolicy?:
+    {
+      /** Approved-root authority frozen in the same synchronous admission step as project policy. */
+      roots: readonly Root[];
+      authority: ProjectAuthoritySnapshot | null;
+      project?: Promise<{ virtual: string; real: string } | null>;
+    };
 }
 
 const storage = new AsyncLocalStorage<CallContext>();

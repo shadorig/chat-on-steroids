@@ -7,10 +7,12 @@ import {
   flushDurable,
   initDurableStore,
   readDurable,
+  readDurableStrict,
   resetDurableForTests,
   writeDurableNow,
-  writeDurableSoon,
-  writeDurableSnapshotSoon
+  writeDurableSnapshotSoon,
+  writeDurableStrictNow,
+  writeDurableSoon
 } from '../src/main/durable.js';
 
 const cleanup: string[] = [];
@@ -107,6 +109,21 @@ describe('durable state commit boundary', () => {
     expect(writes).toEqual([{ version: 1 }, { version: 2 }]);
   });
 
+  it('distinguishes an absent strict state file from unavailable or malformed authority', async () => {
+    await expect(readDurableStrict('policy')).rejects.toThrow(/not been initialized/);
+    const dir = await tempStore();
+    await expect(readDurableStrict('policy')).resolves.toBeNull();
+    await fs.mkdir(path.join(dir, 'state'), { recursive: true });
+    await fs.writeFile(path.join(dir, 'state', 'policy.json'), '{broken');
+    await expect(readDurableStrict('policy')).rejects.toThrow();
+  });
+
+  it('propagates non-absence read failures from strict state', async () => {
+    await tempStore();
+    vi.spyOn(fs, 'readFile').mockRejectedValueOnce(Object.assign(new Error('denied'), { code: 'EACCES' }));
+    await expect(readDurableStrict('policy')).rejects.toMatchObject({ code: 'EACCES' });
+  });
+
   it('rejects a failed immediate atomic rename and preserves the snapshot for retry', async () => {
     await tempStore();
     const busy = Object.assign(new Error('injected rename contention'), { code: 'EBUSY' });
@@ -118,6 +135,17 @@ describe('durable state commit boundary', () => {
     rename.mockRestore();
     await flushDurable();
     await expect(readDurable('probe')).resolves.toEqual({ generation: 1 });
+  });
+
+  it('never background-retries a failed strict security write outside its owning transaction', async () => {
+    const dir = await tempStore();
+    const busy = Object.assign(new Error('injected strict rename contention'), { code: 'EBUSY' });
+    const rename = vi.spyOn(fs, 'rename').mockRejectedValueOnce(busy);
+
+    await expect(writeDurableStrictNow('policy', { epoch: 4 })).rejects.toMatchObject({ code: 'EBUSY' });
+    rename.mockRestore();
+    await flushDurable();
+    await expect(fs.stat(path.join(dir, 'state', 'policy.json'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('never lets an older in-flight generation erase a newer pending value', async () => {

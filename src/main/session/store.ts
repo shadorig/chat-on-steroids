@@ -72,6 +72,68 @@ const MAX_SCANNED_SESSIONS = 5_000;
 const ATTACHMENT_CATALOG_READ_CONCURRENCY = 64;
 
 let root = '';
+
+/**
+ * Project authority intentionally outlives this transcript store. The project module installs
+ * these two narrow hooks so session lifecycle changes can project that authority without making
+ * this general-purpose history layer import filesystem policy (and creating an import cycle).
+ */
+export interface SessionProjectAuthorityHooks {
+  projectForPrincipal(principal: { sessionId?: string | null; conversationId?: string | null }): string | null;
+  retainLineage(binding: {
+    sessionId: string;
+    conversationIds: readonly string[];
+    requestedProjectId?: string;
+  }): Promise<string | null>;
+}
+
+let projectAuthorityHooks: SessionProjectAuthorityHooks | null = null;
+
+export function configureSessionProjectAuthority(hooks: SessionProjectAuthorityHooks | null): void {
+  projectAuthorityHooks = hooks;
+}
+
+async function projectSessionSummary(summary: SessionSummary, requestedProjectId?: string): Promise<SessionSummary> {
+  if (!projectAuthorityHooks) return summary;
+  await projectAuthorityHooks.retainLineage({
+    sessionId: summary.id,
+    conversationIds: summary.chatIds,
+    ...(requestedProjectId ? { requestedProjectId } : {})
+  });
+  // Authority is the only post-migration owner of the binding. Do not create a second durable
+  // permission fact in transcript metadata; if a legacy projection is already present, retire it
+  // the next time this summary is legitimately rewritten.
+  if (summary.projectId === undefined) return summary;
+  const withoutLegacyProjection = { ...summary };
+  delete withoutLegacyProjection.projectId;
+  return withoutLegacyProjection;
+}
+
+/**
+ * Read-side projection of project authority. Persisted SessionSummary.projectId is deliberately
+ * only a presentation cache: after an explicit security reset, old transcript metadata must not
+ * keep manufacturing "Unavailable project" groups. If authority itself is unavailable, preserve
+ * the stored projection so history remains inspectable while the recovery UI is shown.
+ */
+function projectSummaryView(summary: SessionSummary): SessionSummary {
+  if (!projectAuthorityHooks) return summary;
+  let projectId: string | null;
+  try {
+    projectId = projectAuthorityHooks.projectForPrincipal({ sessionId: summary.id });
+  } catch {
+    return summary;
+  }
+  if ((summary.projectId ?? null) === projectId) return summary;
+  const projected = { ...summary };
+  if (projectId) projected.projectId = projectId;
+  else delete projected.projectId;
+  return projected;
+}
+
+function cloneSummaryForRead(summary: SessionSummary): SessionSummary {
+  const projected = projectSummaryView(summary);
+  return { ...projected, chatIds: [...projected.chatIds], agents: [...projected.agents] };
+}
 /**
  * Current-conversation misses already proven against this process's durable catalog.
  *
@@ -392,14 +454,17 @@ export async function createSession(options: {
   conversationId?: string | null;
   origin?: SessionOrigin | null;
 }): Promise<SessionSummary> {
-  const id = `${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
-  const summary = emptySummary(id, options.title?.trim() || 'ChatGPT session', options.conversationId ?? null);
+  const id = `${new Date().toISOString().slice(0, 10)}-${randomUUID()}`;
+  let summary = emptySummary(id, options.title?.trim() || 'ChatGPT session', options.conversationId ?? null);
   summary.origin = options.origin ?? null;
   if (options.titleSource) summary.titleSource = options.titleSource;
-  if (options.origin?.fromSessionId) {
-    const source = await getSession(options.origin.fromSessionId);
-    if (source?.projectId) summary.projectId = source.projectId;
-  }
+  const inheritedProject = options.origin?.fromSessionId && projectAuthorityHooks
+    ? projectAuthorityHooks.projectForPrincipal({ sessionId: options.origin.fromSessionId }) ?? undefined
+    : undefined;
+  // The independent authority lands first. A later history write failure may leave an orphaned
+  // narrowing record, which is safe; the opposite order creates a crash window that broadens a
+  // project chat when its transcript is deleted or pruned.
+  summary = await projectSessionSummary(summary, inheritedProject);
   // Invalidate before exposing the in-flight live entry. A cached miss must never hide a
   // session that this process has started creating, even while its first durable write awaits.
   if (summary.conversationId) missingCurrentConversations.delete(summary.conversationId);
@@ -1933,7 +1998,7 @@ export async function listSessionPage(options: {
   for (const entry of open.values()) {
     if (entry.summary.origin?.kind === 'helper') continue;
     if (options.cursor && !comesAfterCursor(entry.summary, options.cursor)) continue;
-    candidates.push({ ...entry.summary, chatIds: [...entry.summary.chatIds], agents: [...entry.summary.agents] });
+    candidates.push(cloneSummaryForRead(entry.summary));
   }
 
   // The durable order is already maintained incrementally. Collect only one page plus one
@@ -1949,7 +2014,7 @@ export async function listSessionPage(options: {
       durableHasMore = true;
       break;
     }
-    candidates.push({ ...summary, chatIds: [...summary.chatIds], agents: [...summary.agents] });
+    candidates.push(cloneSummaryForRead(summary));
     durableEligible += 1;
   }
 
@@ -2124,7 +2189,7 @@ export async function sessionDurableModifiedAt(id: string): Promise<number | nul
 export async function getSession(id: string): Promise<SessionSummary | null> {
   assertSessionId(id);
   const summary = await readAuthoritativeSummary(id);
-  return summary ? { ...summary } : null;
+  return summary ? cloneSummaryForRead(summary) : null;
 }
 
 /** A plan is one replaceable session document, not another execution queue. */
@@ -2250,9 +2315,8 @@ export async function bindSessionProject(id: string, projectId: string): Promise
   if (!/^[a-f0-9-]{36}$/i.test(projectId)) throw new Error('Invalid project id');
   const entry = await ensureOpen(id);
   await enqueueSessionOperation(entry, 'project', async () => {
-    if (entry.summary.projectId === projectId) return;
-    if (entry.summary.projectId) throw new Error('Session already belongs to another project');
-    const staged = { ...entry.summary, projectId };
+    const staged = await projectSessionSummary(entry.summary, projectId);
+    if (staged === entry.summary) return;
     await writeSummary(staged, entry.historySeq);
     entry.summary = staged;
     publishAttachmentSummary(staged);
@@ -2268,11 +2332,12 @@ export async function bindSessionProject(id: string, projectId: string): Promise
  * name contradicts.
  */
 export async function setSessionOrigin(id: string, origin: SessionOrigin, title: string): Promise<void> {
-  const inheritedProject = origin.fromSessionId ? (await getSession(origin.fromSessionId))?.projectId : undefined;
+  const inheritedProject = origin.fromSessionId && projectAuthorityHooks
+    ? projectAuthorityHooks.projectForPrincipal({ sessionId: origin.fromSessionId }) ?? undefined
+    : undefined;
   const entry = await ensureOpen(id);
   await enqueueSessionOperation(entry, 'origin write', async () => {
-    if (inheritedProject && entry.summary.projectId && entry.summary.projectId !== inheritedProject) throw new Error('Session origin belongs to another project');
-    const staged = { ...entry.summary, origin, title: title.slice(0, 120), ...(inheritedProject ? { projectId: inheritedProject } : {}) };
+    const staged = await projectSessionSummary({ ...entry.summary, origin, title: title.slice(0, 120) }, inheritedProject);
     await writeSummary(staged, entry.historySeq);
     entry.summary = staged;
     publishAttachmentSummary(staged);
@@ -2330,7 +2395,7 @@ export async function rebindSession(
         return false;
       }
     }
-    const staged: SessionSummary = {
+    let staged: SessionSummary = {
       ...entry.summary,
       conversationId: toConversationId,
       chatIds: entry.summary.chatIds.includes(toConversationId)
@@ -2349,6 +2414,7 @@ export async function rebindSession(
     };
 
     try {
+      staged = await projectSessionSummary(staged);
       await writeSummary(staged, entry.historySeq);
     } catch (err) {
       logWarn(`session ${id} could not be moved to ${toConversationId}: ${(err as Error).message}`);

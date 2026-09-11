@@ -43,6 +43,9 @@ export const RESERVED_ROOT_NAMES = new Set(['skills']);
 
 export class SandboxError extends Error {}
 
+/** A narrower caller-owned scope rejected the path before the approved-root sandbox did. */
+export class ScopeBoundaryError extends SandboxError {}
+
 export interface Resolved {
   /** Canonical absolute path on disk. */
   real: string;
@@ -51,6 +54,9 @@ export interface Resolved {
   /** The root this path belongs to. */
   root: Root;
 }
+
+/** Canonical narrower subtree used as an additional security boundary inside approved roots. */
+export type FilesystemScope = Pick<Resolved, 'real' | 'virtual'>;
 
 /**
  * The approved spelling a refused path most likely meant, or null.
@@ -218,6 +224,14 @@ export interface ResolveOptions {
    * of the root, because there is no point at which a traversal is normalised away first.
    */
   base?: string | null;
+  /**
+   * Optional canonical subtree inside the approved roots.
+   *
+   * Enforced lexically before probing the requested target and canonically afterwards. This is
+   * deliberately part of resolution rather than a caller-side post-check: an outside existing
+   * path and an outside missing path must have the same answer, and neither may be observed first.
+   */
+  within?: FilesystemScope;
 }
 
 /** True for a path that names its root, rather than starting from somewhere already known. */
@@ -263,7 +277,11 @@ function isNativePosixPath(roots: readonly Root[], input: unknown): input is str
  * equivalent virtual path; resolvePath then runs that through the exact same realpath,
  * symlink/junction and allowMissing checks as an originally-virtual path.
  */
-async function normaliseNativePath(roots: readonly Root[], input: string): Promise<string | null> {
+async function normaliseNativePath(
+  roots: readonly Root[],
+  input: string,
+  within?: FilesystemScope
+): Promise<string | null> {
   const nativeWindows = isNativeWindowsPath(input);
   const nativePosix = isNativePosixPath(roots, input);
   if (!nativeWindows && !nativePosix) return null;
@@ -289,12 +307,23 @@ async function normaliseNativePath(roots: readonly Root[], input: string): Promi
     );
   }
   const native = path.resolve(trimmed);
+  // Native spelling normally has to be canonicalised before it can be mapped to a virtual root.
+  // A narrower scope changes that order: probing an arbitrary sibling first would disclose
+  // whether it exists. Require the spelling itself to start inside the canonical scope. A native
+  // alias located elsewhere and pointing inward is intentionally refused; virtual paths remain
+  // the unambiguous way to address the selected subtree.
+  if (within && !isContained(within.real, native)) {
+    throw new ScopeBoundaryError('Path is outside the required filesystem scope');
+  }
   let canonicalNative: string;
   try {
     const { real, missing } = await realpathDeepest(native);
     canonicalNative = missing.length === 0 ? real : path.join(real, ...missing);
   } catch {
     canonicalNative = native;
+  }
+  if (within && !isContained(within.real, canonicalNative)) {
+    throw new ScopeBoundaryError('Path escapes the required filesystem scope via a link');
   }
   for (const root of roots) {
     let rootReal: string;
@@ -332,7 +361,7 @@ export async function resolvePath(
   virtualPath: string,
   options: ResolveOptions = {}
 ): Promise<Resolved> {
-  const normalisedNative = await normaliseNativePath(roots, virtualPath);
+  const normalisedNative = await normaliseNativePath(roots, virtualPath, options.within);
   const suppliedPath = normalisedNative ?? virtualPath;
   // A relative path is shorthand for one absolute path, and is turned into that path here,
   // before anything is validated — so there stays exactly one piece of code deciding what
@@ -365,17 +394,36 @@ export async function resolvePath(
     );
   }
 
-  const rootReal = await realRoot(root);
   const rest = segments.slice(1);
+  const lexicalVirtual = `/${[root.name, ...rest].join('/')}`;
+  if (options.within) {
+    const normalize = (value: string) => IS_WINDOWS ? value.toLowerCase() : value;
+    const parent = normalize(options.within.virtual.replace(/\/+$/, ''));
+    const child = normalize(lexicalVirtual);
+    if (child !== parent && !child.startsWith(`${parent}/`)) {
+      throw new ScopeBoundaryError('Path is outside the required filesystem scope');
+    }
+  }
+
+  const rootReal = await realRoot(root);
   const candidate = rest.length === 0 ? rootReal : path.join(rootReal, ...rest);
 
   // Cheap structural check before touching the disk.
   if (!isContained(rootReal, candidate)) {
     throw new SandboxError('Path escapes its approved folder');
   }
+  // Scope is checked before realpathDeepest() so paths outside it reveal no existence fact.
+  if (options.within && !isContained(options.within.real, candidate)) {
+    throw new ScopeBoundaryError('Path is outside the required filesystem scope');
+  }
 
   const { real, missing } = await realpathDeepest(candidate);
 
+  // Check the narrower authority first. A link escaping both the scope and the broad approved
+  // root is still, most importantly, an attempt to leave the caller's scope.
+  if (options.within && !isContained(options.within.real, real)) {
+    throw new ScopeBoundaryError('Path escapes the required filesystem scope via a link');
+  }
   // The canonical existing part must still be inside the root. This is the check
   // that catches a symlink or junction inside the tree pointing somewhere else.
   if (!isContained(rootReal, real)) {
@@ -387,6 +435,9 @@ export async function resolvePath(
   }
 
   const finalReal = missing.length === 0 ? real : path.join(real, ...missing);
+  if (options.within && !isContained(options.within.real, finalReal)) {
+    throw new ScopeBoundaryError('Path is outside the required filesystem scope');
+  }
   if (!isContained(rootReal, finalReal)) {
     throw new SandboxError('Path escapes its approved folder');
   }

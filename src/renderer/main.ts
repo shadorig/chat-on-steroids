@@ -22,7 +22,6 @@ import type { AppApi, SettingsPatch } from '../preload/index.js';
 import { requiresApprovedFilesystemRoot } from '../shared/capabilities.js';
 import type { AppState, Capability, ChatBrowser, LogEntry, SurfaceStatus } from '../shared/types.js';
 import {
-  browserExtensionRequired,
   isNewer,
   RELEASES_PAGE,
   CAPABILITY_DETAILS,
@@ -771,7 +770,7 @@ let announced = false;
  * bar is for what the user can act on - a version to fetch by hand, an extension to reload -
  * while the Activity line reports every state, including the good one.
  */
-function updateSummary({ bridge, update, config, status }: AppState): { text: string; tone: UpdateTone; notice: boolean; extensionAction: string | null } | null {
+function updateSummary({ bridge, update, status, browserBridgeRequired }: AppState): { text: string; tone: UpdateTone; notice: boolean; extensionAction: string | null } | null {
   // Only an extension older than this app is the user's to fix. The other direction is an app
   // that has not caught up yet - normal while an update downloads - and telling that user to
   // load the bundled folder again would talk them into downgrading a working extension. The
@@ -782,7 +781,7 @@ function updateSummary({ bridge, update, config, status }: AppState): { text: st
       : null;
   // A mismatched companion can fail the protocol gate before it becomes present.
   // Retain its last observed version until a matching companion actually reports in.
-  const missing = !stale && bridge.running && !bridge.present && isRunning(status.state) && browserExtensionRequired(config);
+  const missing = !stale && bridge.running && !bridge.present && isRunning(status.state) && browserBridgeRequired;
   if (!stale && !missing && !update.latest && update.stage === 'idle' && !update.checkedAt) return null;
 
   const lines: string[] = [];
@@ -931,6 +930,12 @@ function apply(next: AppState): void {
   // ---- folders
   paintRoots(config.roots);
   $('rootsEmpty').hidden = config.roots.length > 0;
+  const projectAuthorityNeedsAttention = next.projectAuthority.status !== 'ready';
+  $('projectAuthorityRecovery').hidden = !projectAuthorityNeedsAttention;
+  $('projectAuthorityHeading').textContent = next.projectAuthority.status === 'unavailable'
+    ? 'Local Project security is unavailable.'
+    : 'Local Project security needs attention.';
+  $('projectAuthorityDetail').textContent = next.projectAuthority.detail ?? 'The saved narrowing policy could not be restored safely.';
 
   // ---- nav badge
   $('setupBadge').hidden = missing === null;
@@ -982,10 +987,10 @@ function apply(next: AppState): void {
   }
 
   const openai = config.tunnel.kind === 'openai';
-  const browserRequired = browserExtensionRequired(config);
+  const browserBridgeRequired = next.browserBridgeRequired;
   step('tunnel').hidden = !openai;
   step('key').hidden = !openai;
-  step('browser').hidden = !browserRequired;
+  step('browser').hidden = !browserBridgeRequired;
   // Only this method needs a tunnel per connector. Cloudflare and manual publish the
   // whole address, so both connectors already ride the one tunnel on their own paths.
   const desktopSurface = status.surfaces.find((surface) => surface.id === 'desktop');
@@ -1067,7 +1072,7 @@ function apply(next: AppState): void {
   // only that this extension is allowed to connect; setup is complete when a required browser
   // has actually checked in during this process. If no enabled feature needs the browser,
   // this optional step is hidden and deliberately cannot block the wizard.
-  if (!browserRequired || next.bridge.present) done.add('browser');
+  if (!browserBridgeRequired || next.bridge.present) done.add('browser');
   const current = order.find((name) => !done.has(name)) ?? null;
   for (const name of order) {
     const node = step(name);
@@ -1558,6 +1563,17 @@ $('readOnlyBtn').addEventListener('click', () => {
 });
 
 $('addFolder').addEventListener('click', () => void addFolder());
+$('resetProjectSecurity').addEventListener('click', async () => {
+  const button = $<HTMLButtonElement>('resetProjectSecurity');
+  if (!window.confirm('Clear Local Project security?\n\nThis removes every approved folder and clears the Local Project authority baseline. It never deletes files. You will need to approve folders again afterwards.')) return;
+  button.disabled = true;
+  try {
+    const next = await run(api.resetProjectSecurity());
+    if (next) apply(next);
+  } finally {
+    button.disabled = false;
+  }
+});
 $('wizAddFolder').addEventListener('click', () => void addFolder());
 $('wizManageFolders').addEventListener('click', () => {
   showTab('home');

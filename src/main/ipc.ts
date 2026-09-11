@@ -48,9 +48,16 @@ import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CH
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
-import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
+import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, logWarn, onLog } from './logger.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, listProjects, removeProject } from './projects.js';
+import { browserBridgeRequired } from './browser-bridge-policy.js';
+import {
+  addLocalProject,
+  listLocalProjects,
+  projectAuthorityStatus,
+  removeLocalProject,
+  resetLocalProjectSecurity,
+} from './local-projects/service.js';
 import { hasSecret, isEncryptionAvailable, secureStorageStatus, setSecret } from './secrets.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
 import { TUNNEL_ID_PATTERN } from './tunnel/index.js';
@@ -348,6 +355,8 @@ async function buildState(): Promise<AppState> {
   return {
     config,
     status: getStatus(),
+    browserBridgeRequired: await browserBridgeRequired(config),
+    projectAuthority: projectAuthorityStatus(),
     platform: hostPlatformInfo(),
     loginStartupAvailable: supportsLoginStartup(process.platform, app.isPackaged),
     secureStorage: await secureStorageStatus(),
@@ -383,6 +392,17 @@ function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void 
 
 export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void): void {
   registerPluginIpc(handle, getWindow);
+
+  async function reconcileBrowserBridgeAfterProjectChange(): Promise<void> {
+    try {
+      if (await browserBridgeRequired(getConfig())) await startBridge();
+      else await stopBridge();
+    } catch (error) {
+      // Local Project authority is the transaction. Bridge health is a recoverable runtime
+      // projection and must never make a committed add/revoke/reset look like it failed.
+      logWarn(`Local Project security changed but the browser bridge could not reconcile: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   handle('usage:get', () => usageOverview());
   handle('state:get', async () => {
     const state = await buildState();
@@ -464,11 +484,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
         authorityPersistError = error instanceof Error ? error : new Error(String(error));
       }
     }
-    // The extension bridge serves both features: recording needs it to observe the
-    // chat, and multi-agent mode needs it to open worker tabs. Either one being on is
-    // enough, and this must match the startup rule in index.ts exactly — a bridge that
-    // runs at startup but not after a settings save is the worst of both.
-    if (next.sessions.record || next.multiAgent.enabled) await startBridge();
+    // This must match startup: Local Project authorization also needs exact browser identity
+    // even when transcript recording and multi-agent orchestration are both off.
+    if (await browserBridgeRequired(next)) await startBridge();
     else await stopBridge();
     // Permissions and the second tunnel id both decide whether the optional Desktop
     // connector should be published. Without this, enabling desktop access or pasting its
@@ -517,10 +535,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return approveRoot(result.filePaths[0]);
   });
 
-  handle('projects:list', () => listProjects());
+  handle('projects:list', async () => listLocalProjects());
   handle('projects:remove', async (payload) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(payload);
-    const project = await removeProject(id);
+    const project = await removeLocalProject(id);
+    await reconcileBrowserBridgeAfterProjectChange();
     push('session:changed');
     return project;
   });
@@ -536,9 +555,20 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       const state = await approveRoot(folder);
       push('state:changed', state);
     }
-    const project = await addProject(folder);
+    const project = await addLocalProject(folder);
+    await reconcileBrowserBridgeAfterProjectChange();
     push('session:changed');
     return project;
+  });
+
+  handle('projects:resetSecurity', async () => {
+    // local-projects owns the complete recovery transaction: intent, root retirement, authority
+    // reset, and intent retirement. Keeping the sequence in one subsystem makes
+    // restart recovery deterministic instead of splitting one security transition across IPC.
+    await resetLocalProjectSecurity();
+    await reconcileBrowserBridgeAfterProjectChange();
+    push('session:changed');
+    return buildState();
   });
 
   // A folder dropped onto the Folders card. The renderer never sees a system path itself:

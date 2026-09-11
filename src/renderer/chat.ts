@@ -46,7 +46,7 @@ import {
   DEFAULT_GOAL_SYSTEM_PROMPT,
   MAX_GOAL_SYSTEM_PROMPT_CHARS
 } from '../shared/goal.js';
-import { browserExtensionRequired, type AppState, type Config } from '../shared/types.js';
+import type { AppState, Config } from '../shared/types.js';
 import { $, ago, clockTime, compactNumber, el, filterSettingsSections, icon, run, toast } from './dom.js';
 
 const api = window.api;
@@ -419,7 +419,7 @@ function sessionRow(summary: SessionSummary): HTMLElement {
     block.className = `btn sess-action sess-block${blocked ? ' is-blocked' : ''}`;
     block.type = 'button';
     ui(block, 'title', () => blocked
-      ? t("Allow unattributed calls: self-contained calls run again even when the app cannot prove which chat sent them")
+      ? t("Allow unattributed calls: self-contained calls run again when the app cannot prove which chat sent them; Local Project file access still requires exact identity")
       : t("Block unattributed calls: every call the app cannot attribute to a chat is refused and the chat is told to stop"));
     block.append(icon(blocked ? 'i-play' : 'i-ban'));
     block.addEventListener('click', (event) => {
@@ -2873,21 +2873,21 @@ export function chatApply(state: AppState, previous?: Config): void {
   applyGoal(state, previous);
 
   // Extension bridge. Connecting is automatic, so this reports rather than asks.
-  const browserRequired = browserExtensionRequired(config);
+  const browserBridgeRequired = state.browserBridgeRequired;
   $<HTMLButtonElement>('bridgeUnpair').disabled = !bridge.paired;
   const secureStorageAvailable = state.secureStorage?.available ?? true;
-  ui($('bridgeState'), 'textContent', () => !browserRequired
+  ui($('bridgeState'), 'textContent', () => !browserBridgeRequired
     ? t("Browser-backed features are off. The extension is not needed right now.")
     : !secureStorageAvailable
       ? (state.secureStorage?.detail ?? t("Secure credential storage is unavailable, so the extension cannot pair safely."))
     : !bridge.running
-      ? t("The local bridge is off even though recording or multi-agent mode needs it.")
+      ? t("The local bridge is off even though recording, multi-agent mode or Local Project security needs it.")
       : bridge.present
         ? t("Connected. Listening on 127.0.0.1:{0} · last message {1}.", [bridge.port ?? '?', ago(bridge.lastSeenAt)])
         : bridge.paired
           ? t("Authorized, but the browser extension is not currently connected. {0}", [bridge.lastSeenAt === null ? t("It has not checked in since this app started.") : t("Last seen {0}.", [ago(bridge.lastSeenAt)])])
           : t("Listening on 127.0.0.1:{0} · no browser is authorized or connected yet.", [bridge.port ?? '?']));
-  $('bridgeState').classList.toggle('is-warn', browserRequired && (!bridge.present || !secureStorageAvailable));
+  $('bridgeState').classList.toggle('is-warn', browserBridgeRequired && (!bridge.present || !secureStorageAvailable));
   void showExtensionPath();
 
   if (sessions.length > 0) paintSessions();

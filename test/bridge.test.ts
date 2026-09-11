@@ -98,6 +98,7 @@ const {
 const { createSession, deleteSession, findSessionByConversation, getSession, initSessionStore, readEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
+const { addLocalProject, assignSessionProject, initLocalProjects, resetLocalProjectsForTests, restoreLocalProjects } = await import('../src/main/local-projects/service.js');
 const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { resetBlockedChatsForTests, setChatBlocked } = await import('../src/main/session/blocked-chats.js');
 const {
@@ -324,6 +325,8 @@ beforeAll(async () => {
     multiAgent: { ...baseConfig.multiAgent, enabled: true, recoverAgentTabs: true }
   };
   await saveConfig(suiteConfig);
+  initLocalProjects(dir);
+  await restoreLocalProjects();
   const port = await startBridge();
   expect(port, 'no loopback port in 8765-8769 was free').not.toBeNull();
   base = `http://127.0.0.1:${port}`;
@@ -332,6 +335,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await stopBridge();
   resetSessionStoreForTests();
+  resetLocalProjectsForTests();
   await removeTempDir(dir);
 });
 
@@ -910,6 +914,32 @@ describe('activity feed', () => {
       attributionMethod: 'request_id'
     });
   });
+
+  it('registers exact request identity without creating transcript history when recording is off', async () => {
+    await saveConfig({
+      ...suiteConfig,
+      sessions: { ...suiteConfig.sessions, record: false },
+      multiAgent: { ...suiteConfig.multiAgent, enabled: false }
+    });
+    await pair();
+    const conversationId = '18181818-4040-6262-8484-969696969696';
+    const requestId = 'wfr-recording-off-handshake';
+    const mapped = await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        calls: [{ messageId: 'recording-off-message', requestId, tool: 'read', order: 0, answered: false }]
+      }
+    });
+    expect(mapped.status).toBe(200);
+    expect(mapped.body).toMatchObject({
+      sessionId: null,
+      requestIds: [requestId],
+      confirmed: [requestId],
+      complete: true
+    });
+    expect(await findSessionByConversation(conversationId)).toBeNull();
+  });
+
   it('registers a request id the page could not yet name a tool for', async () => {
     await pair();
     const conversationId = '16161616-3838-6060-8282-949494949494';
@@ -2384,12 +2414,11 @@ describe('delivering a bootstrap', () => {
   it.each(['worker', 'resume'] as const)('adds setup only to a new worker, never a resumed chat (%s)', async kind => {
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
-    const { addProject, assignSessionProject } = await import('../src/main/projects.js');
     const folder = path.join(dir, `prompt-project-${kind}`);
     await fs.mkdir(folder, { recursive: true });
     await fs.writeFile(path.join(folder, 'AGENTS.md'), 'SCOPED_AGENTS_HEAD\n' + 'a'.repeat(150000) + '\nSCOPED_AGENTS_TAIL');
     await saveConfig({ ...suiteConfig, roots: [{ name: 'project', path: folder }] });
-    const project = await addProject(folder);
+    const project = await addLocalProject(folder);
     const conversationId = `c-prompt-project-${kind}`;
     const source = await createSession({ title: 'Project source', conversationId });
     await assignSessionProject(source.id, project.id);

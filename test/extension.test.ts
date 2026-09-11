@@ -39,8 +39,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(13);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 13;');
+    expect(BRIDGE_PROTOCOL).toBe(14);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 14;');
   });
 
   /**
@@ -3307,6 +3307,49 @@ describe('extension connection', () => {
       data: { conversationId, confirmed: [requestId], complete: true }
     });
   });
+
+  it.each([true, false])(
+    'publishes a pending Local Project before correlation evidence (binding accepted=%s)',
+    async (accepted) => {
+      const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+      const requestId = '77186fb4-bdda-4849-8cd7-879bb08a1617';
+      const routes: string[] = [];
+      const worker = loadWorker({
+        local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+        session: new FakeStorageArea(),
+        tabsGet: async () => ({ id: 1, url: `https://chatgpt.com/c/${conversationId}` }),
+        fetch: async (input) => {
+          const route = new URL(input).pathname;
+          if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+          routes.push(route);
+          if (route === '/input/bind') return response(200, { ok: accepted });
+          if (route === '/correlations') return response(200, {
+            ok: true,
+            conversationId,
+            requestIds: [requestId],
+            confirmed: [requestId],
+            complete: true
+          });
+          return response(404, {});
+        }
+      });
+
+      const reply = await worker.send({
+        type: 'correlate',
+        conversationId,
+        projectInput: {
+          id: 'ffffffff-1111-4222-8333-444444444444',
+          owner: '1:document-1-0:0'
+        },
+        calls: [{ messageId: 'project-call', tool: 'read', order: 0, answered: false, requestId }]
+      });
+
+      expect(routes).toEqual(accepted ? ['/input/bind', '/correlations'] : ['/input/bind']);
+      expect(reply).toMatchObject(accepted
+        ? { ok: true, data: { confirmed: [requestId] } }
+        : { ok: false, error: 'project_binding_pending' });
+    }
+  );
 
   it('does not re-ask where the app is before every single request', async () => {
     const server = app();

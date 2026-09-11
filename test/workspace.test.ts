@@ -18,7 +18,7 @@ import {
   noteExecOwner,
   resetExecOwnershipForTests
 } from '../src/main/codex/ownership.js';
-import { resolveIn } from '../src/main/mcp/kernel.js';
+import { resolveScopedPath } from '../src/main/mcp/filesystem-scope.js';
 import { SandboxError, resolvePath } from '../src/main/sandbox.js';
 import {
   activateAgentWorkspace,
@@ -28,7 +28,7 @@ import {
   moveChatWorkspace,
   parkAgentWorkspace,
   primeWorkspace,
-  projectFolderOf,
+  workspaceFolderOf,
   resetWorkspaces,
   setWorkspaceFor,
   workspaceEntries,
@@ -125,29 +125,29 @@ describe('who a workspace belongs to', () => {
   });
 
   it('learns nothing when it does not know who is asking', async () => {
-    await run(null, () => resolveIn(roots, '/workspace/project/src/main/patch.ts'));
+    await run(null, () => resolveScopedPath(roots, '/workspace/project/src/main/patch.ts'));
     expect(workspaceEntries()).toEqual([]);
   });
 });
 
 describe('learning a folder from the paths a call already uses', () => {
   it('takes the project, not the folder the file happens to sit in', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/src/main/patch.ts'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/src/main/patch.ts'));
     // `src/main` would be technically true and useless: the next call would have to write
     // `../renderer/chat.ts` and nothing would have been saved.
     expect(run('worker-1', currentWorkspace)?.virtual).toBe('/workspace/project');
   });
 
   it('lets the next call write the path short', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/src/main/patch.ts'));
-    const resolved = await run('worker-1', () => resolveIn(roots, 'src/renderer/chat.ts'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/src/main/patch.ts'));
+    const resolved = await run('worker-1', () => resolveScopedPath(roots, 'src/renderer/chat.ts'));
     expect(resolved.virtual).toBe('/workspace/project/src/renderer/chat.ts');
     expect(resolved.real).toBe(path.join(approved, 'project', 'src', 'renderer', 'chat.ts'));
   });
 
   it('does not learn from a relative path', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/notes.txt'));
-    await run('worker-1', () => resolveIn(roots, 'src/main/patch.ts'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/notes.txt'));
+    await run('worker-1', () => resolveScopedPath(roots, 'src/main/patch.ts'));
     // Still the project. If shorthand could redefine the base, one loose resolution would
     // decide where the next loose resolution points, and the folder would drift downwards
     // one call at a time.
@@ -155,22 +155,22 @@ describe('learning a folder from the paths a call already uses', () => {
   });
 
   it('follows the chat into another project when it moves', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/notes.txt'));
-    await run('worker-1', () => resolveIn(roots, '/workspace/other/src/index.ts'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/notes.txt'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/other/src/index.ts'));
     expect(run('worker-1', currentWorkspace)?.virtual).toBe('/workspace/other');
-    const resolved = await run('worker-1', () => resolveIn(roots, 'src/index.ts'));
+    const resolved = await run('worker-1', () => resolveScopedPath(roots, 'src/index.ts'));
     expect(resolved.virtual).toBe('/workspace/other/src/index.ts');
   });
 
   it('falls back to the containing folder where no project marker exists', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/loose/file.txt'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/loose/file.txt'));
     expect(run('worker-1', currentWorkspace)?.virtual).toBe('/workspace/loose');
   });
 
   it('never walks above the approved root looking for a marker', async () => {
     // `approved` itself has no marker, and neither should the search be allowed to leave it
     // even if a parent on the real disk did: containment is the boundary here as everywhere.
-    const folder = await projectFolderOf(
+    const folder = await workspaceFolderOf(
       { real: path.join(approved, 'loose', 'file.txt'), virtual: '/workspace/loose/file.txt' },
       approved
     );
@@ -180,28 +180,28 @@ describe('learning a folder from the paths a call already uses', () => {
 
 describe("one chat's folder is not another's", () => {
   it('keeps two callers apart', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/notes.txt'));
-    await run('worker-2', () => resolveIn(roots, '/workspace/other/src/index.ts'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/notes.txt'));
+    await run('worker-2', () => resolveScopedPath(roots, '/workspace/other/src/index.ts'));
     expect(run('worker-1', currentWorkspace)?.virtual).toBe('/workspace/project');
     expect(run('worker-2', currentWorkspace)?.virtual).toBe('/workspace/other');
   });
 
   it('resolves the same shorthand to different files for different callers', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/package.json'));
-    await run('worker-2', () => resolveIn(roots, '/workspace/other/package.json'));
-    const one = await run('worker-1', () => resolveIn(roots, 'package.json'));
-    const two = await run('worker-2', () => resolveIn(roots, 'package.json'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/package.json'));
+    await run('worker-2', () => resolveScopedPath(roots, '/workspace/other/package.json'));
+    const one = await run('worker-1', () => resolveScopedPath(roots, 'package.json'));
+    const two = await run('worker-2', () => resolveScopedPath(roots, 'package.json'));
     expect(one.virtual).toBe('/workspace/project/package.json');
     expect(two.virtual).toBe('/workspace/other/package.json');
   });
 
   it('refuses shorthand from a caller that has not worked anywhere yet', async () => {
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/notes.txt'));
-    await expect(run('worker-2', () => resolveIn(roots, 'notes.txt'))).rejects.toThrow(SandboxError);
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/notes.txt'));
+    await expect(run('worker-2', () => resolveScopedPath(roots, 'notes.txt'))).rejects.toThrow(SandboxError);
   });
 
   it('says what to write instead, rather than complaining about an unknown root', async () => {
-    const error = await run('worker-2', () => resolveIn(roots, 'src/main/patch.ts')).catch((e: Error) => e);
+    const error = await run('worker-2', () => resolveScopedPath(roots, 'src/main/patch.ts')).catch((e: Error) => e);
     expect(String((error as Error).message)).toContain('/workspace');
     expect(String((error as Error).message)).not.toContain('Unknown root');
   });
@@ -298,33 +298,33 @@ describe('carrying the folder across a compaction', () => {
 describe('the sandbox is still the boundary', () => {
   beforeEach(async () => {
     resetWorkspaces();
-    await run('worker-1', () => resolveIn(roots, '/workspace/project/src/main/patch.ts'));
+    await run('worker-1', () => resolveScopedPath(roots, '/workspace/project/src/main/patch.ts'));
   });
 
   it('refuses shorthand that climbs out of the workspace', async () => {
     // The point of prefixing before validation rather than joining and normalising: the
     // `..` is still there when checkSegment sees it. `posix.normalize` would have turned
     // this into a clean-looking path with nothing left to refuse.
-    await expect(run('worker-1', () => resolveIn(roots, '../other/src/index.ts'))).rejects.toThrow(SandboxError);
+    await expect(run('worker-1', () => resolveScopedPath(roots, '../other/src/index.ts'))).rejects.toThrow(SandboxError);
   });
 
   it('refuses shorthand that climbs out of the root', async () => {
-    await expect(run('worker-1', () => resolveIn(roots, '../../outside/secret.txt'))).rejects.toThrow(SandboxError);
-    await expect(run('worker-1', () => resolveIn(roots, '..\\..\\outside\\secret.txt'))).rejects.toThrow(SandboxError);
+    await expect(run('worker-1', () => resolveScopedPath(roots, '../../outside/secret.txt'))).rejects.toThrow(SandboxError);
+    await expect(run('worker-1', () => resolveScopedPath(roots, '..\\..\\outside\\secret.txt'))).rejects.toThrow(SandboxError);
   });
 
   it('refuses a symlink out of the root reached by shorthand', async () => {
-    await expect(run('worker-1', () => resolveIn(roots, 'escape/secret.txt'))).rejects.toThrow(SandboxError);
+    await expect(run('worker-1', () => resolveScopedPath(roots, 'escape/secret.txt'))).rejects.toThrow(SandboxError);
   });
 
   it('refuses a native drive path even with a workspace set', async () => {
-    await expect(run('worker-1', () => resolveIn(roots, path.join(outside, 'secret.txt')))).rejects.toThrow(
+    await expect(run('worker-1', () => resolveScopedPath(roots, path.join(outside, 'secret.txt')))).rejects.toThrow(
       SandboxError
     );
   });
 
   it('leaves absolute virtual paths meaning exactly what they always meant', async () => {
-    const resolved = await run('worker-1', () => resolveIn(roots, '/workspace/other/src/index.ts'));
+    const resolved = await run('worker-1', () => resolveScopedPath(roots, '/workspace/other/src/index.ts'));
     expect(resolved.virtual).toBe('/workspace/other/src/index.ts');
     // And the same path resolves identically with no workspace and no call context at all,
     // which is what makes every existing caller and every stored path still correct.
@@ -334,7 +334,7 @@ describe('the sandbox is still the boundary', () => {
   });
 
   it('refuses an absolute path that traverses, instead of normalising it away', async () => {
-    await expect(run('worker-1', () => resolveIn(roots, '/workspace/project/../../outside/secret.txt'))).rejects.toThrow(
+    await expect(run('worker-1', () => resolveScopedPath(roots, '/workspace/project/../../outside/secret.txt'))).rejects.toThrow(
       SandboxError
     );
   });

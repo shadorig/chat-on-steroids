@@ -9,13 +9,15 @@
  *
  * So: write to a temp file, rename over the target (atomic on NTFS), and coalesce
  * bursts on a short timer so a chatty broker does not rewrite the file per message.
- * A parse failure returns null rather than throwing — a corrupt state file must cost
- * the pending work, never the app's ability to start.
+ * Ordinary operational snapshots use the tolerant reader below: corruption may cost pending
+ * convenience state, never startup. Security state is different and uses the strict read/write
+ * boundary, where missing initialization or malformed bytes must stay visible to the caller.
  */
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { logWarn } from './logger.js';
+import { atomicRemoveFile, atomicWriteFile } from './atomic-file.js';
 
 const WRITE_DELAY_MS = 300;
 const RETRY_MAX_MS = 5_000;
@@ -39,10 +41,6 @@ export function initDurableStore(userDataDir: string): void {
   root = path.join(userDataDir, 'state');
 }
 
-export function durableStoreReady(): boolean {
-  return root !== '';
-}
-
 function fileFor(name: string): string {
   if (!/^[a-z0-9-]{1,40}$/.test(name)) throw new Error(`Invalid durable state name: ${name}`);
   return path.join(root, `${name}.json`);
@@ -59,6 +57,37 @@ export async function readDurable<T>(name: string): Promise<T | null> {
       logWarn(`could not read ${name} state: ${(err as Error).message}`);
     }
     return null;
+  }
+}
+
+/**
+ * Reads durable state whose absence is harmless but whose loss would widen authority.
+ *
+ * Most control-plane snapshots can degrade to "nothing pending" when their file is corrupt.
+ * Permission state cannot: treating malformed or unreadable policy as an empty policy silently
+ * grants the broader fallback. Keep that distinction explicit at the read boundary instead of
+ * asking each security-sensitive consumer to reverse-engineer why `readDurable()` returned null.
+ */
+export async function readDurableStrict<T>(name: string): Promise<T | null> {
+  const raw = await readDurableStrictText(name);
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    logWarn(`could not parse ${name} state: ${(err as Error).message}`);
+    throw err;
+  }
+}
+
+/** Strict raw-byte counterpart used when a digest must describe the exact persisted snapshot. */
+export async function readDurableStrictText(name: string): Promise<string | null> {
+  if (!root) throw new Error('The durable store has not been initialized');
+  try {
+    return await fs.readFile(fileFor(name), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    logWarn(`could not read ${name} state: ${(err as Error).message}`);
+    throw err;
   }
 }
 
@@ -159,8 +188,11 @@ export function writeDurableSnapshotSoon(name: string, snapshot: () => unknown):
  * snapshot is correct for ordinary progress, but cannot close a crash window between two
  * files when recovery needs to know which side of the boundary the process reached.
  */
-export async function writeDurableNow(name: string, value: unknown): Promise<void> {
-  if (!root) return;
+async function writeNow(name: string, value: unknown, required: boolean): Promise<void> {
+  if (!root) {
+    if (required) throw new Error('The durable store has not been initialized');
+    return;
+  }
   const timer = timers.get(name);
   if (timer) {
     clearTimeout(timer);
@@ -179,6 +211,42 @@ export async function writeDurableNow(name: string, value: unknown): Promise<voi
     scheduleRetry(name);
     throw err;
   }
+}
+
+export function writeDurableNow(name: string, value: unknown): Promise<void> {
+  return writeNow(name, value, false);
+}
+
+/**
+ * Immediate one-shot write for permission-bearing state; initialization is mandatory.
+ *
+ * Unlike ordinary durable snapshots this deliberately does not enter `pending` and can never be
+ * replayed later by the generic retry timer. A failed security transaction must remain failed
+ * until its owning subsystem explicitly retries the complete transaction, not have one file from
+ * that transaction appear on disk after the caller was already told it failed.
+ */
+export function writeDurableStrictNow(name: string, value: unknown): Promise<void> {
+  return value === null
+    ? writeDurableStrictSerializedNow(name, null)
+    : writeDurableStrictSerializedNow(name, JSON.stringify(value));
+}
+
+/** Exact-byte strict write; see `readDurableStrictText`. */
+export function writeDurableStrictSerializedNow(name: string, serialized: string | null): Promise<void> {
+  if (!root) return Promise.reject(new Error('The durable store has not been initialized'));
+  return enqueue(name, async () => {
+    const target = fileFor(name);
+    try {
+      if (serialized === null) {
+        await atomicRemoveFile(target);
+      } else {
+        await atomicWriteFile(target, serialized);
+      }
+    } catch (err) {
+      logWarn(`could not save ${name} security state: ${(err as Error).message}`);
+      throw err;
+    }
+  });
 }
 
 /** Writes everything queued right now. Called before the app quits, and by tests. */

@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { defaultConfig } from '../src/main/config.js';
-import { surfaceDefinition, surfaceIsUseful } from '../src/main/mcp/surfaces.js';
-import { browserExtensionRequired } from '../src/shared/types.js';
+import { projectToolPolicy, surfaceDefinition, surfaceIsUseful, toolUsesProjectFilesystemScope } from '../src/main/mcp/surfaces.js';
+import { configuredBrowserBridgeRequired } from '../src/shared/types.js';
 
 describe('portable browser-backed feature parity', () => {
   it.each(['win32', 'darwin', 'linux'] as const)(
@@ -25,7 +25,7 @@ describe('portable browser-backed feature parity', () => {
         allowUnattributedCalls: true,
         recoverAgentTabs: false
       });
-      expect(browserExtensionRequired(config)).toBe(true);
+      expect(configuredBrowserBridgeRequired(config)).toBe(true);
     }
   );
 
@@ -33,19 +33,19 @@ describe('portable browser-backed feature parity', () => {
     const config = defaultConfig('darwin');
 
     expect(
-      browserExtensionRequired({
+      configuredBrowserBridgeRequired({
         sessions: { ...config.sessions, record: false },
         multiAgent: { ...config.multiAgent, enabled: true }
       })
     ).toBe(true);
     expect(
-      browserExtensionRequired({
+      configuredBrowserBridgeRequired({
         sessions: { ...config.sessions, record: true },
         multiAgent: { ...config.multiAgent, enabled: false }
       })
     ).toBe(true);
     expect(
-      browserExtensionRequired({
+      configuredBrowserBridgeRequired({
         sessions: { ...config.sessions, record: false },
         multiAgent: { ...config.multiAgent, enabled: false }
       })
@@ -90,5 +90,18 @@ describe('portable browser-backed feature parity', () => {
         'http://127.0.0.1:8769/*'
       ])
     );
+  });
+
+  it('classifies project filesystem admission positively at the MCP surface owner', () => {
+    for (const name of ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'download_artifact']) {
+      expect(toolUsesProjectFilesystemScope('core', name)).toBe(true);
+    }
+    for (const name of ['write_stdin', 'session', 'agents', 'session_finish']) {
+      expect(toolUsesProjectFilesystemScope('core', name)).toBe(false);
+    }
+    expect(toolUsesProjectFilesystemScope('desktop', 'read')).toBe(false);
+    expect(projectToolPolicy('core', 'write_stdin')).toBe('principal');
+    expect(projectToolPolicy('core', 'exec_command')).toBe('filesystem');
+    expect(projectToolPolicy('core', 'session')).toBe('none');
   });
 });

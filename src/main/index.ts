@@ -38,6 +38,8 @@ import {
   type SwarmSnapshot
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { initLocalProjects, restoreLocalProjects } from './local-projects/service.js';
+import { browserBridgeRequired } from './browser-bridge-policy.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
 import { restoreBlockedChats } from './session/blocked-chats.js';
 import { stopComputerHelper } from './computer/index.js';
@@ -300,9 +302,18 @@ void app.whenReady().then(async () => {
   initSecretsPath(userData);
   initSessionStore(userData);
   initDurableStore(userData);
+  initLocalProjects(userData);
   await restoreChatModels();
   if (windowActivation.isDisabled()) return;
   await loadConfig();
+  try {
+    await restoreLocalProjects();
+  } catch (error) {
+    // Keep the app UI repairable, but never reinterpret unreadable/lost narrowing state as broad
+    // access. restoreLocalProjects() latches the runtime UNAVAILABLE, so filesystem admission
+    // refuses for this process even if a later disk read would happen to look empty or valid.
+    logError(`local project authority could not be restored: ${error instanceof Error ? error.message : String(error)}`);
+  }
   await pluginManager.initialize(userData);
   if (windowActivation.isDisabled()) return;
   try { applyLoginStartup(app, getConfig().ui.startAtLogin === true); }
@@ -434,10 +445,9 @@ void app.whenReady().then(async () => {
   // traffic, so never make startup/reload wait behind years of old session history.
   queueDeterministicAttributionRepair();
 
-  // The bridge serves recording and multi-agent mode both: recording needs the
-  // extension to observe the chat, and multi-agent mode needs it to open worker tabs.
-  // Either switch being on starts it. ipc.ts applies the same rule on a settings save.
-  if (getConfig().sessions.record || getConfig().multiAgent.enabled) {
+  // Recording, multi-agent orchestration and Local Project authorization all consume exact
+  // browser identity. ipc.ts applies this same predicate after a settings change.
+  if (await browserBridgeRequired(getConfig())) {
     void startBridge();
   }
   // Retention governs recordings already stored on disk, independent of whether recording is

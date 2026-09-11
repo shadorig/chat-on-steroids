@@ -256,6 +256,12 @@
                   Nothing shared yet. Press Add or drop a folder here. ChatGPT sees short names
                   like <code>/project</code> — your real system paths are never sent.
                 </p>
+                <div class="errbox project-authority-recovery" id="projectAuthorityRecovery" hidden>
+                  <strong id="projectAuthorityHeading">Local Project security is unavailable.</strong>
+                  <p id="projectAuthorityDetail">The saved narrowing policy could not be restored safely.</p>
+                  <p>Recovery first removes every approved folder, then clears Local Project security state. It never deletes files; you can approve the folders you still want afterwards.</p>
+                  <button class="btn" id="resetProjectSecurity" type="button">Clear projects &amp; folder approvals</button>
+                </div>
               </div>
             </section>
 

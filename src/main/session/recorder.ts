@@ -760,10 +760,11 @@ function scheduleAttributionRepair(requestId: string): void {
  */
 function noteCallEvidence(
   conversationId: string,
-  sessionId: string,
+  sessionId: string | null,
   fiberConversationId: string | null | undefined,
   calls: readonly PageCallEvidence[],
-  at: number
+  at: number,
+  options: { persistence?: 'durable' | 'memory' } = {}
 ): void {
   if (fiberConversationId && fiberConversationId !== conversationId) {
     // Name the discarded ids. Without them this line says a batch was dropped but not
@@ -794,7 +795,8 @@ function noteCallEvidence(
       messageId: call.messageId,
       tool: call.tool,
       observedAt
-    }))
+    })),
+    options
   );
   const refusals = new Set<string>();
   for (const [index, call] of evidencedCalls.entries()) {
@@ -816,6 +818,27 @@ function noteCallEvidence(
       scheduleAttributionRepair(call.requestId);
     }
   }
+}
+
+/**
+ * Records the exact browser request-id join independently of transcript recording.
+ *
+ * Recording-on traffic stays on the mature observation path so Compact & Resume supersession,
+ * session selection and every other recorder invariant remain unchanged. Recording-off traffic
+ * adds only the exact request join: it reuses a real retained session when one exists, otherwise
+ * records sessionId=null, creates no transcript, and keeps the correlation process-local so
+ * disabling transcript recording does not silently persist raw browser-activity metadata.
+ */
+export async function recordRequestEvidence(
+  conversationId: string,
+  evidence: readonly PageCallEvidence[] | readonly ChatObservation[]
+): Promise<string | null> {
+  const observations: readonly ChatObservation[] = evidence.length > 0 && 'kind' in evidence[0]!
+    ? evidence as readonly ChatObservation[]
+    : evidence.length > 0
+      ? [{ kind: 'tool_evidence', time: Date.now(), calls: [...evidence as readonly PageCallEvidence[]] }]
+      : [];
+  return recordObservationEvidence(conversationId, observations);
 }
 
 /**
@@ -912,6 +935,10 @@ export async function repairDeterministicAttribution(affected?: ReadonlySet<stri
       const requestId = event.call.requestId;
       const correlation = requestId ? requestCorrelation(requestId) : null;
       if (!correlation) {
+        unknown.push(event);
+        continue;
+      }
+      if (!correlation.sessionId) {
         unknown.push(event);
         continue;
       }
@@ -1717,11 +1744,19 @@ function observationTitle(observations: readonly ChatObservation[]): string | un
 /** The one ownership ingress used by both /correlations and transcript batches.
  * Exact proof needs a committed session/lineage, but must never wait behind that chat's
  * streamed text, HTML or image writes. Session initialization already has its own owner. */
-export async function recordRequestEvidence(
+async function recordObservationEvidence(
   conversationId: string,
   observations: readonly ChatObservation[]
 ): Promise<string | null> {
-  if (!recordingEnabled()) return null;
+  if (!recordingEnabled()) {
+    const sessionId = (await findSessionByConversation(conversationId, { requireUnique: true }))?.id ?? null;
+    for (const item of observations) {
+      if (item.kind === 'tool_evidence' && item.calls?.length) {
+        noteCallEvidence(conversationId, sessionId, item.fiberConversationId, item.calls, item.time, { persistence: 'memory' });
+      }
+    }
+    return sessionId;
+  }
   const lineage = !conversations.has(conversationId) ? await supersededLineage(conversationId) : null;
   const sessionId = lineage ?? await sessionForConversation(conversationId, observationTitle(observations));
   if (!sessionId) return null;
@@ -1746,7 +1781,7 @@ export function recordChatObservations(
   goalCandidates: Array<{ replyId: string; turnId: string; eventSeq: number }>;
 }> {
   const hasEvidence = observations.some((item) => item.kind === 'tool_evidence');
-  const ownership = hasEvidence ? recordRequestEvidence(conversationId, observations) : null;
+  const ownership = hasEvidence ? recordObservationEvidence(conversationId, observations) : null;
   // Observe rejection now even if an earlier transcript batch is still blocked. The queued
   // work below rethrows it to the journal owner, which retains the batch for its normal retry.
   void ownership?.catch(() => undefined);

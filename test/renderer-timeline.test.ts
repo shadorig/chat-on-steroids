@@ -170,6 +170,8 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
   };
   const state = {
     config,
+    browserBridgeRequired: true,
+    projectAuthority: { status: 'ready' as const, detail: null },
     status: { state: 'disconnected', detail: '', publicUrl: null, localUrl: null, handshakeAt: null, lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: [] },
     hasApiKey: false,
     hasGoalKey: false,

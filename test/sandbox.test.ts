@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Root } from '../src/shared/types.js';
 import {
   SandboxError,
+  ScopeBoundaryError,
   isContained,
   normaliseRootName,
   resolvePath,
@@ -214,6 +215,62 @@ describe('resolvePath — roots', () => {
     ];
     const resolved = await resolvePath(two, '/project-two/secret.txt');
     expect(resolved.real).toBe(path.join(outside, 'secret.txt'));
+  });
+});
+
+describe('resolvePath — narrower caller scope', () => {
+  const scope = () => ({ real: path.join(approved, 'sub'), virtual: '/project/sub' });
+  let innerLink: string;
+
+  beforeAll(async () => {
+    await fs.symlink(approved, path.join(approved, 'sub', 'scope-escape'), DIR_LINK);
+    await fs.mkdir(path.join(approved, 'sub', 'inner-target'), { recursive: true });
+    await fs.writeFile(path.join(approved, 'sub', 'inner-target', 'inside.txt'), 'inside');
+    innerLink = path.join(approved, 'sub', 'scope-inner');
+    await fs.symlink(path.join(approved, 'sub', 'inner-target'), innerLink, DIR_LINK);
+  });
+
+  it('allows the selected subtree and its missing descendants', async () => {
+    await expect(resolvePath(roots, '/project/sub/nested.txt', { within: scope() }))
+      .resolves.toMatchObject({ virtual: '/project/sub/nested.txt' });
+    await expect(resolvePath(roots, '/project/sub/new/file.txt', { within: scope(), allowMissing: true }))
+      .resolves.toMatchObject({ virtual: '/project/sub/new/file.txt' });
+  });
+
+  it('rejects existing and missing siblings before exposing which one exists', async () => {
+    await expect(resolvePath(roots, '/project/file.txt', { within: scope() }))
+      .rejects.toThrow('outside the required filesystem scope');
+    await expect(resolvePath(roots, '/project/not-there.txt', { within: scope() }))
+      .rejects.toThrow('outside the required filesystem scope');
+  });
+
+  it('rejects native siblings before canonical target probing', async () => {
+    await expect(resolvePath(roots, path.join(approved, 'file.txt'), { within: scope() }))
+      .rejects.toBeInstanceOf(ScopeBoundaryError);
+    await expect(resolvePath(roots, path.join(approved, 'not-there.txt'), { within: scope() }))
+      .rejects.toBeInstanceOf(ScopeBoundaryError);
+  });
+
+  it('rejects another virtual root before checking whether that root is available', async () => {
+    const unavailable: Root[] = [
+      ...roots,
+      { name: 'other', path: path.join(base, 'missing-approved-root') }
+    ];
+    await expect(resolvePath(unavailable, '/other/unknown.txt', {
+      within: scope()
+    })).rejects.toThrow('outside the required filesystem scope');
+  });
+
+  it('rejects a link that starts inside the scope and resolves outside it', async () => {
+    await expect(resolvePath(roots, '/project/sub/scope-escape/file.txt', { within: scope() }))
+      .rejects.toBeInstanceOf(ScopeBoundaryError);
+    await expect(resolvePath(roots, '/project/sub/scope-escape/new.txt', { within: scope(), allowMissing: true }))
+      .rejects.toBeInstanceOf(ScopeBoundaryError);
+  });
+
+  it('allows a link whose canonical target remains inside the narrower scope', async () => {
+    await expect(resolvePath(roots, '/project/sub/scope-inner/inside.txt', { within: scope() }))
+      .resolves.toMatchObject({ real: path.join(approved, 'sub', 'inner-target', 'inside.txt') });
   });
 });
 

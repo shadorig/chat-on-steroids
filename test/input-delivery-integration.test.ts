@@ -6,7 +6,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { addProject, assignSessionProject } from '../src/main/projects.js';
+import {
+  addLocalProject,
+  assignSessionProject,
+  initLocalProjects,
+  resetLocalProjectsForTests,
+  restoreLocalProjects
+} from '../src/main/local-projects/service.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
 import * as browserWake from '../src/main/browser-wake.js';
 type Handler = (event: unknown, payload: unknown) => Promise<any>;
@@ -50,6 +56,8 @@ beforeAll(async () => {
   directory = await makeTempDir('clf-input-integration-');
   initConfigPath(directory); initSecretsPath(directory); initDurableStore(directory); initSessionStore(directory);
   await saveConfig(defaultConfig());
+  initLocalProjects(directory);
+  await restoreLocalProjects();
   registerIpc(() => ({ isDestroyed: () => false, webContents: { send: pushed } }) as never, () => undefined);
   await startBridge();
   const paired = await post('/pair', {});
@@ -204,7 +212,7 @@ it('completes only an explicitly temporary planner over HTTP without inventing a
   expect((await input.listInputs())[0]).toMatchObject({ conversationId: null, deliveredSessionId: null, state: 'sent' });
 });
 afterAll(async () => {
-  await stopBridge(); await flushDurable(); resetSessionStoreForTests(); resetDurableForTests();
+  await stopBridge(); await flushDurable(); resetSessionStoreForTests(); resetLocalProjectsForTests(); resetDurableForTests();
   await removeTempDir(directory);
 });
 const message = (sessionId: string | null, automation: 'off' | 'goal' | 'loop') => ({
@@ -246,7 +254,7 @@ it('delivers only the selected project AGENTS.md, freezes claims across restart,
   await fs.writeFile(file, 'PROJECT_HEAD\n' + 'project instructions\n'.repeat(30000) + '\nPROJECT_TAIL');
   const config = defaultConfig();
   await saveConfig({ ...config, roots: [{ name: 'project', path: folder }], ui: { ...config.ui, finishTool: true } });
-  const project = await addProject(folder);
+  const project = await addLocalProject(folder);
   const request = await input.enqueueInput({ ...message(null, 'off'), mode: 'auto', projectId: project.id,
     model: 'gpt-6-pro', reasoningEffort: 'pro' });
   const claim = await input.claimBrowserInput(request.id, 'project-document', null, true);

@@ -2357,6 +2357,11 @@ input.num {
   font-size: 12px;
 }
 
+.project-authority-recovery { margin: 10px; color: var(--ink); }
+.project-authority-recovery strong { color: var(--red); }
+.project-authority-recovery p { margin: 6px 0; line-height: 1.45; }
+.project-authority-recovery .btn { margin-top: 4px; }
+
 .hint.is-warn {
   color: var(--soft);
   font-weight: 600;

@@ -319,6 +319,8 @@ export interface ArtifactSettings {
 export interface Config {
   artifacts: ArtifactSettings;
   roots: Root[];
+  /** Authority generation paired with Local Project security state; null means never activated. */
+  projectAuthorityEra: string | null;
   capabilities: Capabilities;
   readOnly: boolean;
   tunnel: TunnelSettings;
@@ -542,18 +544,21 @@ export interface MacOSDesktopAccessStatus {
 /**
  * Whether the enabled product surface currently needs the companion browser extension.
  *
- * Recording consumes browser observations, and multi-agent uses the browser to open/bind
- * worker chats. Goal and compaction also execute through that bridge, but both depend on a
- * recorded session, so they are not independently viable reasons to require a browser when
- * recording itself is off.
+ * Config-only baseline for the main-process runtime predicate. Recording consumes browser
+ * observations, and multi-agent uses the browser to open/bind worker chats. Durable Local Project
+ * state is intentionally composed by browser-bridge-policy.ts because it is not config state.
  */
-export function browserExtensionRequired(config: Pick<Config, 'sessions' | 'multiAgent'>): boolean {
+export function configuredBrowserBridgeRequired(config: Pick<Config, 'sessions' | 'multiAgent'>): boolean {
   return config.sessions.record || config.multiAgent.enabled;
 }
 
 export interface AppState {
   config: Config;
   status: ConnectionStatus;
+  /** Main-process decision including durable Local Project authority, not merely config toggles. */
+  browserBridgeRequired: boolean;
+  /** Fail-closed Local Project policy health; details intentionally contain no storage paths. */
+  projectAuthority: { status: 'ready' | 'degraded' | 'unavailable'; detail: string | null };
   platform: PlatformInfo;
   /** Only packaged Windows builds may change the login item. */
   loginStartupAvailable?: boolean;

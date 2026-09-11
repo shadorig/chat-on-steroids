@@ -15,9 +15,9 @@ the latest version, include that result in the private report.
 
 Chat On Steroids is a permission boundary between ChatGPT and the logged-in OS user running the app:
 
-- Filesystem tools validate paths against folders you explicitly approve.
+- Filesystem tools validate paths against folders you explicitly approve. When a chat is bound to a Local Project, that project is an additional narrower boundary: absolute paths, relative paths, searches, patches, downloads and command starting directories cannot use a sibling folder merely because the sibling shares an approved parent root.
 - Read-only mode disables effective file writes, commands, desktop control and clipboard writes.
-- `exec_command` is intentionally **not** confined to approved folders. It starts in an approved working directory, then runs with the normal privileges of your account.
+- `exec_command` is intentionally **not** a process sandbox. Its starting directory must satisfy the current approved-root and Local Project boundary, but once launched the shell runs with the normal privileges of your account and may access paths the OS user can access.
 - Screen, mouse/keyboard and clipboard permissions are desktop-wide capabilities on Windows and macOS, not folder permissions. On macOS they start off and also require the OS's own Screen Recording and Accessibility grants.
 - MCP servers bind to loopback and use secret tokenized paths. Public reachability comes only from the tunnel you configure.
 - The companion-extension bridge is a separate loopback service and exposes no filesystem, command or settings-mutation route.

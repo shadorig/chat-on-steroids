@@ -22,7 +22,6 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
  * genuinely read-only tool is marked as such.
  */
 
-import { rawPromises as fs } from '../rawfs.js';
 import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
@@ -33,12 +32,17 @@ import { toolSchema } from './tool-declarations.js';
 import {
   SandboxError,
   isAbsoluteVirtualPath,
-  isNativeWindowsPath,
-  resolvePath,
-  type Resolved
+  isNativeWindowsPath
 } from '../sandbox.js';
-import { currentWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
-import { getSessionProject } from '../projects.js';
+import {
+  PROJECT_IDENTITY_REQUIRED,
+  assertProjectPrincipalAllowed,
+  pinFilesystemPolicy,
+  requiresProjectCallerIdentity,
+  resolveScopedCwd,
+  resolveScopedPath,
+  type ResolvedCwd
+} from './filesystem-scope.js';
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
@@ -63,7 +67,7 @@ import {
   stageQueuedWorkerRevivals,
   swarmRunning
 } from '../agents.js';
-import type { SurfaceId } from './surfaces.js';
+import { projectToolPolicy, type SurfaceId } from './surfaces.js';
 import {
   currentCall,
   emptyEvidence,
@@ -439,7 +443,8 @@ export async function dispatch(
   requestId: string | null,
   surface: SurfaceId,
   run: () => Promise<ToolResult>,
-  parent?: CallContext
+  parent?: CallContext,
+  roots: readonly Root[] = getConfig().roots
 ): Promise<ToolResult> {
   // The context is built here, one layer out from where the work happens, because the
   // compaction barrier asks about the whole request and not just the handler. A call is
@@ -458,7 +463,7 @@ export async function dispatch(
   };
   try {
     const result = await trackMcpRequest(() =>
-      trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
+      trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent, roots))
     );
     // In-process callers have no socket; resolving their outer invocation publishes it.
     if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
@@ -491,7 +496,8 @@ async function dispatchTracked(
   requestId: string | null,
   surface: SurfaceId,
   run: () => Promise<ToolResult>,
-  nested: boolean
+  nested: boolean,
+  roots: readonly Root[]
 ): Promise<ToolResult> {
   noteTransportIdentity(transportKey);
   const markTiming = beginToolTiming();
@@ -504,8 +510,45 @@ async function dispatchTracked(
   // Cheap, non-blocking ingress identity. When the page has already reported this exact
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
   // touch state. If the page is one tick late this stays null; only handlers that actually
-  // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
+  // require identity wait for their own exact mate.
   if (!nested) setCallerConversation(context, callerConversation(name, startedAt, requestId));
+  // A Local Project is caller-owned authority. Preflight may tell us identity matters, but it
+  // deliberately does not freeze policy: a project-bearing browser send normally commits
+  // /input/bind before it publishes the request correlation that wakes this waiter. If its page
+  // dies in the post-Send gap, the durable unresolved-send fence makes an unbound caller fail
+  // closed instead. Only after exact identity has settled do we pin one immutable authority epoch
+  // for every admission fence and filesystem operation in this call.
+  let projectAdmissionError: string | null = null;
+  let identityEvidenceExhausted = false;
+  const localProjectPolicy = projectToolPolicy(surface, name);
+  if (localProjectPolicy !== 'none') {
+    try {
+      if (!context.filesystemPolicy) {
+        const identityRequired = await requiresProjectCallerIdentity();
+        if (identityRequired && !context.caller.conversationId) {
+          if (requestId) {
+            setCallerConversation(
+              context,
+              await awaitFreshCallOrigin(name, startedAt, REQUEST_ID_GRACE_MS, { requestId })
+            );
+            // This is the longest exact-id evidence window used by the recorder. If it expired,
+            // shorter workspace/worker/block waits below cannot establish a stronger answer and
+            // would only stack latency onto a call that project admission must already refuse.
+            identityEvidenceExhausted = !context.caller.conversationId;
+          }
+          if (!context.caller.conversationId) {
+            projectAdmissionError = PROJECT_IDENTITY_REQUIRED;
+          }
+        }
+        if (!projectAdmissionError) {
+          pinFilesystemPolicy(context, roots, identityRequired);
+        }
+      }
+      if (!projectAdmissionError && localProjectPolicy === 'principal') await assertProjectPrincipalAllowed(context);
+    } catch (error) {
+      projectAdmissionError = friendlyError(error);
+    }
+  }
   // Only calls that need an *existing* per-chat workspace before the handler runs are
   // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
   // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply
@@ -520,7 +563,8 @@ async function dispatchTracked(
   // handler runs. Recording a late identity cannot recover a discarded anonymous frame.
   const desktopContext = surface === 'desktop' && (name === 'get_window_state' ||
     (WINDOWS_COMPUTER_STATE_INPUT_METHODS as readonly string[]).includes(name));
-  if (!context.caller.conversationId && (desktopContext || name === 'exec' || name === 'update_plan' || (identitySensitive && swarmRunning())) && requestId) {
+  if (!identityEvidenceExhausted && !context.caller.conversationId &&
+      (desktopContext || name === 'exec' || name === 'update_plan' || (identitySensitive && swarmRunning())) && requestId) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
@@ -529,7 +573,7 @@ async function dispatchTracked(
   // A run that ended leaves an explicit short-lived lease tombstone for each open worker
   // chat. Resolve exact request identity before ordinary tools too while such leases exist;
   // otherwise an explicit-workdir exec could keep mutating after its worker was retired.
-  if (!context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
+  if (!identityEvidenceExhausted && !context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
@@ -540,7 +584,7 @@ async function dispatchTracked(
   // attribution an absolute read/exec would otherwise look like an unrelated ordinary chat and
   // run successfully. Resolve the exact mate for every call while such worker conversations
   // exist, just as we do for short-lived retired worker leases.
-  if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
+  if (!identityEvidenceExhausted && !context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId })
@@ -565,7 +609,7 @@ async function dispatchTracked(
   // now means the page never proved it, not that the page had not proved it yet.
   //
   // A chat being compacted is refused on the same terms, so it waits on the same terms.
-  if (!context.caller.conversationId && (anyChatBlocked() || anyContinuationOpen()) && requestId) {
+  if (!identityEvidenceExhausted && !context.caller.conversationId && (anyChatBlocked() || anyContinuationOpen()) && requestId) {
     setCallerConversation(
       context,
       await awaitFreshCallOrigin(name, startedAt, REQUEST_ID_GRACE_MS, { requestId })
@@ -708,6 +752,8 @@ async function dispatchTracked(
           )
         : endedWorker
         ? Promise.resolve(fail(endedWorker))
+        : projectAdmissionError
+        ? Promise.resolve(fail(projectAdmissionError))
         : retiredLeaseAmbiguous
         ? Promise.resolve(
             fail(
@@ -891,89 +937,24 @@ function isFinishCall(name: string, args: unknown): boolean {
   return (args as Record<string, unknown>)['action'] === 'finish';
 }
 
-/**
- * A path named by a tool call, resolved against the chat's workspace when it is relative.
- *
- * Every path argument in every tool goes through here rather than calling `resolvePath`
- * directly, for two reasons. Shorthand then means the same thing in `read` as in `exec` as in
- * `apply_patch` — a model that learns it once has learned it everywhere — and the workspace is
- * learned from every absolute path a call has *proved* it can reach, so no tool has to
- * remember to teach it.
- *
- * The sandbox underneath is untouched. `resolvePath` still performs every root, containment,
- * `..` and symlink check it ever did; the workspace only supplies a prefix for a path that
- * arrived without one, before any of that runs. A chat with no workspace gets the same
- * refusal it would have got for a relative path before, which is why ambiguity here costs a
- * retry rather than reaching the wrong file.
- */
-async function validatedWorkspace() {
-  const sessionId = currentCall()?.caller.sessionId;
-  // Explicit project bindings are durable authority, even after a cwd was learned.
-  // Validate first so a revoked or moved project never becomes a first-root fallback.
-  const project = sessionId ? await getSessionProject(sessionId) : null;
-  if (project) {
-    setCurrentWorkspace(project);
-    return project;
-  }
-  return currentWorkspace();
-}
-
-export async function resolveIn(
-  roots: Parameters<typeof resolvePath>[0],
+export function resolveIn(
+  roots: readonly Root[],
   requested: string,
   options: { allowMissing?: boolean; base?: string | null } = {}
-): Promise<Resolved> {
-  // An explicit adapter-supplied base beats the workspace; otherwise the workspace is the base.
-  // Either way the joining happens inside `resolvePath`, ahead of validation,
-  // so a `..` in the caller's text still meets `checkSegment` instead of being normalised
-  // away first. Doing that join here is how a relative patch path could climb out of the
-  // workspace: `posix.normalize('/root/a/../../elsewhere')` is a perfectly clean-looking
-  // `/elsewhere`, and nothing downstream can tell it apart from a path that was always that.
-  const workspace = await validatedWorkspace();
-  const base = options.base !== undefined ? options.base : (workspace?.virtual ?? null);
-  const resolved = await resolvePath(roots, requested, {
-    ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
-    base
+) {
+  return resolveScopedPath(roots, requested, options);
+}
+
+export function resolveCwd(
+  ctx: ToolContext,
+  virtualPath: string | undefined,
+  purpose: 'command' | 'patch' = 'command'
+): Promise<ResolvedCwd> {
+  return resolveScopedCwd(ctx.roots, virtualPath, {
+    workspaceRequiredMessage: purpose === 'patch'
+      ? 'WORKSPACE_REQUIRED: this chat has no proven workspace. Use an absolute path with read or find first so the intended project is established before applying a patch.'
+      : 'WORKSPACE_REQUIRED: this chat has no proven workspace. Supply an explicit approved workdir before running a command.'
   });
-  // Absolute only: a workspace learned from a relative path would let one loose resolution
-  // decide where the next loose resolution points. See workspace.ts.
-  if (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested)) await learnWorkspace(resolved);
-  return resolved;
-}
-
-export interface ResolvedCwd {
-  real: string;
-  virtual: string;
-  /** True when the caller named no folder, so the workspace or first root was used instead. */
-  defaulted: boolean;
-}
-
-/**
- * The working directory a command tool may use, restricted to an approved root.
- *
- * The caller is told which folder this turned out to be, and whether it was a default,
- * because omitting `workdir` while working inside a nested project is a quiet way to run the
- * wrong build: a live run meant for `…/minecraft-web-demo` fell back to the first root and
- * rebuilt the parent Electron app instead, and nothing in the reply said so.
- */
-export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefined): Promise<ResolvedCwd> {
-  // The chat's own folder before the first root: a command with no `workdir` should run where the
-  // chat has been working, which is the whole point of the workspace and is exactly the case
-  // the note above describes going wrong.
-  const workspace = await validatedWorkspace();
-  // Codex treats an explicitly empty workdir exactly like an omitted one.
-  const provided = virtualPath !== undefined && virtualPath !== '';
-  if (!provided && !workspace && swarmRunning()) {
-    throw new SandboxError(
-      'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Supply an explicit approved workdir before running a command.'
-    );
-  }
-  const target = provided ? virtualPath : (workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : ''));
-  if (!target) throw new SandboxError('No folder is approved, so there is nowhere to run');
-  const resolved = await resolveIn(ctx.roots, target);
-  const stat = await fs.stat(resolved.real);
-  if (!stat.isDirectory()) throw new SandboxError('workdir must be a folder');
-  return { real: resolved.real, virtual: resolved.virtual, defaulted: !provided };
 }
 
 // ------------------------------------------------------------------ shared args
@@ -1081,7 +1062,7 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
       return dispatch(name, args, parent.caller.transportKey, parent.caller.requestId, surface, async () => {
         const entry = handlers.get(name);
         return entry ? entry.run(args) : fail('UNKNOWN_TOOL: this tool is not available on this connector.');
-      }, parent);
+      }, parent, ctx.roots);
     },
     register(name, config, handler) {
       names.push(name);
@@ -1099,7 +1080,7 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
         ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
       }, ((args: never, mcpCtx?: McpCallContext) =>
         dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args)
+          handler(args), undefined, ctx.roots
         )) as never);
     },
     guarded(cap, name, fn) {

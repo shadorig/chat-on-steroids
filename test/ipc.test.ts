@@ -39,9 +39,10 @@ const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('.
 const { initSecretsPath, resetSecretsCacheForTests } = await import('../src/main/secrets.js');
 const { appendEvent, createSession, initSessionStore, rebindSession, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
-const { pendingCommands, resetBridgeForTests, setBrowserOpener, startBridge, stopBridge } = await import(
+const { bridgeStatus, pendingCommands, resetBridgeForTests, setBrowserOpener, startBridge, stopBridge } = await import(
   '../src/main/bridge.js'
 );
+const { initLocalProjects, restoreLocalProjects } = await import('../src/main/local-projects/service.js');
 const {
   bindConversation,
   finishAgent,
@@ -199,8 +200,13 @@ it('adds picker-selected projects, reuses containing approval, and leaves cancel
   currentWindow = { setBackgroundColor: vi.fn(), setTitleBarOverlay: vi.fn(), isDestroyed: () => false, webContents: { send: vi.fn() } };
   const folder = path.join(dir, 'picker-project');
   await fs.mkdir(path.join(folder, 'child'), { recursive: true });
-  await saveConfig({ ...defaultConfig(), roots: [] });
-  await writeDurableNow('projects', []);
+  const config = defaultConfig();
+  await saveConfig({
+    ...config,
+    roots: [],
+    sessions: { ...config.sessions, record: false },
+    multiAgent: { ...config.multiAgent, enabled: false }
+  });
   const add = () => handlers.get('projects:add')!(null, {}) as Promise<any>;
   expect((await add()).data).toBeNull();
   expect(getConfig().roots).toHaveLength(0);
@@ -209,6 +215,8 @@ it('adds picker-selected projects, reuses containing approval, and leaves cancel
   expect(first.ok, first.error).toBe(true);
   expect(first.data.name).toBe('picker-project');
   expect(getConfig().roots).toHaveLength(1);
+  expect((await bridgeStatus()).running).toBe(true);
+  expect(((await handlers.get('state:get')!(null, undefined)) as any).data.browserBridgeRequired).toBe(true);
   expect((await add()).data.id).toBe(first.data.id);
   vi.mocked(dialog.showOpenDialog).mockResolvedValue({ canceled: false, filePaths: [path.join(folder, 'child')] });
   expect((await add()).data.name).toBe('child');
@@ -243,6 +251,8 @@ beforeAll(async () => {
   initSecretsPath(dir);
   initSessionStore(dir);
   initDurableStore(dir);
+  initLocalProjects(dir);
+  await restoreLocalProjects();
   onSwarmPersist(() => writeDurableSoon('ipc-swarm', snapshotSwarm()));
   onSwarmPersistNow((snapshot) => writeDurableNow('ipc-swarm', snapshot));
   onRetiredWorkersPersist(() => writeDurableSoon('ipc-retired-workers', snapshotRetiredWorkers()));

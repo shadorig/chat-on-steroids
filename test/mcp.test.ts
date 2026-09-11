@@ -1928,14 +1928,33 @@ describe('sandbox enforcement through the tool layer', () => {
     await expect(fs.stat(path.join(approved, 'escaped.txt'))).rejects.toThrow();
   });
 
-  it('still applies an ordinary relative patch path against its base', async () => {
-    // The refusals above must not have been bought by breaking shorthand itself.
+  it('uses relative patch shorthand only after the exact chat has a proven workspace', async () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ create: true });
-    const reply = await core('tools/call', {
+    const unbound = await core('tools/call', {
       name: 'apply_patch',
       arguments: { patch: addPatch('relative-landed.txt', ['x']) }
     });
+    expect(unbound.body.result?.isError).toBe(true);
+    expect(textOf(unbound)).toContain('WORKSPACE_REQUIRED');
+    await expect(fs.stat(path.join(approved, 'relative-landed.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+    const requestId = 'wfr_relative_patch';
+    const conversationId = 'conv-relative-patch';
+    expect(observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: 'session-relative-patch',
+      messageId: 'message-relative-patch',
+      tool: 'apply_patch',
+      observedAt: Date.now()
+    })).toBe('stored');
+    setWorkspaceFor(`chat:${conversationId}`, { virtual: '/workspace', real: approved });
+    const reply = await modern(
+      'tools/call',
+      { name: 'apply_patch', arguments: { patch: addPatch('relative-landed.txt', ['x']) } },
+      { 'x-request-id': `${requestId}/att1` }
+    );
     expect(reply.body.result?.isError).toBeFalsy();
     expect(await fs.readFile(path.join(approved, 'relative-landed.txt'), 'utf8')).toContain('x');
   });
@@ -3278,7 +3297,7 @@ describe('exec_command and write_stdin', () => {
     expect(textOf(second)).not.toContain('first=raw-no-newline');
   });
 
-  it('runs in workdir and omits the old connector-specific cwd header', async () => {
+  it('runs in an explicit workdir, refuses an unproven default, and omits the old cwd header', async () => {
     const readApp = IS_WINDOWS ? "Get-Content 'src/app.ts'" : "cat 'src/app.ts'";
     const named = await core('tools/call', {
       name: 'exec_command',
@@ -3292,9 +3311,28 @@ describe('exec_command and write_stdin', () => {
       name: 'exec_command',
       arguments: { cmd: readApp, yield_time_ms: 5_000 }
     });
-    expect(defaulted.body.result?.isError).not.toBe(true);
-    expect(textOf(defaulted)).toContain('export const name = "app";');
-    expect(textOf(defaulted)).not.toContain('default — no cwd was given');
+    expect(defaulted.body.result?.isError).toBe(true);
+    expect(textOf(defaulted)).toContain('WORKSPACE_REQUIRED');
+
+    const requestId = 'wfr_exec_default_workspace';
+    const conversationId = 'conv-exec-default-workspace';
+    expect(observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: 'session-exec-default-workspace',
+      messageId: 'message-exec-default-workspace',
+      tool: 'exec_command',
+      observedAt: Date.now()
+    })).toBe('stored');
+    setWorkspaceFor(`chat:${conversationId}`, { virtual: '/workspace', real: approved });
+    const proven = await modern(
+      'tools/call',
+      { name: 'exec_command', arguments: { cmd: readApp, yield_time_ms: 5_000 } },
+      { 'x-request-id': `${requestId}/att1` }
+    );
+    expect(proven.body.result?.isError).not.toBe(true);
+    expect(textOf(proven)).toContain('export const name = "app";');
+    expect(textOf(proven)).not.toContain('default — no cwd was given');
   });
 
   it.runIf(IS_WINDOWS)('preserves Codex raw merged output instead of the retired connector CLIXML rewrite', async () => {

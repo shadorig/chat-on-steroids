@@ -785,13 +785,14 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     h.fetch.mockImplementation(async () => ({ ok: false, status: 503, json: async () => ({}) } as never));
     const receipt = { id: firstId, owner: '7:original-document:0', conversationId: 'conversation-a', messageId: 'native-user-a' };
     expect(await h.ackDesktopInput(receipt.id, receipt.owner, receipt.conversationId, receipt.messageId)).toMatchObject({ ok: true, queued: true });
-    expect(h.localSaved.commandAckOutbox).toEqual([expect.objectContaining({ kind: 'input', ...receipt })]);
+    expect(h.localSaved.inputReceiptOutbox).toEqual([expect.objectContaining(receipt)]);
+    expect(h.localSaved.commandAckOutbox).toEqual([]);
     const restarted = await worker([], undefined, JSON.parse(JSON.stringify(h.localSaved)));
     await restarted.drainCommandAcks();
     const requests = restarted.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/ack');
     expect(requests).toHaveLength(1);
     expect(JSON.parse(String(requests[0]?.[1]?.body))).toEqual(receipt);
-    expect(restarted.localSaved.commandAckOutbox).toEqual([]);
+    expect(restarted.localSaved.inputReceiptOutbox).toEqual([]);
     expect(restarted.create).not.toHaveBeenCalled();
     expect(restarted.sendMessage).not.toHaveBeenCalled();
   });
@@ -802,6 +803,32 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect(await h.ackDesktopInput(firstId, 'owner', 'conversation-b', 'native-b')).toMatchObject({ ok: false, error: 'conflicting_send_receipt' });
     h.local.set.mockRejectedValueOnce(new Error('storage unavailable'));
     await expect(h.ackDesktopInput(secondId, 'owner', 'conversation-b', 'native-b')).rejects.toThrow('storage unavailable');
+  });
+  it('gives exact input receipts independent capacity from a saturated command ACK queue', async () => {
+    const commands = Array.from({ length: 200 }, (_, index) => ({ id: `command-${index}`, status: 'sent', queuedAt: index }));
+    const h = await worker([], undefined, { commandAckOutbox: commands });
+    h.fetch.mockImplementation(async (input) => new URL(input).pathname === '/hello'
+      ? { ok: true, status: 200, json: async () => ({ app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, compatible: true, paired: true }) } as never
+      : { ok: false, status: 503, json: async () => ({}) } as never);
+    expect(await h.ackDesktopInput(firstId, 'owner', 'conversation-a', 'native-a')).toMatchObject({ ok: true, queued: true });
+    expect((h.localSaved.commandAckOutbox as unknown[])).toHaveLength(200);
+    expect(h.localSaved.inputReceiptOutbox).toEqual([expect.objectContaining({ id: firstId, conversationId: 'conversation-a' })]);
+  });
+  it('retains a project-binding 409 receipt and replays it until the app accepts the exact proof', async () => {
+    const h = await worker([]);
+    let bindingReady = false;
+    h.fetch.mockImplementation(async (input) => {
+      const route = new URL(input).pathname;
+      if (route === '/hello') return { ok: true, status: 200, json: async () => ({ app: 'chat-on-steroids', bridge: BRIDGE_PROTOCOL, compatible: true, paired: true }) } as never;
+      if (route === '/input/ack' && !bindingReady) return { ok: false, status: 409, json: async () => ({ error: 'project_input_not_bound' }) } as never;
+      return { ok: true, status: 200, json: async () => ({ ok: true }) } as never;
+    });
+    expect(await h.ackDesktopInput(firstId, 'owner', 'conversation-a', 'native-a')).toMatchObject({ ok: true, queued: true });
+    expect(h.localSaved.inputReceiptOutbox).toEqual([expect.objectContaining({ id: firstId })]);
+    bindingReady = true;
+    await h.drainCommandAcks();
+    expect(h.localSaved.inputReceiptOutbox).toEqual([]);
+    expect(h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/ack')).toHaveLength(2);
   });
   it('journals only a receipt belonging to the current exact document and conversation', async () => {
     const h = await worker([]);
@@ -830,7 +857,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     expect((await h.events(message, sender, source)).ok).toBe(false);
     expect(h.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/events')).toBe(false);
     accepted = true;
-    expect((await h.events(message, sender, source)).projectBound).toBe(firstId);
+    expect((await h.events(message, sender, source)).boundProjectInputId).toBe(firstId);
     const routes = h.fetch.mock.calls.map(([url]) => new URL(url).pathname);
     expect(routes.indexOf('/events')).toBeGreaterThan(routes.lastIndexOf('/input/bind'));
     h.fetch.mockClear();

@@ -12,7 +12,7 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '2.0.9';
+export const APP_VERSION = '2.0.10';
 
 /**
  * Standalone extension recovery must stay on the app's own release. Using GitHub's moving
@@ -66,4 +66,7 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  */
 // 13 — native file attachments require exact claimed-input chunk delivery and final
 // draft ownership. A 12 companion would silently send text without these files.
-export const BRIDGE_PROTOCOL = 13;
+// 14 — browser evidence can carry a project input claim so the app binds Local Project authority
+// before normal request-id publication, while a durable pre-Send fence covers document loss in the
+// narrow post-Send gap. A 13 companion can publish correlation without that claim/fence contract.
+export const BRIDGE_PROTOCOL = 14;

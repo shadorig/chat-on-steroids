@@ -435,7 +435,7 @@ export interface SessionSummary {
   titleSource?: 'fallback' | 'provider' | 'manual';
   /** Latest proven native picker selection; scoped to its frontend, never worker creation intent. */
   selectedModel?: { conversationId: string; model: string; observedAt: number; reasoningEffort?: ReasoningEffort };
-  /** Explicit local project; durable across frontend conversation replacement. */
+  /** UI projection of explicit Local Project authority; the independent authority ledger is durable. */
   projectId?: string;
   id: string;
   title: string;

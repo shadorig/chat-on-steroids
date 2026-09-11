@@ -41,6 +41,7 @@ import {
 import { logError } from './logger.js';
 import { RESERVED_ROOT_NAMES } from './sandbox.js';
 import { capabilitiesForPlatform } from './platform.js';
+import { atomicWriteJson } from './atomic-file.js';
 
 /**
  * Defaults for the newer sections, in one place so the schema and defaultConfig()
@@ -263,6 +264,13 @@ const capabilitiesSchema = z
 export const MAX_MCP_INSTRUCTIONS_CHARS = 4000;
 const DEFAULT_MCP = { instructions: '' } as const;
 
+/**
+ * One-time upgrade identity for builds that persisted only `projectAuthorityActivated: true`.
+ * It is deliberately a valid UUID so the runtime has one era type; a later security reset always
+ * replaces it with a fresh random UUID and old/new durable generations can no longer mix.
+ */
+export const LEGACY_PROJECT_AUTHORITY_ERA = '00000000-0000-4000-8000-000000000001';
+
 const configSchema = z.object({
   // A config written by hand — or by a build before `/skills` was reserved — must not be
   // able to claim a reserved virtual root. Renamed rather than rejected: a single bad root
@@ -271,6 +279,10 @@ const configSchema = z.object({
     .array(rootSchema)
     .max(32)
     .transform(uniqueStoredRoots),
+  // Paired generation witness stored beside broad root grants. The deprecated boolean is accepted
+  // only as migration input and is never emitted again.
+  projectAuthorityEra: z.string().uuid().nullable().optional(),
+  projectAuthorityActivated: z.boolean().optional().default(false),
   capabilities: capabilitiesSchema,
   readOnly: z.boolean(),
   tunnel: z.object({
@@ -452,7 +464,10 @@ const configSchema = z.object({
     .optional()
     .default({ ...DEFAULT_MCP })
     .catch({ ...DEFAULT_MCP })
-});
+}).transform(({ projectAuthorityActivated, projectAuthorityEra, ...config }) => ({
+  ...config,
+  projectAuthorityEra: projectAuthorityEra ?? (projectAuthorityActivated ? LEGACY_PROJECT_AUTHORITY_ERA : null)
+} satisfies Config));
 
 /**
  * Fresh-install Desktop exposure differs by host. Windows starts the Desktop group on. macOS has
@@ -470,6 +485,7 @@ function firstLaunchCapabilities(platform: NodeJS.Platform, release?: string): C
 export function defaultConfig(platform: NodeJS.Platform = process.platform, release?: string): Config {
   return {
     roots: [],
+    projectAuthorityEra: null,
     capabilities: firstLaunchCapabilities(platform, release),
     readOnly: false,
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
@@ -670,10 +686,7 @@ export function effectiveCapabilities(
 
 async function persistConfig(next: Config): Promise<Config> {
   const parsed = enforceFeatureDependencies(configSchema.parse(next));
-  const tmp = `${configPath}.tmp`;
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(tmp, JSON.stringify(parsed, null, 2), 'utf8');
-  await fs.rename(tmp, configPath);
+  await atomicWriteJson(configPath, parsed, true);
   // Only publish the new in-memory state after the durable write succeeded. A disk
   // error must not leave the UI believing settings were saved when they were not.
   current = parsed;

@@ -30,26 +30,33 @@ import { indexedSessions, readRecentEvents } from './store.js';
 export interface RequestCorrelation {
   requestId: string;
   conversationId: string;
-  /** Durable local session epoch that owned this request when the page first proved it. */
-  sessionId: string;
+  /** Actual durable local session id when one existed at first proof; never a synthetic id. */
+  sessionId: string | null;
   messageId: string;
   tool: string;
   observedAt: number;
 }
 
 const MAX_CORRELATIONS = 50_000;
+const MAX_VOLATILE_CORRELATIONS = 5_000;
 const CORRELATIONS_STATE = 'request-correlations';
 /**
- * 5 stores owners and nothing else, because an owner is now the only verdict there is.
+ * 6 stores owners and permits `sessionId: null`, because exact conversation ownership does not
+ * imply a durable local session exists when transcript recording is off.
  *
  * Versions 3 and 4 wrapped each row in a sticky `conflicted` flag, so a row could exist purely
  * to record that its id was unusable. Those rows say nothing this registry can act on any more:
  * read the owner out of the wrapper when one is there, and let a forgotten id be proved again
  * by exact evidence or by the recorded history reconciled below.
  */
-const CORRELATIONS_STATE_VERSION = 5;
+const CORRELATIONS_STATE_VERSION = 6;
 
-const byRequest = new Map<string, RequestCorrelation>();
+/** Durable ownership and its eviction order are one isolated persistence domain. */
+const durableByRequest = new Map<string, RequestCorrelation>();
+const durableOrder = new Map<string, true>();
+/** Recording-off ownership is useful at runtime but cannot mutate the durable domain at capacity. */
+const volatileByRequest = new Map<string, RequestCorrelation>();
+const volatileOrder = new Map<string, true>();
 const waiters = new Map<string, Set<() => void>>();
 /**
  * Evidence grace belongs to the request, not each tool call in its workflow. All callers
@@ -76,11 +83,21 @@ function wake(requestId: string): void {
   for (const resolve of held) resolve();
 }
 
-function trim(): void {
-  while (byRequest.size > MAX_CORRELATIONS) {
-    const first = byRequest.keys().next().value as string | undefined;
+function touch(order: Map<string, true>, requestId: string): void {
+  order.delete(requestId);
+  order.set(requestId, true);
+}
+
+function trimStore(
+  byRequest: Map<string, RequestCorrelation>,
+  order: Map<string, true>,
+  limit: number
+): void {
+  while (byRequest.size > limit) {
+    const first = order.keys().next().value as string | undefined;
     if (!first) break;
     byRequest.delete(first);
+    order.delete(first);
     wake(first);
   }
 }
@@ -88,7 +105,11 @@ function trim(): void {
 function snapshot(): PersistedCorrelations {
   return {
     version: CORRELATIONS_STATE_VERSION,
-    entries: [...byRequest.values()].map((owner) => ({ ...owner }))
+    entries: [...durableOrder.keys()]
+      .flatMap(requestId => {
+        const owner = durableByRequest.get(requestId);
+        return owner ? [{ ...owner }] : [];
+      })
   };
 }
 
@@ -100,7 +121,7 @@ function persist(): void {
  * Whether a persisted row still carries everything an owner needs to be restored.
  *
  * The bar is exactly what this registry answers with: a request id, the conversation that
- * proved it, the session epoch that owned it, and when. `tool` is a diagnostic label, kept so
+ * proved it, the real session id when one existed, and when. `tool` is a diagnostic label, kept so
  * a stored row can be read by a human; no caller reads it, and the header above says why it
  * could not be evidence even if one did. Demanding a nonempty one here was therefore a bar the
  * registry itself does not have - and it silently deleted the rows that need restoring most.
@@ -119,7 +140,7 @@ function validCorrelation(value: unknown): value is RequestCorrelation {
   return (
     typeof item.requestId === 'string' && item.requestId.length > 0 && item.requestId.length <= 200 &&
     typeof item.conversationId === 'string' && item.conversationId.length > 0 && item.conversationId.length <= 200 &&
-    typeof item.sessionId === 'string' && /^[0-9a-z-]{8,64}$/i.test(item.sessionId) &&
+    (item.sessionId === null || (typeof item.sessionId === 'string' && /^[0-9a-z-]{8,64}$/i.test(item.sessionId))) &&
     typeof item.messageId === 'string' && item.messageId.length > 0 && item.messageId.length <= 300 &&
     typeof item.tool === 'string' && item.tool.length <= 100 &&
     typeof item.observedAt === 'number' && Number.isFinite(item.observedAt)
@@ -146,34 +167,62 @@ function storedOwner(raw: unknown): RequestCorrelation | null {
  * tool identify individual calls inside that turn, so differences there are expected and change
  * nothing. Only the conversation is ownership, and only the first proof of it counts.
  *
- * The session epoch is first-proof-wins for the same conversation as well. Compact & Resume can
- * leave the old page model mounted while a newer local session epoch exists for that same old
+ * The session id is first-proof-wins for the same conversation as well. Compact & Resume can
+ * leave the old page model mounted while a newer local session exists for that same old
  * conversation id, and re-observing the request from that stale page must not drag an in-flight
- * request into the newer epoch.
+ * request into the newer session.
  */
-function merge(input: RequestCorrelation): 'stored' | 'same' | 'refused' {
-  const previous = byRequest.get(input.requestId);
+function merge(
+  input: RequestCorrelation,
+  persistence: 'durable' | 'memory' = 'durable'
+): { result: 'stored' | 'same' | 'refused'; durableChanged: boolean } {
+  const durable = durableByRequest.get(input.requestId);
+  const volatile = volatileByRequest.get(input.requestId);
+  const previous = volatile ?? durable;
   if (!previous) {
-    byRequest.set(input.requestId, { ...input });
+    if (persistence === 'memory') {
+      volatileByRequest.set(input.requestId, { ...input });
+      touch(volatileOrder, input.requestId);
+      trimStore(volatileByRequest, volatileOrder, MAX_VOLATILE_CORRELATIONS);
+    } else {
+      durableByRequest.set(input.requestId, { ...input });
+      touch(durableOrder, input.requestId);
+      trimStore(durableByRequest, durableOrder, MAX_CORRELATIONS);
+    }
     evidenceWindowStarts.delete(input.requestId);
-    trim();
     wake(input.requestId);
-    return 'stored';
+    return { result: 'stored', durableChanged: persistence === 'durable' };
   }
 
   // Refused, and nothing else: the entry does not change and no waiter is woken, because a
   // claim this registry does not believe is not an answer for anybody waiting on the id.
-  if (previous.conversationId !== input.conversationId) return 'refused';
+  if (previous.conversationId !== input.conversationId) return { result: 'refused', durableChanged: false };
 
-  if (input.observedAt > previous.observedAt) {
-    previous.observedAt = input.observedAt;
-    // trim() uses insertion order as the bounded registry's freshness order. Updating the
-    // timestamp without moving this key left a live, repeatedly observed old request at the
-    // eviction head, so enough newer ids could discard it while genuinely stale ids stayed.
-    byRequest.delete(input.requestId);
-    byRequest.set(input.requestId, previous);
+  if (persistence === 'memory') {
+    // A purely volatile owner may advance its own freshness. A durable owner is completely
+    // untouched — including LRU order — so recording-off traffic cannot influence persistence.
+    if (volatile) {
+      if (input.observedAt > volatile.observedAt) volatile.observedAt = input.observedAt;
+      touch(volatileOrder, input.requestId);
+    }
+    return { result: 'same', durableChanged: false };
   }
-  return 'same';
+
+  let durableChanged = false;
+  if (volatile) {
+    // Promotion persists only fields from the durable observation, except the first-proof session
+    // principal, whose immutability prevents a stale page from moving an in-flight workflow.
+    durableByRequest.set(input.requestId, { ...input, sessionId: volatile.sessionId });
+    volatileByRequest.delete(input.requestId);
+    volatileOrder.delete(input.requestId);
+    durableChanged = true;
+  } else if (durable && input.observedAt > durable.observedAt) {
+    durable.observedAt = input.observedAt;
+    durableChanged = true;
+  }
+  touch(durableOrder, input.requestId);
+  trimStore(durableByRequest, durableOrder, MAX_CORRELATIONS);
+  return { result: 'same', durableChanged };
 }
 
 /**
@@ -204,10 +253,10 @@ async function restoreRequestCorrelationsOnce(): Promise<void> {
     for (const raw of saved.entries.slice(-MAX_CORRELATIONS)) {
       const owner = storedOwner(raw);
       if (!owner) continue;
-      merge(owner);
+      merge(owner, 'durable');
       loaded = true;
     }
-    trim();
+    trimStore(durableByRequest, durableOrder, MAX_CORRELATIONS);
   }
 
   // The durable index is a debounced snapshot, while attributed tool-call JSONL is appended
@@ -248,13 +297,13 @@ async function restoreRequestCorrelationsOnce(): Promise<void> {
         messageId: `stored:${call.callId}`,
         tool: call.tool,
         observedAt: event.time
-      });
+      }, 'durable');
     }
   }
   // Also when the snapshot on disk is an older version that held nothing usable: rewriting it
   // is what actually removes its conflict rows, and leaving them there would make every
   // later launch re-read a verdict this registry no longer has.
-  if (byRequest.size > 0 || loaded || (saved?.version ?? CORRELATIONS_STATE_VERSION) !== CORRELATIONS_STATE_VERSION) persist();
+  if (durableByRequest.size > 0 || loaded || (saved?.version ?? CORRELATIONS_STATE_VERSION) !== CORRELATIONS_STATE_VERSION) persist();
 }
 
 /**
@@ -277,28 +326,24 @@ export function observeRequestCorrelation(input: RequestCorrelation): 'stored' |
  * keep the API above, so the durable queue boundary stays synchronous everywhere.
  */
 export function observeRequestCorrelations(
-  inputs: readonly RequestCorrelation[]
+  inputs: readonly RequestCorrelation[],
+  options: { persistence?: 'durable' | 'memory' } = {}
 ): Array<'stored' | 'same' | 'refused'> {
   let changed = false;
+  const persistence = options.persistence ?? 'durable';
   const results = inputs.map((input) => {
-    const previousObservedAt = byRequest.get(input.requestId)?.observedAt;
-    const result = merge(input);
-    // A same-owner observation can still advance durable freshness/order. Persist that too so
-    // an app restart cannot resurrect the pre-refresh eviction order. A refusal changes nothing
-    // and therefore writes nothing.
-    if (result === 'stored' || (result === 'same' && previousObservedAt !== undefined && input.observedAt > previousObservedAt)) {
-      changed = true;
-    }
-    return result;
+    const merged = merge(input, persistence);
+    if (merged.durableChanged) changed = true;
+    return merged.result;
   });
-  if (changed) persist();
+  if (changed && persistence === 'durable') persist();
   return results;
 }
 
 /** Exact request-id lookup. An id no page has proved yet resolves to null. */
 export function requestCorrelation(requestId: string | null | undefined): RequestCorrelation | null {
   if (!requestId) return null;
-  const held = byRequest.get(requestId);
+  const held = volatileByRequest.get(requestId) ?? durableByRequest.get(requestId);
   return held ? { ...held } : null;
 }
 
@@ -340,7 +385,10 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
 
 /** A conversation being closed cannot invalidate an already issued request. */
 export function resetCorrelationRegistryForTests(): void {
-  byRequest.clear();
+  durableByRequest.clear();
+  durableOrder.clear();
+  volatileByRequest.clear();
+  volatileOrder.clear();
   evidenceWindowStarts.clear();
   restored = false;
   restoring = null;

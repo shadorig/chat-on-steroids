@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import { JSDOM } from 'jsdom';
+import { BRIDGE_PROTOCOL } from '../src/main/version.js';
 
 const html = await readFile(new URL('../extension/popup.html', import.meta.url), 'utf8');
 const script = await readFile(new URL('../extension/popup.js', import.meta.url), 'utf8');
@@ -40,10 +41,10 @@ it('reports only app reachability from compatible health and pairing', () => {
 
 it('explains manual mismatch recovery with both versions and keeps reload available', () => {
   const document = openPopup(vi.fn());
-  (popup!.window as any).paintAlert({ connected: true, paired: true, compatible: false, appVersion: '2.0.7', appProtocol: 13, extensionVersion: '2.0.6', extensionProtocol: 12 }, null);
+  (popup!.window as any).paintAlert({ connected: true, paired: true, compatible: false, appVersion: '2.0.7', appProtocol: BRIDGE_PROTOCOL, extensionVersion: '2.0.6', extensionProtocol: BRIDGE_PROTOCOL - 1 }, null);
   const alert = document.getElementById('alert')!;
   expect(alert.textContent).toContain('2.0.7'); expect(alert.textContent).toContain('2.0.6');
-  expect(alert.textContent).toContain('protocol 13'); expect(alert.textContent).toContain('protocol 12');
+  expect(alert.textContent).toContain(`protocol ${BRIDGE_PROTOCOL}`); expect(alert.textContent).toContain(`protocol ${BRIDGE_PROTOCOL - 1}`);
   expect(alert.textContent).toContain('Developer mode'); expect(alert.textContent).toContain('Open extension folder');
   expect(document.getElementById('reloadBtn')).not.toBeNull();
 });

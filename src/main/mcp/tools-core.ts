@@ -29,8 +29,7 @@ import {
   viewImage
 } from '../codex/view-image.js';
 import { logInfo, logWarn } from '../logger.js';
-import { SandboxError, isNativeWindowsPath, resolvePath, strayVirtualPath } from '../sandbox.js';
-import { currentWorkspace } from '../workspace.js';
+import { SandboxError, isAbsoluteVirtualPath, isNativeWindowsPath, strayVirtualPath } from '../sandbox.js';
 import type { Capabilities, Root } from '../../shared/types.js';
 import type { FileChange } from '../../shared/session.js';
 import { REASONING_EFFORTS } from '../../shared/session.js';
@@ -116,7 +115,6 @@ import {
   stageFinishAgent,
   stageMessages,
   stageSpawn,
-  swarmRunning,
   swarmStateForCaller,
   type Caller
 } from '../agents.js';
@@ -148,10 +146,10 @@ import {
   pathArg,
   lineNumberArg,
   resolveCwd,
-  resolveIn,
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
+import { resolveDefaultSearchScopes, resolveScopedPath } from './filesystem-scope.js';
 import { registerSessionTool as registerSessionSearchReadTool } from './session-tool.js';
 import { ArtifactFetchError } from './artifact-fetch.js';
 import { ArtifactTargetError } from './artifact-target.js';
@@ -260,7 +258,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   const readPathDescription =
     virtualRoots.length > 0
       ? `Paths inside the live approved roots: ${virtualRoots.join(', ')}. A root is an approved folder, usually a parent of the project rather than the project itself, so name every folder between the root and the file — the same path exec_command takes as workdir. Reading a root lists it one level deep. ` +
-        'Absolute native paths copied from command output are also accepted when they resolve inside one of these roots; globs work in either spelling.'
+        'Absolute native paths copied from command output are also accepted when they resolve inside one of these roots; globs work in either spelling. A chat started in a Local Project is limited to that selected directory tree.'
       : 'Paths require an approved virtual root in the form /<root>/...; no root is currently approved. Globs are supported after a root is approved.';
 
   // ------------------------------------------------------------------- read
@@ -446,7 +444,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               'TOOL_DISABLED: view_image is disabled by the current Chat On Steroids permissions. Ask the user to enable reading in the app.'
             );
           }
-          const resolved = await resolveIn(ctx.roots, path);
+          const resolved = await resolveScopedPath(ctx.roots, path);
           try {
             const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
             logInfo(`tool view_image ${resolved.virtual} (${formatBytes(image.bytes)})`);
@@ -490,7 +488,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               .describe('Text to look for'),
             path: pathArg
               .optional()
-              .describe('File or folder to search. Virtual paths and absolute native paths inside approved roots are accepted. Defaults to every approved root.'),
+              .describe('File or folder to search. Virtual paths and absolute native paths inside approved roots are accepted. Defaults to the selected Local Project when bound; otherwise every approved root.'),
             mode: z.enum(['name', 'content']).optional().describe('Default name.'),
             include: z.string().max(200).optional().describe('Glob filter such as **/*.ts'),
             exclude: z
@@ -520,7 +518,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const deadline = Date.now() + 10_000;
           const scopes: Array<{ real: string; virtual: string }> = [];
           if (p) {
-            const resolved = await resolveIn(ctx.roots, p);
+            const resolved = await resolveScopedPath(ctx.roots, p);
             const stat = await fs.stat(resolved.real);
             if (stat.isFile()) {
               const outcome = await searchOneFile(resolved.real, resolved.virtual, {
@@ -547,10 +545,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             if (!stat.isDirectory()) return fail(`${resolved.virtual} is not a regular file or folder`);
             scopes.push({ real: resolved.real, virtual: resolved.virtual });
           } else {
-            for (const root of ctx.roots) {
-              const resolved = await resolvePath(ctx.roots, `/${root.name}`);
-              scopes.push({ real: resolved.real, virtual: resolved.virtual });
-            }
+            scopes.push(...await resolveDefaultSearchScopes(ctx.roots));
           }
           if (scopes.length === 0) return fail('No folders are approved');
 
@@ -627,17 +622,14 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (args.environmentId !== null) {
             return fail('apply_patch environment selection is unavailable for this turn');
           }
-          const workspace = currentWorkspace();
-          if (!workspace && swarmRunning()) {
-            return fail(
-              'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Use an absolute path in another tool first so the approved project can be learned.'
-            );
-          }
-          const baseVirtual = workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : null);
-          if (baseVirtual === null) {
-            return fail('No folder is approved, so there is nowhere to apply the patch.');
-          }
-          const base = await resolveIn(ctx.roots, baseVirtual);
+          // Codex resolves relative patch paths against the turn cwd, but an absolute patch does
+          // not consume cwd at all. Requiring a workspace before parsing those absolute targets
+          // would reintroduce the retired "first root" assumption in disguise: the base would be
+          // security-irrelevant yet mandatory. Keep the permission verdict first, then resolve a
+          // workspace only when at least one source/destination spelling is genuinely relative.
+          const directDenial = patchCapabilityDenial(args.hunks, caps);
+          if (directDenial !== null) return fail(directDenial);
+          const base = patchNeedsWorkspace(args.hunks) ? await resolveCwd(ctx, undefined, 'patch') : null;
           return (await runParsedPatch(args, ctx.roots, base, caps)).result;
         })
     );
@@ -986,7 +978,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       toolDeclaration('download_artifact', () => ({
         title: 'Save ChatGPT file',
         description:
-          'Save one file ChatGPT generated or attached to a path inside an approved folder. ' +
+          'Save one file ChatGPT generated or attached to a path inside an approved folder and, when selected, this chat\'s Local Project. ' +
           'The file value is supplied by ChatGPT itself — never invent download_url or file_id values. ' +
           'The destination must not already exist and its parent folder must already exist. ' +
           'Use for images, PDFs, archives and other files ChatGPT produces; never recreate such files with apply_patch or exec_command.',
@@ -1003,7 +995,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               })
               .describe('Native file value injected by ChatGPT.'),
             path: pathArg.describe(
-              'Destination inside an approved folder: a virtual /<root>/... path or an absolute native path. ' +
+              'Destination inside an approved folder and this chat\'s selected Local Project, if any: a virtual /<root>/... path or an absolute native path. ' +
                 'Relative paths resolve against this chat\'s folder. The destination must name a file that does not already exist.'
             )
           })
@@ -1721,7 +1713,7 @@ async function rollbackFailedPatch(
 async function runParsedPatch(
   args: { patch: string; hunks: Hunk[]; workdir: string | null; environmentId: string | null },
   roots: readonly Root[],
-  base: { real: string; virtual: string },
+  base: { real: string; virtual: string } | null,
   caps?: Capabilities
 ): Promise<ParsedPatchRun> {
   if (caps !== undefined) {
@@ -1738,11 +1730,18 @@ async function runParsedPatch(
   let effectiveBase = base;
   let effectiveArgs = args;
   if (args.workdir !== null) {
+    if (!effectiveBase) {
+      return {
+        result: fail('WORKSPACE_REQUIRED: apply_patch interception has no command workdir.'),
+        content: null,
+        exitCode: null
+      };
+    }
     try {
       // Preserve the shell gate from `cd dir && apply_patch`: interception must not execute a
       // patch that the submitted shell command would never have reached. The cwd must already
       // exist and be a directory; patch-created parents apply only to paths *inside* it.
-      effectiveBase = await resolveIn(roots, args.workdir, { base: base.virtual });
+      effectiveBase = await resolveScopedPath(roots, args.workdir, { base: effectiveBase.virtual });
       const stat = await fs.stat(effectiveBase.real);
       if (!stat.isDirectory()) {
         return { result: fail('apply_patch workdir must be an existing folder'), content: null, exitCode: null };
@@ -1757,7 +1756,7 @@ async function runParsedPatch(
   // synchronous resolver handed into the Codex port reads that table back.
   let resolution: PatchResolution;
   try {
-    resolution = await resolvePatchPaths(roots, effectiveBase.virtual, effectiveArgs.hunks);
+    resolution = await resolvePatchPaths(roots, effectiveBase?.virtual ?? null, effectiveArgs.hunks);
   } catch (error) {
     return { result: fail(friendlyError(error)), content: null, exitCode: null };
   }
@@ -1774,11 +1773,15 @@ async function runParsedPatch(
   // Preserve line endings whenever Edit is unavailable; any real content change was already
   // rejected by patchCapabilityDenial before resolution.
   const patchUpdateMode = caps !== undefined && !caps.edit ? 'preserve_line_endings' : DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE;
+  // With only absolute spellings the custom resolver below is the complete path authority, and
+  // Codex's cwd argument is never consulted. Use an inert empty string rather than inventing a
+  // root solely to satisfy the upstream function shape.
+  const runtimeCwd = effectiveBase?.real ?? '';
 
   try {
     await verifyApplyPatchArgs(
       effectiveArgs,
-      effectiveBase.real,
+      runtimeCwd,
       patchUpdateMode,
       resolution.resolve
     );
@@ -1801,7 +1804,7 @@ async function runParsedPatch(
 
   const execution = await executeApplyPatch({
     patch: effectiveArgs.patch,
-    cwd: effectiveBase.real,
+    cwd: runtimeCwd,
     updateFileMode: patchUpdateMode,
     resolvePath: resolution.resolve
   });
@@ -1832,6 +1835,14 @@ async function runParsedPatch(
     content,
     exitCode: execution.exitCode
   };
+}
+
+/** Whether any patch spelling actually consumes the chat/command working directory. */
+function patchNeedsWorkspace(hunks: readonly Hunk[]): boolean {
+  const relative = (value: string): boolean => !isAbsoluteVirtualPath(value) && !isNativeWindowsPath(value);
+  return hunks.some((hunk) =>
+    relative(hunk.path) || (hunk.kind === 'update_file' && hunk.movePath !== null && relative(hunk.movePath))
+  );
 }
 
 /** Product permission gates around the otherwise ported Codex patch runtime. */
@@ -1935,7 +1946,7 @@ function safePatchOutput(text: string, resolution: PatchResolution): string {
  */
 async function resolvePatchPaths(
   roots: readonly Root[],
-  baseVirtual: string,
+  baseVirtual: string | null,
   hunks: readonly Hunk[]
 ): Promise<PatchResolution> {
   const realBySpelling = new Map<string, string>();
@@ -1950,12 +1961,12 @@ async function resolvePatchPaths(
   const add = async (spelledPath: string, requireExisting: boolean): Promise<string> => {
     // First resolve the sandbox identity without requiring the leaf to exist. This gives later
     // hunks a stable real key even when the path exists only in the patch's simulated state.
-    let resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: true });
+    let resolved = await resolveScopedPath(roots, spelledPath, { base: baseVirtual, allowMissing: true });
     const state = pendingPresence.get(pathKey(resolved.real));
     // An untouched initial Update/Delete keeps the old strict Not-found behaviour. Once an
     // earlier hunk has established presence/absence, the verifier owns the sequential verdict.
     if (requireExisting && state === undefined) {
-      resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing: false });
+      resolved = await resolveScopedPath(roots, spelledPath, { base: baseVirtual, allowMissing: false });
     }
     realBySpelling.set(spelledPath, resolved.real);
     virtualPaths.set(resolved.real, resolved.virtual);
@@ -2039,7 +2050,7 @@ function hasGlob(path: string): boolean {
  * applied — a truncated expansion the model does not know about is worse than no expansion.
  */
 async function expandGlob(
-  roots: Parameters<typeof resolvePath>[0],
+  roots: readonly Root[],
   pattern: string
 ): Promise<{ matches: string[]; truncated: 'matches' | 'scan' | null }> {
   const normalised = process.platform === 'win32' ? pattern.replace(/\\/g, '/') : pattern;
@@ -2055,7 +2066,7 @@ async function expandGlob(
   const rest = segments.slice(baseSegments.length).join('/');
   if (!rest) return { matches: [normalised], truncated: null };
 
-  const resolved = await resolveIn(roots, base);
+  const resolved = await resolveScopedPath(roots, base);
   const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false });
   if (info.type !== 'directory') throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
 
@@ -2092,7 +2103,7 @@ async function expandGlob(
 }
 
 interface ReadOneOptions {
-  roots: Parameters<typeof resolvePath>[0];
+  roots: readonly Root[];
   canRead: boolean;
   canBrowse: boolean;
   startLine?: number;
@@ -2146,7 +2157,7 @@ async function nearestFolderListing(roots: Root[], requested: string, err: unkno
     candidate = parent;
     let resolved;
     try {
-      resolved = await resolveIn(roots, candidate);
+      resolved = await resolveScopedPath(roots, candidate);
     } catch (error) {
       if (error instanceof SandboxError && error.message.startsWith('Not found:')) continue;
       return '';
@@ -2177,7 +2188,7 @@ async function readOne(
   requested: string,
   options: ReadOneOptions
 ): Promise<{ text: string; bytes: number; image?: { data: string; mimeType: string } }> {
-  const resolved = await resolveIn(options.roots, requested);
+  const resolved = await resolveScopedPath(options.roots, requested);
   const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead });
 
   if (info.type === 'directory') {

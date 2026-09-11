@@ -11,7 +11,16 @@ import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 import { getSession, findSessionByConversation, createSession, conversationWasSuperseded, readRecentEvents, listUsageSessions } from './store.js';
-import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
+import {
+  abortProjectSend,
+  authorizeProjectSend,
+  currentProjectAuthorityEra,
+  projectIdForPrincipal,
+  resolveAvailableProjectDirectory,
+  resolveSessionProjectDirectory,
+  settleProjectSend,
+  ProjectPolicyError
+} from '../local-projects/service.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
 import { logInfo } from '../logger.js';
@@ -67,7 +76,8 @@ const entrySchema = inputArgs.extend({
   stagesApplied: z.boolean().optional(),
   historyRecorded: z.boolean().optional(),
   completedTurnId: z.string().max(256).optional(),
-  queueOrder: z.number().int().nonnegative().optional()
+  queueOrder: z.number().int().nonnegative().optional(),
+  projectAuthorityEra: z.string().uuid().optional()
 });
 export type InputEntry = z.infer<typeof entrySchema>;
 const STATE = 'session-input';
@@ -374,11 +384,15 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     const directTurn = input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
     const entry: InputEntry = { ...input, ...(directTurn ? { directTurn } : {}), ...(transportIntent ? { transportIntent } : {}), ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
     if (input.projectId) {
-      await projectWorkspace(input.projectId);
+      await resolveAvailableProjectDirectory(input.projectId);
+      const era = currentProjectAuthorityEra();
+      if (!era) throw new Error('Local Project authority is not ready');
+      entry.projectAuthorityEra = era;
       if (input.sessionId) {
-        const session = await getSession(input.sessionId);
-        if (session?.projectId !== input.projectId) throw new Error('Message project does not match the session');
-        await getSessionProject(input.sessionId);
+        if (projectIdForPrincipal({ sessionId: input.sessionId }) !== input.projectId) {
+          throw new Error('Message project does not match the session');
+        }
+        await resolveSessionProjectDirectory(input.sessionId);
       }
     }
     entry.conversationId = await target(entry);
@@ -499,7 +513,40 @@ export function authorizeBrowserInput(id: string, owner: string, conversationId:
     const row = current.find(row => row.id === id && row.owner === owner && row.state === 'browser' && row.conversationId === conversationId);
     if (!row || row.sendAuthorizedAt !== undefined) return false;
     if (!(await browserInputAllowed(row)) || await target(row) !== conversationId) return false;
+    if (row.projectId && row.projectAuthorityEra && row.projectAuthorityEra !== currentProjectAuthorityEra()) {
+      await commit(current.map(entry => entry === row ? {
+        ...row,
+        state: 'failed' as const,
+        error: 'Local Project security was reset before this message could be sent.'
+      } : entry));
+      return false;
+    }
     await commit(current.map(entry => entry === row ? { ...row, sendAuthorizedAt: Date.now() } : entry));
+    // Known destinations are bound before Send and normally require no authority write at all.
+    // Only a fresh chat, whose conversation id does not exist until native Send succeeds, gets a
+    // durable unresolved-send fence before the browser receives `true`.
+    if (row.projectId) {
+      try {
+        await authorizeProjectSend({
+          inputId: row.id,
+          projectId: row.projectId,
+          authorityEra: row.projectAuthorityEra,
+          sessionId: row.sessionId,
+          conversationId
+        });
+      } catch (error) {
+        if (error instanceof ProjectPolicyError && error.code === 'authority-era-retired') {
+          const latest = await load();
+          await commit(latest.map(entry => entry.id === row.id ? {
+            ...entry,
+            state: 'failed' as const,
+            error: 'Local Project security was reset before this message could be sent.'
+          } : entry));
+          return false;
+        }
+        throw error;
+      }
+    }
     return true;
   });
 }
@@ -588,7 +635,7 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     if (await target(entry) !== conversationId) return null;
     if (!(await browserInputAllowed(entry))) return null;
     if (entry.purpose === 'decision' && !decisionWaiters.has(id)) return null;
-    if (entry.projectId) await projectWorkspace(entry.projectId);
+    if (entry.projectId) await resolveAvailableProjectDirectory(entry.projectId);
     if (entry.sessionId) {
       if (current.some((row) => row.id !== id && row.sessionId === entry.sessionId && ['browser', 'tool'].includes(row.state))) return null;
       const first = ordered(current).find((row) => row.sessionId === entry.sessionId && row.state === 'queued' && queuedFollowup(row) === queuedFollowup(entry) && row.dueAt <= Date.now());
@@ -623,15 +670,32 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     return { ...claimed, ...selection, text: claimed.deliveryText ?? claimed.text };
   });
 }
-/** Commit exact project ownership before the document publishes any request-id evidence. */
-export function bindBrowserInputProject(id: string, owner: string, conversationId: string): Promise<boolean> {
+/**
+ * Commit exact project ownership before request-id evidence is published.
+ *
+ * Existing-chat input already names its destination before Send. Fresh-chat input does not, so
+ * only its native send receipt may establish the first conversation. Evidence observed later in
+ * the same document can never retarget a stale pending claim onto a different chat.
+ */
+export function bindBrowserInputProject(
+  id: string,
+  owner: string,
+  conversationId: string,
+  proof: 'evidence' | 'receipt' = 'evidence'
+): Promise<boolean> {
   return serial(async () => {
     if (!owner || !/^[0-9a-z-]{8,256}$/i.test(conversationId)) return false;
     const current = await load();
     const entry = current.find(row => row.id === id && row.owner === owner);
-    if (!entry || !['browser', 'sent'].includes(entry.state) || !entry.projectId || entry.purpose === 'decision') return false;
+    if (!entry || !['browser', 'sent', 'cancelled'].includes(entry.state) || !entry.projectId || entry.purpose === 'decision') return false;
+    if (entry.state === 'cancelled' && entry.sendAuthorizedAt === undefined) return false;
+    if (!entry.conversationId && proof !== 'receipt') return false;
     if (entry.conversationId && entry.conversationId !== conversationId) return false;
     if (await conversationWasSuperseded(conversationId)) return false;
+    // Explicit security reset retires every pre-reset claim. The reset also clears broad roots, so
+    // dropping this stale project claim cannot widen access; the resulting historical chat belongs
+    // to the new baseline exactly like every other pre-reset conversation.
+    if (entry.projectAuthorityEra && entry.projectAuthorityEra !== currentProjectAuthorityEra()) return true;
     // Fence this claim to one conversation durably before creating its session.
     const bound = { ...entry, conversationId };
     if (!entry.conversationId) await commit(current.map(row => row === entry ? bound : row));
@@ -639,8 +703,15 @@ export function bindBrowserInputProject(id: string, owner: string, conversationI
     const session = heldSessionId ? await getSession(heldSessionId) :
       await findSessionByConversation(conversationId, { requireUnique: true }) ?? await createSession({ conversationId, title: userTitle(entry.text, entry.text), titleSource: 'fallback' });
     if (!session || session.conversationId !== conversationId) return false;
-    await assignSessionProject(session.id, entry.projectId);
+    await settleProjectSend({
+      inputId: entry.id,
+      projectId: entry.projectId,
+      authorityEra: entry.projectAuthorityEra,
+      sessionId: session.id,
+      conversationIds: session.chatIds.includes(conversationId) ? session.chatIds : [...session.chatIds, conversationId]
+    });
     const latest = await load();
+    if (latest.find(row => row.id === id)?.deliveredSessionId === session.id) return true;
     await commit(latest.map(row => row.id === id ? { ...row, deliveredSessionId: session.id } : row));
     return true;
   });
@@ -787,6 +858,12 @@ export function failBrowserInput(id: string, owner: string, error: string): Prom
     const current = await load();
     const entry = current.find((row) => row.id === id && row.owner === owner && row.state === 'browser');
     if (!entry) return false;
+    // content.js calls this path after authorization only when its exact post-authorization recheck
+    // proves the click did not happen. Remove that fresh-send fence before publishing terminal
+    // outbox failure; if the second write fails, broad access is still no longer needlessly denied.
+    if (entry.projectId && entry.sendAuthorizedAt !== undefined) {
+      await abortProjectSend(entry.id, entry.projectAuthorityEra);
+    }
     await commit(current.map((row) => row === entry ? { ...row, state: 'failed', error: error.slice(0, 200) } : row));
     decisionWaiters.get(id)?.reject(new Error('goal_browser_send_failed'));
     decisionWaiters.delete(id);

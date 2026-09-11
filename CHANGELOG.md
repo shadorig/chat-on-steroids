@@ -9,6 +9,27 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.0.10] — 2026-09-11
+
+- Local Projects now use an independent authority snapshot instead of treating retained transcript
+  metadata as filesystem permission. The snapshot owns canonical project identities, direct
+  session/conversation bindings and pending sends; a separately stored coordinator records the exact
+  committed/pending snapshot digest. Missing, mismatched or incomplete authority fails closed rather
+  than widening.
+- Legacy Local Project upgrades retain surviving positive bindings but classify missing historical
+  ownership as unknown, not unbound. Broad-root access resumes only after an explicit security reset,
+  whose persistent recovery marker survives an interrupted root/catalog/authority transition.
+- Project narrowing is established before browser request ownership can authorize filesystem work,
+  including the correlation-only path used when transcript recording is off. An authorized send
+  that loses its page before exact binding stays fail-closed behind a durable unresolved-send fence.
+- Removing a project continues to mean “ungroup”: existing conversations keep their exact narrower
+  project authority, and adding the same folder again restores the same project identity. The
+  explicit security reset remains the destructive authorization recovery operation.
+- This fix requires companion bridge protocol 14. Released 2.0.9 used protocol 13; the app,
+  lockfile, extension and shared `APP_VERSION` advance together to 2.0.10.
+
+See [the full release notes](docs/release-notes/v2.0.10.md).
+
 ## [2.0.9] — they nerfed astra
 
 - Code mode combines local and plugin tools in one JavaScript call, with saved task plans and automatic background command results.

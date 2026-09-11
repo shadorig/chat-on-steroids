@@ -56,9 +56,10 @@ export const EXEC_COMMAND_CMD_DESCRIPTION = LAUNCHES_WINDOWS_POWERSHELL_5
   : 'Shell command to execute. To read a file, use the read tool instead.';
 
 export const EXEC_COMMAND_CMDS_DESCRIPTION =
-  'Sequential shell commands to run in one shell session. Use this for related checks instead of separate exec_command calls. Each command gets a labeled output section and exit code; all commands run after ordinary non-zero exits, and the overall exit code is the first non-zero code.';
+  'Sequential commands in one shell session. Use for related checks. Each gets a labeled output section and exit code; later commands still run after ordinary non-zero exits, and the overall exit code is the first non-zero.';
 
-export const EXEC_COMMAND_WORKDIR_DESCRIPTION = 'Working directory for the command. Defaults to the turn cwd.';
+export const EXEC_COMMAND_WORKDIR_DESCRIPTION =
+  'Command working directory. Defaults to the selected Local Project when bound, otherwise its learned workspace; project-bound chats cannot start outside it.';
 
 export const EXEC_COMMAND_TTY_DESCRIPTION =
   'True allocates a PTY for the command; false or omitted uses plain pipes.';

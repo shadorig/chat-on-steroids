@@ -1560,6 +1560,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         await registerGoalDecisionChat(helperConversation, entry.decisionSourceSessionId);
       }
       if (route === '/input/answer') return json(res, 200, { ok: typeof body.response === 'string' && await completeBrowserDecision(body.id, body.owner, body.response, deliveredConversation) }, origin);
+      // The content document may disappear after native Send but before its first observation.
+      // A receipt is equally exact proof of the destination conversation, so resolve any durable
+      // project-send ambiguity here before acknowledging delivery or allowing later correlation.
+      if (entry.projectId && deliveredConversation && !(await bindBrowserInputProject(body.id, body.owner, deliveredConversation, 'receipt'))) {
+        return json(res, 409, { error: 'project_input_not_bound' }, origin);
+      }
       const acknowledged = await acknowledgeBrowserInput(body.id, body.owner, deliveredConversation, typeof body.messageId === 'string' ? body.messageId : undefined);
       if (acknowledged && deliveredConversation) await collectRecordedBrowserDecision(deliveredConversation);
       return json(res, 200, { ok: acknowledged }, origin);
@@ -1611,12 +1617,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     });
     const blocked = new Set(conflicts);
     const unresolved = calls.filter((call) => call.requestId && !blocked.has(call.requestId) && requestCorrelation(call.requestId) === null);
-    const observations: ChatObservation[] = unresolved.length > 0
-      ? [{ kind: 'tool_evidence', time: Date.now(), calls: unresolved }]
-      : [];
-    // Even an already-confirmed mapping must ensure/reuse the chat session, matching /events'
-    // first-observation semantics and making this one atomic operation from the page's view.
-    const sessionId = await recordRequestEvidence(id, observations);
+    // Exact ownership is security metadata, not transcript data. The recorder creates/reuses a
+    // normal session only while recording is enabled; otherwise this stores the exact conversation
+    // owner with sessionId=null and writes no session history.
+    const sessionId = await recordRequestEvidence(id, unresolved);
     const confirmed = requestIds.filter((requestId) => requestCorrelation(requestId)?.conversationId === id);
     return json(res, 200, {
       ok: true,

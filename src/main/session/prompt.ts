@@ -2,7 +2,7 @@ import path from 'node:path';
 import { readFileStream } from '../codex/filesystem.js';
 import { effectiveCapabilities, getConfig } from '../config.js';
 import { currentCoreInstructions } from '../mcp/instructions.js';
-import { getSessionProject, projectWorkspace } from '../projects.js';
+import { resolveAvailableProjectDirectory, resolveSessionProjectDirectory } from '../local-projects/service.js';
 import { resolvePath } from '../sandbox.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, prependUserPrompt } from '../../shared/user-prompt.js';
 
@@ -16,8 +16,8 @@ const cutNotice = '\n\n[Cut off because of the message limit. Read AGENTS.md you
 async function projectInstructions(scope: PromptScope): Promise<ProjectInstructions | null> {
   if ((!scope.sessionId && !scope.projectId) || !effectiveCapabilities(getConfig()).read) return null;
   // Existing sessions own their project; a caller-provided project cannot replace that binding.
-  const folder = scope.sessionId ? await getSessionProject(scope.sessionId)
-    : await projectWorkspace(scope.projectId!);
+  const folder = scope.sessionId ? await resolveSessionProjectDirectory(scope.sessionId)
+    : await resolveAvailableProjectDirectory(scope.projectId!);
   if (!folder) return null;
   const filename = path.join(folder.real, 'AGENTS.md');
   try {
@@ -38,7 +38,9 @@ async function projectInstructions(scope: PromptScope): Promise<ProjectInstructi
     const text = new TextDecoder('utf-8', { fatal: true }).decode(data.subarray(0, budget), { stream: bytes > budget });
     if (text.includes('\0')) throw new Error('AGENTS.md must be a UTF-8 text file');
     // Permission/path changes during the asynchronous read cannot publish another folder's text.
-    const current = scope.sessionId ? await getSessionProject(scope.sessionId) : await projectWorkspace(scope.projectId!);
+    const current = scope.sessionId
+      ? await resolveSessionProjectDirectory(scope.sessionId)
+      : await resolveAvailableProjectDirectory(scope.projectId!);
     const checked = await resolvePath(getConfig().roots, filename);
     if (!current || current.real !== folder.real || checked.real !== resolved.real || !effectiveCapabilities(getConfig()).read)
       throw new Error('Project instructions changed location or permission while being read');

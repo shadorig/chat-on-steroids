@@ -40,7 +40,7 @@ const MODEL_REQUEST_TIMEOUT_MS = 190_000;
 /** The reason a deadline aborts with, so it is a fact the caller can act on rather than prose. */
 const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 13;
+const BRIDGE_PROTOCOL = 14;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -182,6 +182,10 @@ let closing = false;
  * body unchanged; durability is a transport concern, not a protocol fork.
  */
 let commandAckOutbox = [];
+/** Security-critical native-send receipts have independent capacity from ordinary command ACKs. */
+let inputReceiptOutbox = [];
+const MAX_COMMAND_ACKS = 200;
+const MAX_INPUT_RECEIPTS = 64;
 let ackingCommands = false;
 
 /**
@@ -251,7 +255,17 @@ function load() {
 }
 
 async function loadOnce() {
-  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings']);
+  const stored = await chrome.storage.local.get([
+    'port',
+    'token',
+    'disconnected',
+    'deferredRevivals',
+    'commandAckOutbox',
+    'inputReceiptOutbox',
+    'inputOpenings',
+    'desktopInputTabs',
+    'stopOpenings'
+  ]);
   port = typeof stored.port === 'number' ? stored.port : null;
   token = typeof stored.token === 'string' ? stored.token : null;
   // Deliberately in `local` rather than `session`: a choice to disconnect that a browser
@@ -276,6 +290,7 @@ async function loadOnce() {
     'terminalDocuments',
     'closeOutbox',
     'commandAckOutbox',
+    'inputReceiptOutbox',
     'recoveryMonitoring',
     'discardProtectedTabs',
     'delivery'
@@ -296,11 +311,17 @@ async function loadOnce() {
   // Browser-close durability: a send already accepted by ChatGPT is irreversible. Its final ACK
   // therefore has to survive storage.session being cleared on browser restart. Prefer the local
   // copy, while still accepting the old session copy as an upgrade migration path.
-  commandAckOutbox = Array.isArray(stored.commandAckOutbox)
-    ? stored.commandAckOutbox.slice(-200)
+  const legacyAckOutbox = Array.isArray(stored.commandAckOutbox)
+    ? stored.commandAckOutbox
     : Array.isArray(live.commandAckOutbox)
-      ? live.commandAckOutbox.slice(-200)
+      ? live.commandAckOutbox
       : [];
+  commandAckOutbox = legacyAckOutbox.filter((entry) => entry?.kind !== 'input').slice(-MAX_COMMAND_ACKS);
+  inputReceiptOutbox = Array.isArray(stored.inputReceiptOutbox)
+    ? stored.inputReceiptOutbox.slice(-MAX_INPUT_RECEIPTS)
+    : Array.isArray(live.inputReceiptOutbox)
+      ? live.inputReceiptOutbox.slice(-MAX_INPUT_RECEIPTS)
+      : legacyAckOutbox.filter((entry) => entry?.kind === 'input').slice(-MAX_INPUT_RECEIPTS);
   recoveryMonitoring = live.recoveryMonitoring === true;
   const savedDiscardProtection =
     live.discardProtectedTabs && typeof live.discardProtectedTabs === 'object' && !Array.isArray(live.discardProtectedTabs)
@@ -332,7 +353,8 @@ function persistLive() {
         retiredDocuments,
         terminalDocuments,
         closeOutbox: closeOutbox.slice(-200),
-        commandAckOutbox: commandAckOutbox.slice(-200),
+        commandAckOutbox: commandAckOutbox.slice(-MAX_COMMAND_ACKS),
+        inputReceiptOutbox: inputReceiptOutbox.slice(-MAX_INPUT_RECEIPTS),
         recoveryMonitoring,
         discardProtectedTabs,
         delivery
@@ -340,7 +362,8 @@ function persistLive() {
       // Only small command-control metadata crosses browser restarts. No transcript and no
       // revival text is duplicated into extension storage.
       chrome.storage.local.set({
-        commandAckOutbox: commandAckOutbox.slice(-200),
+        commandAckOutbox: commandAckOutbox.slice(-MAX_COMMAND_ACKS),
+        inputReceiptOutbox: inputReceiptOutbox.slice(-MAX_INPUT_RECEIPTS),
         inputOpenings,
         stopOpenings,
         deferredRevivals: deferredRevivals.slice(-100)
@@ -669,7 +692,7 @@ function noteDelivery(result, count, conversationId) {
 /** Finds the next deliverable conversation and its first batch in one journal pass. */
 function nextJournalBatch(preferredConversationId = null, excluded = []) {
   const blocked = new Set(excluded);
-  for (const ack of commandAckOutbox) {
+  for (const ack of [...inputReceiptOutbox, ...commandAckOutbox]) {
     if (ack && ack.conversationId) blocked.add(ack.conversationId);
   }
   const preferred = cleanConversationId(preferredConversationId);
@@ -907,6 +930,7 @@ function retryWanted() {
     journal.length > 0 ||
     closeOutbox.length > 0 ||
     commandAckOutbox.length > 0 ||
+    inputReceiptOutbox.length > 0 ||
     deferredRevivals.length > 0 ||
     Object.keys(tabConversations).length > 0 ||
     Object.keys(discardProtectedTabs).length > 0 ||
@@ -1218,20 +1242,24 @@ function commandAckPayload(id, status, error, conversationId, agent, client, tur
  */
 async function drainCommandAcks(targetId = null) {
   await load();
-  if (ackingCommands || commandAckOutbox.length === 0 || !token) {
-    return { ok: true, pending: commandAckOutbox.length, queued: commandAckOutbox.length > 0 };
+  const pendingCount = () => inputReceiptOutbox.length + commandAckOutbox.length;
+  if (ackingCommands || pendingCount() === 0 || !token) {
+    return { ok: true, pending: pendingCount(), queued: pendingCount() > 0 };
   }
   ackingCommands = true;
   let targetResult = null;
   let changed = false;
   try {
-    for (const entry of [...commandAckOutbox]) {
+    // Security receipts first: their conversation is held out of the observation journal until
+    // the app accepts the exact native receipt, so correlation can never overtake project binding.
+    for (const entry of [...inputReceiptOutbox, ...commandAckOutbox]) {
+      const inputReceipt = inputReceiptOutbox.includes(entry);
       if (!entry || typeof entry.id !== 'string' || !entry.id) {
-        commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
+        if (inputReceipt) inputReceiptOutbox = inputReceiptOutbox.filter((candidate) => candidate !== entry);
+        else commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
         changed = true;
         continue;
       }
-      const inputReceipt = entry.kind === 'input';
       const payload = inputReceipt ? { id: entry.id, owner: entry.owner, conversationId: entry.conversationId, messageId: entry.messageId } : commandAckPayload(
         entry.id,
         entry.status === 'failed' ? 'failed' : 'sent',
@@ -1244,11 +1272,17 @@ async function drainCommandAcks(targetId = null) {
       const result = await call(inputReceipt ? '/input/ack' : '/commands/ack', { method: 'POST', body: JSON.stringify(payload) });
       if (entry.id === targetId) targetResult = result;
 
-      if (result.ok || result.status === 404 || result.status === 409) {
+      // `/input/ack` can return 409 while the exact project receipt still needs binding. That is a
+      // retryable security dependency, not the terminal ownership answer that 409 means for a
+      // command ACK. Never discard the only exact receipt in that state.
+      const inputBindingPending = inputReceipt && result.status === 409 && result.data?.error === 'project_input_not_bound';
+      const terminalOwnershipAnswer = result.status === 404 || (result.status === 409 && !inputBindingPending);
+      if (result.ok || terminalOwnershipAnswer) {
         if (!inputReceipt && result.ok && result.data?.outcome === 'terminal-failure' && payload.status === 'failed' && !payload.conversationId && entry.source) {
           await retireFailedCommandTab(entry);
         }
-        commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
+        if (inputReceipt) inputReceiptOutbox = inputReceiptOutbox.filter((candidate) => candidate !== entry);
+        else commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
         changed = true;
         if (!inputReceipt && result.ok && result.data?.committed !== false && payload.status === 'sent' && !payload.agent) {
           // The app is authoritative. Settling before its ACK made a transient rejection
@@ -1261,8 +1295,9 @@ async function drainCommandAcks(targetId = null) {
       // A normalized current payload should not get a permanent 4xx other than the ownership
       // answers above. Do not spin forever if the bridge explicitly rejects one, but preserve
       // the statuses that can become valid after auth/version/backoff recovery.
-      if (result.status >= 400 && result.status < 500 && ![401, 408, 426, 429].includes(result.status)) {
-        commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
+      if (result.status >= 400 && result.status < 500 && ![401, 408, 409, 426, 429].includes(result.status)) {
+        if (inputReceipt) inputReceiptOutbox = inputReceiptOutbox.filter((candidate) => candidate !== entry);
+        else commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
         changed = true;
         continue;
       }
@@ -1270,10 +1305,10 @@ async function drainCommandAcks(targetId = null) {
       break;
     }
     if (changed) await persistLive();
-    if (commandAckOutbox.length > 0) scheduleRetry();
+    if (pendingCount() > 0) scheduleRetry();
     else clearRetryIfIdle();
-    if (targetResult) return { ...targetResult, pending: commandAckOutbox.length };
-    return { ok: true, pending: commandAckOutbox.length, queued: commandAckOutbox.length > 0 };
+    if (targetResult) return { ...targetResult, pending: pendingCount() };
+    return { ok: true, pending: pendingCount(), queued: pendingCount() > 0 };
   } finally {
     ackingCommands = false;
   }
@@ -1291,8 +1326,8 @@ async function ackCommand(id, status, error, conversationId, agent, client, sour
   };
   // One command has one terminal page result. Replace an earlier replay copy rather than
   // allowing duplicate storage entries to race each other after a worker restart.
-  const retained = commandAckOutbox.filter((entry) => entry && (entry.kind === 'input' || entry.id !== id));
-  if (retained.length >= 200) return { ok: false, error: 'receipt_journal_full' };
+  const retained = commandAckOutbox.filter((entry) => entry && entry.id !== id);
+  if (retained.length >= MAX_COMMAND_ACKS) return { ok: false, error: 'command_ack_journal_full' };
   commandAckOutbox = [...retained, queued];
   // Durability is established before any network attempt. If storage itself fails the message
   // handler rejects and the page is told truthfully that this worker did not take custody.
@@ -1318,25 +1353,25 @@ async function retireFailedCommandTab(entry) {
   } catch { /* A busy, edited, replaced or unreadable page stays open. */ }
 }
 
-/** A proven browser send hands only its receipt to the existing durable ACK journal.
+/** A proven browser send hands only its receipt to the independent durable receipt journal.
  * Replays never read the current tab or send text: the captured owner and conversation
  * remain authoritative after navigation, MV3 suspension and browser/app restart. */
 async function ackDesktopInput(id, owner, conversationId, messageId) {
   await load();
   if (!conversationId || typeof messageId !== 'string' || !messageId || messageId.length > 256) return { ok: false, error: 'missing_send_receipt' };
-  const previous = commandAckOutbox.find(entry => entry.kind === 'input' && entry.id === id);
+  const previous = inputReceiptOutbox.find(entry => entry.id === id);
   if (previous && (previous.owner !== owner || previous.conversationId !== conversationId || previous.messageId !== messageId)) return { ok: false, error: 'conflicting_send_receipt' };
   if (!previous) {
-    if (commandAckOutbox.length >= 200) return { ok: false, error: 'receipt_journal_full' };
-    commandAckOutbox.push({ kind: 'input', id, owner, conversationId, messageId, queuedAt: Date.now() });
+    if (inputReceiptOutbox.length >= MAX_INPUT_RECEIPTS) return { ok: false, error: 'input_receipt_journal_full' };
+    inputReceiptOutbox.push({ id, owner, conversationId, messageId, queuedAt: Date.now() });
   }
   await persistLive();
   scheduleRetry();
   const result = await drainCommandAcks(id);
   if (result.ok && result.data?.ok === false) return result;
-  if (!result.ok && !commandAckOutbox.some(entry => entry.kind === 'input' && entry.id === id)) return result;
+  if (!result.ok && !inputReceiptOutbox.some(entry => entry.id === id)) return result;
   // Custody, not a network response, is the page's completion boundary.
-  return { ok: true, data: { ok: true }, queued: commandAckOutbox.some(entry => entry.kind === 'input' && entry.id === id) };
+  return { ok: true, data: { ok: true }, queued: inputReceiptOutbox.some(entry => entry.id === id) };
 }
 
 /**
@@ -2626,6 +2661,29 @@ function serializeTab(tab, operation) {
   return tracked;
 }
 
+/**
+ * A project-bearing desktop send must publish its narrower authority before this document can
+ * publish request-id ownership through either browser evidence route. Returning false keeps the
+ * evidence page-side for retry; it never lets a failed bind degrade into an unbound call.
+ */
+async function bindReportedProjectInput(message, sender, source, conversationId) {
+  const claim = message.projectInput;
+  if (!claim) return null;
+  const tab = await chrome.tabs.get(source.tab);
+  const routedConversation = conversationFromUrl(tab.url);
+  const prefix = `${source.tab}:${sender.documentId}:`;
+  if (!conversationId || routedConversation !== conversationId ||
+      !/^[a-f0-9-]{36}$/i.test(String(claim.id || '')) ||
+      typeof claim.owner !== 'string' || !claim.owner.startsWith(prefix) || !ownsDocument(source)) {
+    return false;
+  }
+  const bound = await call('/input/bind', {
+    method: 'POST',
+    body: JSON.stringify({ id: claim.id, owner: claim.owner, conversationId })
+  });
+  return bound.ok && bound.data?.ok === true && ownsDocument(source) ? claim.id : false;
+}
+
 const HANDLERS = {
   async plugin_refresh(message, _sender, source) {
     if (!ownsDocument(source) || !/^[a-f0-9-]{36}$/i.test(String(message.id || ''))) return { ok: false };
@@ -2727,6 +2785,7 @@ const HANDLERS = {
       disconnected,
       pending: journal.length,
       pendingCommandAcks: commandAckOutbox.length,
+      pendingInputReceipts: inputReceiptOutbox.length,
       compatible: found ? found.compatible !== false : null,
       appVersion: found ? found.version : null,
       appProtocol: found ? found.bridge : null,
@@ -2863,6 +2922,7 @@ const HANDLERS = {
       pendingAll: journal.length,
       pendingCloses: closeOutbox.length,
       pendingCommandAcks: commandAckOutbox.length,
+      pendingInputReceipts: inputReceiptOutbox.length,
       delivery
     };
   },
@@ -2878,19 +2938,13 @@ const HANDLERS = {
   async events(message, _sender, source) {
     await load();
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
-    if (message.projectInput) {
-      const claim = message.projectInput;
-      const tab = await chrome.tabs.get(source.tab);
-      const conversationId = conversationFromUrl(tab.url);
-      const prefix = `${source.tab}:${_sender.documentId}:`;
-      if (!conversationId || message.conversationId !== conversationId ||
-          !/^[a-f0-9-]{36}$/i.test(String(claim.id || '')) ||
-          typeof claim.owner !== 'string' || !claim.owner.startsWith(prefix) || !ownsDocument(source)) {
-        return { ok: false, error: 'project_binding_pending' };
-      }
-      const bound = await call('/input/bind', { method: 'POST', body: JSON.stringify({ id: claim.id, owner: claim.owner, conversationId }) });
-      if (!bound.ok || bound.data?.ok !== true || !ownsDocument(source)) return { ok: false, error: 'project_binding_pending' };
-    }
+    const boundProjectInputId = await bindReportedProjectInput(
+      message,
+      _sender,
+      source,
+      cleanConversationId(message.conversationId)
+    );
+    if (boundProjectInputId === false) return { ok: false, error: 'project_binding_pending' };
     await noteTabConversation(source, message.conversationId);
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const key = tabKey(source);
@@ -2909,7 +2963,7 @@ const HANDLERS = {
     if (ackBound > 0) await drainCommandAcks();
     const result = await drain();
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
-    return { ok: true, pending: result.pending, durable: stored, projectBound: message.projectInput?.id };
+    return { ok: true, pending: result.pending, durable: stored, boundProjectInputId: boundProjectInputId || undefined };
   },
 
   /**
@@ -2941,17 +2995,17 @@ const HANDLERS = {
   /**
    * Registers exact request-id ownership for the currently live ChatGPT turn.
    *
-   * Unlike normal transcript events this is an acknowledged identity operation: the app
-   * creates/reuses the conversation session, stores the request-id join, reads it back, and
-   * tells the page which ids are actually confirmed. content.js retries unconfirmed ids on a
-   * later Fiber scan, so a sleeping worker/app can delay attribution but cannot silently turn a
-   * known request into a permanent Unattributed call.
+   * Unlike normal transcript events this is an acknowledged identity operation: the app stores
+   * the exact request-id join and reads it back; with recording on, that same path also
+   * creates/reuses the durable session. content.js retries unconfirmed ids on a later Fiber scan.
    */
   async correlate(message, _sender, source) {
     await load();
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const conversationId = cleanConversationId(message.conversationId);
     if (!conversationId) return { ok: false, error: 'bad_conversation_id' };
+    const boundProjectInputId = await bindReportedProjectInput(message, _sender, source, conversationId);
+    if (boundProjectInputId === false) return { ok: false, error: 'project_binding_pending' };
     await noteTabConversation(source, conversationId);
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const calls = Array.isArray(message.calls) ? message.calls : [];
@@ -2960,6 +3014,9 @@ const HANDLERS = {
       method: 'POST',
       body: JSON.stringify({ conversationId, calls })
     });
+    if (boundProjectInputId && result.ok && result.data && typeof result.data === 'object') {
+      result.data = { ...result.data, boundProjectInputId };
+    }
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
   async activity(message, _sender, source) {
