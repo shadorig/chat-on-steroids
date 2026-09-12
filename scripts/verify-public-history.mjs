@@ -1,8 +1,18 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
-const maintainerLogin = 'totec448-spec';
-const safeMaintainerEmail = /^(?:\d+\+)?totec448-spec@users\.noreply\.github\.com$/i;
+// Protect the current identity and the inherited history. Ownership moved, but a future
+// cherry-pick or reused local identity must not leak either maintainer's private address.
+const protectedMaintainerIdentities = [
+  {
+    login: 'shadorig',
+    safeEmail: /^(?:\d+\+)?shadorig@users\.noreply\.github\.com$/i,
+  },
+  {
+    login: 'totec448-spec',
+    safeEmail: /^(?:\d+\+)?totec448-spec@users\.noreply\.github\.com$/i,
+  },
+];
 
 // Keep the blocked values split so this guard does not contain the data it rejects.
 const blockedText = [
@@ -40,10 +50,11 @@ function findBlockedText(text, location) {
 function checkMaintainerIdentity(name, email, location) {
   const normalizedName = name.trim().toLowerCase();
   const normalizedEmail = email.trim().replace(/^<|>$/g, '').toLowerCase();
-  const belongsToMaintainer =
-    normalizedName === maintainerLogin || normalizedEmail.includes(maintainerLogin);
-  if (belongsToMaintainer && !safeMaintainerEmail.test(normalizedEmail)) {
-    return [`${location} uses a non-noreply maintainer email`];
+  for (const { login, safeEmail } of protectedMaintainerIdentities) {
+    const belongsToMaintainer = normalizedName === login || normalizedEmail.includes(login);
+    if (belongsToMaintainer && !safeEmail.test(normalizedEmail)) {
+      return [`${location} uses a non-noreply maintainer email`];
+    }
   }
   return [];
 }
@@ -100,15 +111,16 @@ function checkMessageFile(messagePath) {
  * checked. Removing a value from published history is a deliberate rewrite of a public branch,
  * not something a pre-push hook should be able to demand.
  *
- * A fork's origin may lag upstream. Select by exact repository URL, never by the name
- * "upstream". Without a canonical remote, retain the legacy origin/main convention.
+ * A clone may retain the repository it was derived from as an upstream. Select the canonical
+ * published line by exact repository URL, never by a remote's local name. Without a canonical
+ * remote, retain the legacy origin/main convention.
  * If a configured canonical remote has no fetched main, exempt nothing.
  */
 function publishedCommits() {
   const remotes = String(runGit(['remote']).stdout).split(/\r?\n/).filter(Boolean);
   const canonical = remotes.find((remote) => {
     const url = String(runGit(['remote', 'get-url', remote]).stdout).trim();
-    return /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)totec448-spec\/chat-on-steroids(?:\.git)?\/?$/i.test(url);
+    return /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)shadorig\/chat-on-steroids(?:\.git)?\/?$/i.test(url);
   });
   const publishedRef = `refs/remotes/${canonical ?? 'origin'}/main`;
   const ref = runGit(['rev-parse', '--verify', '--quiet', publishedRef], {

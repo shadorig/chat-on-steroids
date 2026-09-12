@@ -507,6 +507,9 @@ describe('bounded IPC identities and OS launch results', () => {
     const reply = await handlers.get('bridge:downloadExtension')!(null, undefined);
 
     expect(reply).toEqual({ ok: true, data: true });
+    expect(extensionDownloadUrl('1.8.8')).toBe(
+      'https://github.com/shadorig/chat-on-steroids/releases/download/v1.8.8/Chat-On-Steroids-Extension.zip'
+    );
     expect(shell.openExternal).toHaveBeenCalledWith(extensionDownloadUrl('1.8.8'));
     expect(vi.mocked(shell.openExternal).mock.calls[0]?.[0]).not.toContain('/releases/latest/');
   });

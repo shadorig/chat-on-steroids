@@ -194,13 +194,14 @@ describe('finding a newer release', () => {
    * date" on the strength of that timestamp, so a pass that never reached GitHub must not set it.
    */
   it('reports nothing when the published release is the version already running', async () => {
-    const { asked } = github({ version: APP_VERSION });
+    const { asked, fetch } = github({ version: APP_VERSION });
     expect(updateStatus().checkedAt).toBeNull();
     await checkForUpdates();
     expect(updateStatus()).toMatchObject({ current: APP_VERSION, latest: null, stage: 'idle' });
     expect(updateStatus().checkedAt).toBeGreaterThan(0);
     // It stopped at the release: no checksums, no artifact, nothing written.
     expect(asked).toEqual(['latest']);
+    expect(fetch.mock.calls[0]?.[0]).toBe('https://api.github.com/repos/shadorig/chat-on-steroids/releases/latest');
     expect(readdirSync(userData)).toEqual([]);
   });
 });

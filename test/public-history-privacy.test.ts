@@ -6,7 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 const script = path.join(process.cwd(), 'scripts', 'verify-public-history.mjs');
 const repositories: string[] = [];
-const safeEmail = '227782719+totec448-spec@users.noreply.github.com';
+const maintainerLogin = 'shadorig';
+const safeEmail = '290957101+shadorig@users.noreply.github.com';
 
 function makeRepository(): string {
   const repository = mkdtempSync(path.join(tmpdir(), 'public-history-privacy-'));
@@ -18,27 +19,27 @@ function makeRepository(): string {
   return repository;
 }
 
-function commit(repository: string, message: string, email: string): void {
+function commit(repository: string, message: string, email: string, name = maintainerLogin): void {
   execFileSync('git', ['commit', '--allow-empty', '-m', message], {
     cwd: repository,
     env: {
       ...process.env,
-      GIT_AUTHOR_NAME: 'totec448-spec',
+      GIT_AUTHOR_NAME: name,
       GIT_AUTHOR_EMAIL: email,
-      GIT_COMMITTER_NAME: 'totec448-spec',
+      GIT_COMMITTER_NAME: name,
       GIT_COMMITTER_EMAIL: email,
     },
   });
 }
 
-function tag(repository: string, name: string, message: string, email: string): void {
-  execFileSync('git', ['tag', '-a', name, '-m', message], {
+function tag(repository: string, tagName: string, message: string, email: string): void {
+  execFileSync('git', ['tag', '-a', tagName, '-m', message], {
     cwd: repository,
     env: {
       ...process.env,
-      GIT_COMMITTER_NAME: 'totec448-spec',
+      GIT_COMMITTER_NAME: maintainerLogin,
       GIT_COMMITTER_EMAIL: email,
-      GIT_AUTHOR_NAME: 'totec448-spec',
+      GIT_AUTHOR_NAME: maintainerLogin,
       GIT_AUTHOR_EMAIL: email,
     },
   });
@@ -49,7 +50,7 @@ function verify(repository: string, args: string[] = []) {
     cwd: repository,
     encoding: 'utf8',
     windowsHide: true,
-    env: { ...process.env, GIT_AUTHOR_NAME: 'totec448-spec', GIT_AUTHOR_EMAIL: safeEmail },
+    env: { ...process.env, GIT_AUTHOR_NAME: maintainerLogin, GIT_AUTHOR_EMAIL: safeEmail },
   });
 }
 
@@ -113,8 +114,19 @@ describe('public-history privacy gate', () => {
 
   it('rejects a non-noreply maintainer identity without printing the address', () => {
     const repository = makeRepository();
-    const privateEmail = ['totec448', 'gmail.com'].join('@');
+    const privateEmail = ['shadorig', 'example.com'].join('@');
     commit(repository, 'Unsafe identity', privateEmail);
+
+    const result = verify(repository);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('non-noreply maintainer email');
+    expect(result.stderr).not.toContain(privateEmail);
+  });
+
+  it('continues protecting the inherited maintainer identity', () => {
+    const repository = makeRepository();
+    const privateEmail = ['totec448', 'gmail.com'].join('@');
+    commit(repository, 'Unsafe inherited identity', privateEmail, 'totec448-spec');
 
     const result = verify(repository);
     expect(result.status).toBe(1);
@@ -140,7 +152,7 @@ describe('public-history privacy gate', () => {
    */
   it('passes a clean checked-out line even when an unrelated ref carries unsafe identity', () => {
     const repository = makeRepository();
-    const privateEmail = ['totec448', 'gmail.com'].join('@');
+    const privateEmail = ['shadorig', 'example.com'].join('@');
     execFileSync('git', ['checkout', '-q', '-b', 'unrelated'], { cwd: repository });
     commit(repository, 'Unsafe identity on a ref this branch never contains', privateEmail);
     execFileSync('git', ['checkout', '-q', 'main'], { cwd: repository });
@@ -152,7 +164,7 @@ describe('public-history privacy gate', () => {
 
   it('still rejects unsafe identity that is an ancestor of HEAD', () => {
     const repository = makeRepository();
-    const privateEmail = ['totec448', 'gmail.com'].join('@');
+    const privateEmail = ['shadorig', 'example.com'].join('@');
     commit(repository, 'Unsafe identity in ancestry', privateEmail);
     commit(repository, 'Clean commit on top', safeEmail);
 
@@ -170,7 +182,7 @@ describe('public-history privacy gate', () => {
    */
   it('exempts unsafe identity that is already published on origin/main', () => {
     const repository = makeRepository();
-    const privateEmail = ['totec448', 'gmail.com'].join('@');
+    const privateEmail = ['shadorig', 'example.com'].join('@');
     commit(repository, 'Unsafe identity merged through the forge', privateEmail);
     execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repository });
     commit(repository, 'Clean local commit on top', safeEmail);
@@ -181,46 +193,47 @@ describe('public-history privacy gate', () => {
   });
 
   it.each([
-    'https://github.com/totec448-spec/chat-on-steroids.git',
-    'git@github.com:totec448-spec/chat-on-steroids.git',
-    'ssh://git@github.com/totec448-spec/chat-on-steroids'
+    'https://github.com/shadorig/chat-on-steroids.git',
+    'git@github.com:shadorig/chat-on-steroids.git',
+    'ssh://git@github.com/shadorig/chat-on-steroids'
   ])('recognizes canonical main under an arbitrary remote name (%s)', (url) => {
     const repository = makeRepository();
     execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/example/fork.git'], { cwd: repository });
     execFileSync('git', ['remote', 'add', 'published', url], { cwd: repository });
     execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repository });
-    commit(repository, 'Already public canonical commit', ['totec448', 'gmail.com'].join('@'));
+    commit(repository, 'Already public canonical commit', ['shadorig', 'example.com'].join('@'));
     execFileSync('git', ['update-ref', 'refs/remotes/published/main', 'HEAD'], { cwd: repository });
     commit(repository, 'Local clean change', safeEmail);
     expect(verify(repository).status).toBe(0);
-    commit(repository, 'New unpublished unsafe identity', ['totec448', 'gmail.com'].join('@'));
+    commit(repository, 'New unpublished unsafe identity', ['shadorig', 'example.com'].join('@'));
     expect(verify(repository).status).toBe(1);
   });
 
   it.each([
     'https://github.com/example/chat-on-steroids.git',
-    'https://github.com/totec448-spec/chat-on-steroids-extra.git',
-    'https://github.com.example/totec448-spec/chat-on-steroids.git'
+    'https://github.com/totec448-spec/chat-on-steroids.git',
+    'https://github.com/shadorig/chat-on-steroids-extra.git',
+    'https://github.com.example/shadorig/chat-on-steroids.git'
   ])('does not trust an unrelated upstream URL (%s)', (url) => {
     const repository = makeRepository();
     execFileSync('git', ['remote', 'add', 'upstream', url], { cwd: repository });
     execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repository });
-    commit(repository, 'Unpublished identity', ['totec448', 'gmail.com'].join('@'));
+    commit(repository, 'Unpublished identity', ['shadorig', 'example.com'].join('@'));
     execFileSync('git', ['update-ref', 'refs/remotes/upstream/main', 'HEAD'], { cwd: repository });
     expect(verify(repository).status).toBe(1);
   });
 
-  it('does not fall back to fork history when canonical main has not been fetched', () => {
+  it('does not fall back to another remote when canonical main has not been fetched', () => {
     const repository = makeRepository();
-    execFileSync('git', ['remote', 'add', 'upstream', 'https://github.com/totec448-spec/chat-on-steroids.git'], { cwd: repository });
-    commit(repository, 'Only published on a fork', ['totec448', 'gmail.com'].join('@'));
+    execFileSync('git', ['remote', 'add', 'upstream', 'https://github.com/shadorig/chat-on-steroids.git'], { cwd: repository });
+    commit(repository, 'Only published on another remote', ['shadorig', 'example.com'].join('@'));
     execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repository });
     expect(verify(repository).status).toBe(1);
   });
 
   it('still rejects unsafe identity a push would add ahead of origin/main', () => {
     const repository = makeRepository();
-    const privateEmail = ['totec448', 'gmail.com'].join('@');
+    const privateEmail = ['shadorig', 'example.com'].join('@');
     execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repository });
     commit(repository, 'Unsafe identity not published yet', privateEmail);
 
