@@ -2,9 +2,9 @@
 
 `sources.json` maps each archive to its URL, version, applicable OS and SHA-256. Verify
 `SHA256SUMS.txt` before extracting. Keep embedded subprojects and notices. Source retains
-its original licenses. The application consumes the published sharp 0.35.3/@img binaries
+its original licenses. The application consumes the published sharp 0.35.4/@img binaries
 without modifying their machine code. Windows and Unix use different dependency versions
-even though both report libvips 8.18.3.
+even though both report libvips 8.18.6.
 
 ## Source preparation
 
@@ -13,23 +13,24 @@ upstream recipes do with `tar --strip-components=1`. Archive filenames contain a
 to avoid collisions; the inventory maps them to recipe downloads. The build repositories
 retain platform settings, inline source edits, generated-file recipes, patches and scripts.
 
-The original libimagequant v2.4.1 tag moved after the June builds. Use supplied commit
-`4e82d9492db228a7a2057c442f7a6eb40508a0eb`, not today's tag. This reconstructs the historical
-Windows recipe archive from that commit:
+The libimagequant v2.4.1 tag resolves to commit
+`cf061ab536ec861449fbc8ac815b492aaa4da5fe`. The supplied archive uses that immutable
+commit instead of relying on the tag remaining fixed:
 
 ```sh
-git archive --format=tar --prefix=libimagequant-2.4.1/ 4e82d9492db228a7a2057c442f7a6eb40508a0eb | gzip -n -6 > libimagequant-2.4.1.tar.gz
+git archive --format=tar --prefix=libimagequant-2.4.1/ cf061ab536ec861449fbc8ac815b492aaa4da5fe | gzip -n -6 > libimagequant-2.4.1.tar.gz
 ```
 
-The resulting SHA-256 is `da531249038e17f0674cef6e5d4100e43bf8cdfb4f330bc2a590bff50cd91913`.
+The resulting recipe-archive SHA-256 is
+`47d2a84b7b1052975c9d50a3d4e3cacbf57b43d84a4c3131210848ead9964dfb`.
 The supplied immutable commit archive has different directory/compression bytes and the same
-historical source. TIFF and Unix Fontconfig come from mirrors at exact Git commits because
-upstream archive endpoints were unavailable. Windows libxml2's recipe directory typo is
-corrected to `2.15`; its original source-archive SHA-256 still matches.
+source. Unix Fontconfig comes from the official read-only mirror at the exact 2.18.3 tag
+commit because the recipe endpoint rejects unattended archival downloads. Windows libxml2's
+recipe directory typo is corrected to `2.15`; its original source-archive SHA-256 still matches.
 
 ## macOS and Linux
 
-Use sharp-libvips commit `4da6d14c0d59866adfb9d8cf52bcaa53846dc4f6` (v1.3.2).
+Use sharp-libvips commit `6e5971d333377743163edc3ad9e5d0b897abcbc9` (v1.3.3).
 Its `build.sh`, `build/posix.sh`, `versions.properties` and `platforms/` directories
 describe configuration and installation. The entry points are:
 
@@ -46,24 +47,25 @@ instead of resolving moving tags again. Four external patches are included; the 
 PR patch is pinned to its byte-identical commit patch. Preserve all inline `sed` edits,
 generated `vips.map`, static inner libraries, SONAME changes and linker flags in `posix.sh`.
 
-The actual release logs record Rust `1.98.0-nightly (096694416 2026-06-29)`, cargo-c
-`0.10.23+cargo-0.97.1` and Meson `1.11.1`. Use that dated Rust toolchain rather than today's
-floating nightly. Original librsvg 2.62.90 Cargo.lock and source-local workspace are in
+The actual release logs record Rust `1.100.0-nightly (787af2b8c 2026-08-25)`, cargo-c
+`0.10.25+cargo-0.99.0` and Meson `1.12.0`. Use that dated Rust toolchain rather than today's
+floating nightly. Original librsvg 2.62.91 Cargo.lock and source-local workspace are in
 its archive. After the recipe's feature edits, `cargo update --workspace` removed only
-`color_quant 1.1.0`, `gif 0.14.2` and `image-webp 0.2.4`; it added/upgraded nothing.
+`color_quant 1.1.0`, `gif 0.14.2`, `image-webp 0.2.4` and `weezl 0.1.12`; it
+added/upgraded nothing.
 Retained crates include that lock's dependency sources, checked against Cargo.lock hashes.
 Retain the lock for `cargo vendor` / `--locked`; do not run an unrestricted update.
 GVDB and libnsgif sources are embedded in their parent archives.
 
-Original release logs: https://github.com/lovell/sharp-libvips/actions/runs/28432216836
+Original release logs: https://github.com/lovell/sharp-libvips/actions/runs/32944387969
 
 ## Windows
 
-Use build-win64-mxe commit `bca68727eb1df12c5d2b204a13a392989d505774` (v8.18.3) and
+Use build-win64-mxe commit `09cfccf20b91b441fbe97fa7a7ed8a597e55e830` (v8.18.6) and
 MXE base `d973945bb92c7783d5afa41bb2b8d2e1a04eaba3` (`llvm-mingw-20260605`), both included.
 The `container/` Dockerfiles, `build/`, `build.sh` and MXE settings define the Linux
 cross-compilation environment. Sharp's `build/win.sh` selects the `web` variant,
-`vips-dev-{ARCH}-web-8.18.3-static.zip`, without `-ffi`. The main libvips and C++ wrapper
+`vips-dev-{ARCH}-web-8.18.6-static.zip`, without `-ffi`. The main libvips and C++ wrapper
 remain DLLs; “static” describes their dependencies.
 
 The pinned MXE recipes identify Rust nightly 2026-06-05 (`e7815e522`), LLVM 22.1.7,
@@ -95,7 +97,7 @@ Close the app and work on a copy. Build for the same OS, CPU and Sharp/libvips A
 retaining exported interfaces and library names. Under application resources:
 
 - Windows: `app.asar.unpacked/node_modules/@img/sharp-win32-{x64|arm64}/lib/`, with
-  `libvips-42.dll` and `libvips-cpp-8.18.3.dll`.
+  `libvips-42.dll` and `libvips-cpp-8.18.6.dll`.
 - Linux: `app.asar.unpacked/node_modules/@img/sharp-libvips-linux-{x64|arm64}/lib/`.
 - macOS: `app.asar.unpacked/node_modules/@img/sharp-libvips-darwin-{x64|arm64}/lib/`
   under `Chat On Steroids.app/Contents/Resources`.

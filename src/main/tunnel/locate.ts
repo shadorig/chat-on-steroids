@@ -155,10 +155,13 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
 function bundledDir(): string | null {
   const packaged = process.resourcesPath ? path.join(process.resourcesPath, 'tunnel') : null;
   if (packaged && existsSync(packaged)) return packaged;
-  // Source: src/main/tunnel -> repo root is three levels up.
-  // Packaged/compiled dev output keeps the same main/tunnel nesting under dist.
-  const dev = path.resolve(__dirname, '..', '..', '..', 'resources', 'tunnel');
-  return existsSync(dev) ? dev : null;
+  // Direct source execution keeps src/main/tunnel; electron-vite flattens it to out/main.
+  // Accept both layouts so development uses the same pinned bundle as packaging.
+  const development = [
+    path.resolve(__dirname, '..', '..', '..', 'resources', 'tunnel'),
+    path.resolve(__dirname, '..', '..', 'resources', 'tunnel')
+  ];
+  return development.find(existsSync) ?? null;
 }
 
 /** The bundled tunnel-client version, for the diagnostics panel. */

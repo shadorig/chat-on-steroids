@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const output = path.join(root, 'resources', 'packaging', 'licenses', 'THIRD-PARTY-NOTICES.txt');
 const lock = JSON.parse(await fs.readFile(path.join(root, 'package-lock.json'), 'utf8'));
 const notices = [
   'Chat On Steroids — Third-party Notices',
@@ -58,7 +59,7 @@ for (const [relative, entry] of Object.entries(lock.packages).sort(([a], [b]) =>
 }
 if (missing.length) throw new Error(`Missing license texts for production packages: ${missing.join(', ')}`);
 notices.push('='.repeat(80), 'Native image-library license supplements', 'The following texts accompany the LGPL/MPL components listed in the platform-specific sharp/libvips notices. They do not replace component copyright notices or corresponding-source obligations.', '');
-for (const file of ['README.md', 'COMPONENT-NOTICES.txt', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt']) {
+for (const file of ['README.md', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt']) {
   notices.push(`--- ${file} ---`, await fs.readFile(path.join(root, 'docs/licenses/native', file), 'utf8'), '');
 }
 // Catalog packages are optional downloads, but their reviewed license texts must
@@ -78,5 +79,8 @@ for (const entry of catalogLicenses) {
 }
 // Each CI host inventories its own optional native packages. Packaging regenerates the
 // shipped file on that host; comparing against another platform's text is not meaningful.
-if (!process.argv.includes('--check')) await fs.writeFile(path.join(root, 'THIRD-PARTY-NOTICES.txt'), notices.join('\n'));
+if (!process.argv.includes('--check')) {
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await fs.writeFile(output, notices.join('\n'));
+}
 console.log(`Validated license notices for ${count} production packages and ${catalogLicenses.length} catalog entries.`);

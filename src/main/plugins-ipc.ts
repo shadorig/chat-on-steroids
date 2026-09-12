@@ -20,7 +20,10 @@ type Register = <T>(channel: string, fn: (payload: unknown) => Promise<T>) => vo
 /** Named, validated operations; credentials cross IPC only toward encrypted storage. */
 export function registerPluginIpc(handle: Register, getWindow: () => BrowserWindow | null): void {
   handle('plugins:legalNotices', async () => {
-    const error = await shell.openPath(path.join(app.isPackaged ? process.resourcesPath : app.getAppPath(), 'THIRD-PARTY-NOTICES.txt'));
+    const noticePath = app.isPackaged
+      ? path.join(process.resourcesPath, 'THIRD-PARTY-NOTICES.txt')
+      : path.join(app.getAppPath(), 'resources', 'packaging', 'licenses', 'THIRD-PARTY-NOTICES.txt');
+    const error = await shell.openPath(noticePath);
     if (error) throw new Error('Could not open the bundled Third-party Notices file.');
   });
   handle('plugins:snapshot', async () => pluginManager.snapshot());

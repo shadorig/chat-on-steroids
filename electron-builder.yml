@@ -26,7 +26,7 @@ files:
 extraResources:
   - from: LICENSE
     to: LICENSE
-  - from: THIRD-PARTY-NOTICES.txt
+  - from: resources/packaging/licenses/THIRD-PARTY-NOTICES.txt
     to: THIRD-PARTY-NOTICES.txt
   - from: node_modules/electron/dist/LICENSE
     to: LICENSE.electron.txt

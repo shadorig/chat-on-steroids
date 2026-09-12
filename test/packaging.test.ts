@@ -118,14 +118,24 @@ describe('cross-platform packaging targets', () => {
     ]) expect(pkg.scripts[script]).toBeTypeOf('string');
   });
 
-  it('pins Electron 43.4.1 exactly and proves packaged runners use those runtime bytes', () => {
+  it('generates notices outside tracked source and packages the generated file', () => {
+    const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const config = yamlFile('electron-builder.yml');
+    expect(pkg.scripts.predev).toBe('node scripts/generate-third-party-notices.mjs');
+    expect(config.extraResources).toContainEqual({
+      from: 'resources/packaging/licenses/THIRD-PARTY-NOTICES.txt',
+      to: 'THIRD-PARTY-NOTICES.txt'
+    });
+  });
+
+  it('pins Electron 43.7.0 exactly and proves packaged runners use those runtime bytes', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
     const smoke = readFileSync(path.join(root, 'scripts', 'smoke-packaged-runtime.mjs'), 'utf8');
 
-    expect(pkg.devDependencies.electron).toBe('43.4.1');
-    expect(lock.packages?.['']?.devDependencies?.electron).toBe('43.4.1');
-    expect(lock.packages?.['node_modules/electron']?.version).toBe('43.4.1');
+    expect(pkg.devDependencies.electron).toBe('43.7.0');
+    expect(lock.packages?.['']?.devDependencies?.electron).toBe('43.7.0');
+    expect(lock.packages?.['node_modules/electron']?.version).toBe('43.7.0');
     expect(smoke).toContain('const expectedElectronVersion = sourcePackage.devDependencies?.electron;');
     expect(smoke).toContain('electron: process.versions.electron');
     expect(smoke).toContain('runtime.electron !== expectedElectronVersion');

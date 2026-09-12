@@ -24,20 +24,21 @@ beforeEach(async () => {
   await write('docs/licenses/plugins/inventory.json', '[]');
   await write('docs/licenses/codex/LICENSE', 'Codex license fixture\n');
   await write('docs/licenses/codex/NOTICE', 'Codex notice fixture\n');
-  for (const name of ['README.md', 'COMPONENT-NOTICES.txt', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt']) await write(`docs/licenses/native/${name}`, `Fixture ${name}\n`);
+  for (const name of ['README.md', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt']) await write(`docs/licenses/native/${name}`, `Fixture ${name}\n`);
 });
 afterEach(async () => { await removeTempDir(root); });
 
 it('preserves license and NOTICE text; check mode leaves the shipped inventory untouched', async () => {
   expect(generate().status).toBe(0);
-  const notice = await fs.readFile(path.join(root, 'THIRD-PARTY-NOTICES.txt'), 'utf8');
+  const output = path.join(root, 'resources/packaging/licenses/THIRD-PARTY-NOTICES.txt');
+  const notice = await fs.readFile(output, 'utf8');
   expect(notice).toContain('Fixture copyright and permission\n');
   expect(notice).toContain('Fixture attribution\n');
   expect(notice).toContain('Codex license fixture\n');
   expect(notice).toContain('Codex notice fixture\n');
-  await write('THIRD-PARTY-NOTICES.txt', 'other platform inventory');
+  await write('resources/packaging/licenses/THIRD-PARTY-NOTICES.txt', 'other platform inventory');
   expect(generate('--check').status).toBe(0);
-  expect(await fs.readFile(path.join(root, 'THIRD-PARTY-NOTICES.txt'), 'utf8')).toBe('other platform inventory');
+  expect(await fs.readFile(output, 'utf8')).toBe('other platform inventory');
 });
 
 it('rejects a manifest license label with no license or NOTICE material', async () => {
@@ -68,5 +69,5 @@ it('rejects changed catalog notice bytes before publishing an inventory', async 
   const result = generate();
   expect(result.status).not.toBe(0);
   expect(result.stderr).toContain('Catalog license hash mismatch');
-  await expect(fs.stat(path.join(root, 'THIRD-PARTY-NOTICES.txt'))).rejects.toThrow();
+  await expect(fs.stat(path.join(root, 'resources/packaging/licenses/THIRD-PARTY-NOTICES.txt'))).rejects.toThrow();
 });

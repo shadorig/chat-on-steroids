@@ -8,14 +8,19 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const noticeDirectory = path.join(root, 'docs', 'licenses', 'native');
 const inventory = JSON.parse(await fs.readFile(path.join(noticeDirectory, 'sources.json'), 'utf8'));
 const lock = JSON.parse(await fs.readFile(path.join(root, 'package-lock.json'), 'utf8'));
-const componentNotices = await fs.readFile(path.join(noticeDirectory, 'COMPONENT-NOTICES.txt'));
-if (createHash('sha256').update(componentNotices).digest('hex') !== inventory.componentNoticesSha256) {
-  throw new Error('Native component notice bytes differ from the reviewed inventory');
-}
 for (const [name, version] of Object.entries(inventory.packages)) {
   if (lock.packages[`node_modules/${name}`]?.version !== version) {
     throw new Error(`Native source review does not cover locked ${name}; expected ${version}`);
   }
+}
+const supplementIds = new Set();
+for (const supplement of inventory.noticeSupplements ?? []) {
+  if (typeof supplement.id !== 'string' || !supplement.id || supplement.id.length > 256 || supplementIds.has(supplement.id) ||
+      typeof supplement.url !== 'string' || !supplement.url.startsWith('https://') || supplement.url.length > 2048 ||
+      typeof supplement.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(supplement.sha256)) {
+    throw new Error(`Invalid or duplicate native notice supplement: ${supplement.id ?? '<missing>'}`);
+  }
+  supplementIds.add(supplement.id);
 }
 const filenames = new Set();
 for (const source of inventory.sources) {
@@ -64,13 +69,13 @@ await Promise.all(Array.from({ length: 8 }, async () => {
     if (++completed % 50 === 0) console.log(`Verified ${completed}/${inventory.sources.length} source files.`);
   }
 }));
-for (const name of ['sources.json', 'README.md', 'SOURCE-BUILD.md', 'COMPONENT-NOTICES.txt', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt']) {
+for (const name of ['sources.json', 'README.md', 'SOURCE-BUILD.md', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt']) {
   await fs.copyFile(path.join(noticeDirectory, name), path.join(output, name));
 }
 await fs.writeFile(path.join(output, 'SHA256SUMS.txt'), inventory.sources.map(source => `${source.sha256}  archives/${source.file}`).join('\n') + '\n');
 const destination = path.join(root, 'release', 'Chat-On-Steroids-Native-Sources.tar.gz');
 // List the reviewed files explicitly: stale files from an older local build cannot enter the release.
-const files = ['sources.json', 'README.md', 'SOURCE-BUILD.md', 'COMPONENT-NOTICES.txt', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt', 'SHA256SUMS.txt',
+const files = ['sources.json', 'README.md', 'SOURCE-BUILD.md', 'LGPL-3.0.txt', 'GPL-3.0.txt', 'MPL-2.0.txt', 'SHA256SUMS.txt',
   ...inventory.sources.map(source => `archives/${source.file}`)];
 const list = path.join(root, 'release', 'native-source-files.txt');
 await fs.writeFile(list, files.join('\n') + '\n');
