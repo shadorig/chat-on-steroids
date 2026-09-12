@@ -21,7 +21,7 @@ const fake = vi.hoisted(() => {
   }
   const requests: Array<Record<string, any>> = [];
   const children: Array<Transport> = [];
-  const clipboard = { writeText: vi.fn(), readText: vi.fn(() => '') };
+  const clipboard = { writeText: vi.fn(async (): Promise<void> => {}), readText: vi.fn(async () => '') };
   const overrides: { focusFailure: boolean; geometry: boolean } = { focusFailure: false, geometry: false };
   class Transport extends Emitter {
     readonly pid = 9000 + children.length;
@@ -242,6 +242,26 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.clipboard.writeText.mockClear();
     await expect(computer.act([{ type: 'paste', text }, { type: 'write_clipboard', text: 'later' }], { window: 77 })).rejects.toThrow(/PASTE_SEQUENCE/);
     expect(fake.clipboard.writeText).not.toHaveBeenCalled();
+  });
+
+  it.runIf(transport === 'stdio')('waits for asynchronous clipboard publication before dispatching paste input', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    let releaseWrite!: () => void;
+    const writeFinished = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    fake.clipboard.writeText.mockImplementationOnce(async () => writeFinished);
+
+    const work = computer.act([{ type: 'paste', text: 'deferred clipboard text' }], { window: 77 });
+    await vi.waitFor(() => expect(fake.clipboard.writeText).toHaveBeenCalledExactlyOnceWith('deferred clipboard text'));
+    expect(fake.requests.filter(request => request.op === 'act')).toMatchObject([
+      { targetWindow: 77, actions: [{ type: 'focus', window: 77 }] }
+    ]);
+
+    releaseWrite();
+    await expect(work).resolves.toMatchObject({ completedCount: 1 });
+    expect(fake.requests.filter(request => request.op === 'act')).toMatchObject([
+      { targetWindow: 77, actions: [{ type: 'focus', window: 77 }] },
+      { targetWindow: 77, actions: [{ type: 'keypress', keys: ['ctrl', 'v'] }] }
+    ]);
   });
 
   it.runIf(transport === 'stdio')('does not replace the clipboard when target activation fails before paste', async () => {

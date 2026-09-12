@@ -71,7 +71,7 @@
     "@types/jsdom": "^30.0.0",
     "@types/node": "^22.20.2",
     "@types/ws": "8.18.1",
-    "electron": "43.7.0",
+    "electron": "44.3.0",
     "electron-builder": "^26.16.1",
     "electron-vite": "^5.0.0",
     "js-yaml": "4.3.2",

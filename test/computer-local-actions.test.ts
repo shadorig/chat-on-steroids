@@ -4,8 +4,8 @@ const mocks = vi.hoisted(() => ({
   spawn: vi.fn(() => {
     throw new Error('desktop helper must not start');
   }),
-  readText: vi.fn(() => 'clipboard-value'),
-  writeText: vi.fn()
+  readText: vi.fn(async () => 'clipboard-value'),
+  writeText: vi.fn(async () => undefined)
 }));
 
 vi.mock('node:child_process', () => ({ spawn: mocks.spawn }));

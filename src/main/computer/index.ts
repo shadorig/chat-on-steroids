@@ -1837,7 +1837,7 @@ async function actLocked(
         // the explicitly selected window; it is one authored paste, not two counted steps.
         const nativeClipboard = await electronClipboard();
         assertHelperGeneration(helperGeneration, expected);
-        nativeClipboard.writeText(action.text);
+        await nativeClipboard.writeText(action.text);
       } catch (err) {
         throw localActionFailure(err, completedCount, index);
       }
@@ -1868,7 +1868,7 @@ async function actLocked(
       try {
         const nativeClipboard = await electronClipboard();
         assertHelperGeneration(helperGeneration, expected);
-        clipboard.push(nativeClipboard.readText());
+        clipboard.push(await nativeClipboard.readText());
       } catch (err) {
         throw localActionFailure(err, completedCount, index);
       }
@@ -1881,7 +1881,7 @@ async function actLocked(
       try {
         const nativeClipboard = await electronClipboard();
         assertHelperGeneration(helperGeneration, expected);
-        nativeClipboard.writeText(action.text);
+        await nativeClipboard.writeText(action.text);
       } catch (err) {
         throw localActionFailure(err, completedCount, index);
       }
@@ -1945,7 +1945,10 @@ function localActionFailure(err: unknown, completedCount: number, failedIndex: n
  * happily outside Electron — the desktop tests drive the helper directly — and a static
  * import would make that impossible for the sake of two actions.
  */
-async function electronClipboard(): Promise<{ readText: () => string; writeText: (text: string) => void }> {
+async function electronClipboard(): Promise<{
+  readText: () => string | Promise<string>;
+  writeText: (text: string) => void | Promise<void>;
+}> {
   try {
     const { clipboard } = await import('electron');
     if (!clipboard) throw new Error('no clipboard');
