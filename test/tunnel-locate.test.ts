@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  bundledTunnelDirectories,
   commonBinaryDirsForPlatform,
   locateBinary,
   resetTunnelLocatorCacheForTests,
@@ -30,6 +31,14 @@ afterEach(async () => {
 });
 
 describe('tunnel binary location', () => {
+  it('finds the repository bundle from direct-source and flattened electron-vite layouts', () => {
+    const repository = path.join(path.parse(process.cwd()).root, 'workspace', 'chat-on-steroids');
+    const expected = path.join(repository, 'resources', 'tunnel');
+
+    expect(bundledTunnelDirectories(path.join(repository, 'src', 'main', 'tunnel'), '')).toContain(expected);
+    expect(bundledTunnelDirectories(path.join(repository, 'out', 'main'), '')).toContain(expected);
+  });
+
   it('prefers the tested bundled client over an unrelated PATH copy', async () => {
     const resources = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-resources-'));
     const fakePath = await mkdtemp(path.join(os.tmpdir(), 'clf-tunnel-path-'));

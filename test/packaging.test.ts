@@ -148,7 +148,9 @@ describe('cross-platform packaging targets', () => {
   it('generates notices outside tracked source and packages the generated file', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     const config = yamlFile('electron-builder.yml');
-    expect(pkg.scripts.predev).toBe('node scripts/generate-third-party-notices.mjs');
+    expect(pkg.scripts.predev).toBe(
+      'node scripts/fetch-tunnel-client.mjs && node scripts/generate-third-party-notices.mjs'
+    );
     expect(config.extraResources).toContainEqual({
       from: 'resources/packaging/licenses/THIRD-PARTY-NOTICES.txt',
       to: 'THIRD-PARTY-NOTICES.txt'

@@ -1476,6 +1476,10 @@ corepack pnpm run dist                       # current OS, x64 + arm64
 corepack pnpm run dist:dir:mac:x64           # example unpacked target on a matching host
 ```
 
+`pnpm run dev` first stages the pinned, checksum-verified host tunnel payload. A clean source
+checkout therefore cannot open a usable-looking app whose saved auto-connect fails merely because
+the ignored development runtime has not been prepared yet.
+
 Use `corepack pnpm install --frozen-lockfile` for an intentionally needed reproducible dependency install, not as routine
 cleanup of this shared tree. `verify:ci` fetches rg, checks privacy/notices/native-source metadata,
 typechecks, verifies Electron resolves, runs Vitest excluding `mcp-shutdown`, then runs that

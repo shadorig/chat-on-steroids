@@ -152,16 +152,22 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
  * In a packaged build extraResources land in resourcesPath; during development the
  * same files sit in resources/ at the repository root.
  */
-function bundledDir(): string | null {
-  const packaged = process.resourcesPath ? path.join(process.resourcesPath, 'tunnel') : null;
-  if (packaged && existsSync(packaged)) return packaged;
+export function bundledTunnelDirectories(
+  moduleDirectory = __dirname,
+  resourcesPath = process.resourcesPath
+): string[] {
+  const packaged = resourcesPath ? path.join(resourcesPath, 'tunnel') : null;
   // Direct source execution keeps src/main/tunnel; electron-vite flattens it to out/main.
   // Accept both layouts so development uses the same pinned bundle as packaging.
-  const development = [
-    path.resolve(__dirname, '..', '..', '..', 'resources', 'tunnel'),
-    path.resolve(__dirname, '..', '..', 'resources', 'tunnel')
+  return [
+    ...(packaged ? [packaged] : []),
+    path.resolve(moduleDirectory, '..', '..', '..', 'resources', 'tunnel'),
+    path.resolve(moduleDirectory, '..', '..', 'resources', 'tunnel')
   ];
-  return development.find(existsSync) ?? null;
+}
+
+function bundledDir(): string | null {
+  return bundledTunnelDirectories().find(existsSync) ?? null;
 }
 
 /** The bundled tunnel-client version, for the diagnostics panel. */
