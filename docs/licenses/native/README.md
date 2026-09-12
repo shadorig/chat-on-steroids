@@ -22,12 +22,15 @@ download is available free of charge beside the installers:
 https://github.com/shadorig/chat-on-steroids/releases/download/v2.0.10/Chat-On-Steroids-Native-Sources.tar.gz
 
 It contains original component archives, locked Rust dependency sources, build repositories,
-patches, a URL/SHA-256 inventory, and build/replacement instructions. The archives preserve
-their source license and copyright notices; `sources.json` records separately reviewed notice
-supplements. Source remains under its original individual licenses, including LGPLv3 and MPL
-2.0 where identified. The inventory distinguishes the Windows and Unix versions. Optional and
-development sources are retained as an inclusive set; this does not imply that every listed
-component is linked into every target. Each packaged target also carries its native README.
+patches, a URL/SHA-256 inventory, and build/replacement instructions. The repository keeps the
+human-reviewed top-level pins and exceptional notice metadata in `source-recipe.json`; release
+assembly expands librsvg's pinned `Cargo.lock` into downloadable crate rows and records the
+embedded Unix/Windows Rust standard-library Cargo closures in the generated `sources.json`.
+The archives preserve their source license and copyright notices. Source remains under its
+original individual licenses, including LGPLv3 and MPL 2.0 where identified. The inventory
+distinguishes the Windows and Unix versions. Optional and development sources are retained as
+an inclusive set; this does not imply that every listed component is linked into every target.
+Each packaged target also carries its native README.
 
 You may modify these libraries and debug those modifications, including by reverse
 engineering the combined application for that purpose. The application imposes no

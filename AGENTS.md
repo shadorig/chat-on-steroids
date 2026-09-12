@@ -1519,7 +1519,7 @@ stable `userData/extension`, never an ephemeral AppImage mount.
 | `prepare-packaging-native.mjs` | Exact target node-pty/Sharp/tree-sitter from verified package material; host leftovers cannot win. |
 | `prepare-macos-desktop-helper.mjs` | Thin target Swift dylib + matching N-API addon; packaged in-process permission identity. |
 | `smoke-packaged-runtime.mjs`, `smoke-macos-{bundle,gui}.mjs` | In-place resource/native-stack checks, Mac bundle/seal and real GUI startup evidence. |
-| `generate-third-party-notices.mjs`, `package-native-sources.mjs` | Production notices and corresponding native source inventory/archive; exact lockfile/catalog provenance. |
+| `generate-third-party-notices.mjs`, `native-source-inventory.mjs`, `package-native-sources.mjs` | Production notices and corresponding native source archive; compact reviewed recipe plus generated downloaded/embedded Cargo-closure provenance. |
 | `verify-public-history.mjs`, `check-release-absent.mjs` | Public-history/privacy gate and positive proof that publishing will not overwrite a release. |
 
 Generated resources are outputs; change their pin/source/script and regenerate instead of

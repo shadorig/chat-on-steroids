@@ -128,6 +128,20 @@ describe('cross-platform packaging targets', () => {
     });
   });
 
+  it('keeps native source provenance compact and expands Cargo sources only for release output', () => {
+    const recipe = JSON.parse(readFileSync(path.join(root, 'docs', 'licenses', 'native', 'source-recipe.json'), 'utf8'));
+
+    expect(recipe.format).toBe(2);
+    expect(recipe.pinnedSources.length).toBeLessThan(100);
+    expect(recipe.pinnedSources.some((source: { type?: string }) => source.type === 'rust-crate')).toBe(false);
+    expect(recipe.cargoSources.map((source: { id: string; mode: string; sourceId: string }) =>
+      [source.id, source.mode, source.sourceId])).toEqual([
+      ['librsvg-crates', 'download', 'rsvg'],
+      ['rust-unix-stdlib-crates', 'embedded', 'rust-unix-standard-library'],
+      ['rust-windows-stdlib-crates', 'embedded', 'rust-windows-standard-library'],
+    ]);
+  });
+
   it('pins Electron 43.7.0 exactly and proves packaged runners use those runtime bytes', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));

@@ -54,7 +54,8 @@ directory typo was corrected while preserving its original archive checksum.
 
 Component, crate and runtime copyright/license notices are retained in the installed notice
 inventory. Missing package license files were checked against exact source revisions or
-packaged MPL declarations, with provenance preserved in `sources.json`. Electron/Chromium
+packaged MPL declarations, with reviewed pins in `source-recipe.json` and generated release
+provenance in `sources.json`. Electron/Chromium
 notices are explicitly copied into application resources on every target; native smoke
 requires them along with sharp, tunnel and ripgrep notices.
 
@@ -139,3 +140,20 @@ navigates to a loopback page; Blender and Unity establish stdio connections and 
 documented tools. Python 3.12 and uv 0.12.5 are provisioned explicitly. OAuth protocol tests
 use local fixtures, not user accounts. Editor-side operations and paid hosted accounts remain
 outside unattended CI, and these jobs do not test a packaged application's GUI runtime lookup.
+
+## 2026-09-12 native source provenance refactor
+
+The tracked 6,110-line expanded native source inventory was replaced by `source-recipe.json`.
+Release assembly derives the 350 librsvg registry crates from the pinned `Cargo.lock` inside its
+verified source archive and records the 31 Unix and 30 Windows Rust standard-library registry
+packages that are already
+vendored inside the pinned `rust-src` archives. The 22 former standalone Windows crate downloads
+are all members of that verified embedded closure; it also records `shlex` 1.3.0, which the old
+top-level inventory did not list separately. Each embedded vendor package's `.cargo-checksum.json`
+package checksum was checked against its lock entry before the release archive was assembled.
+
+Local validation rebuilt the source artifact with 401 verified top-level source files and 409
+unique archive entries, with 401 matching `SHA256SUMS.txt` rows and no stale component-notice
+payload. Focused inventory/packaging tests passed 31/31, typecheck and the production build passed,
+and the full verification run passed 3,958 tests with 40 skips. Its only two failures were the
+pre-existing live Windows UIA/browser-root checks in `test/computer.test.ts` on this desktop.

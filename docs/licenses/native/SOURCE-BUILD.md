@@ -1,9 +1,12 @@
 # Building and replacing the native image libraries
 
-`sources.json` maps each archive to its URL, version, applicable OS and SHA-256. Verify
-`SHA256SUMS.txt` before extracting. Keep embedded subprojects and notices. Source retains
-its original licenses. The application consumes the published sharp 0.35.4/@img binaries
-without modifying their machine code. Windows and Unix use different dependency versions
+The repository's `source-recipe.json` pins each top-level archive, patch and exceptional notice.
+Release assembly reads the pinned Cargo locks from their verified source archives, downloads
+librsvg's crates.io source closure, and records the Rust standard-library closures already embedded
+in their `rust-src` archives. It writes generated `sources.json` plus `SHA256SUMS.txt` into the
+source archive. Verify the checksums before extracting. Keep embedded subprojects and notices.
+Source retains its original licenses. The application consumes the published sharp 0.35.4/@img
+binaries without modifying their machine code. Windows and Unix use different dependency versions
 even though both report libvips 8.18.6.
 
 ## Source preparation
@@ -49,8 +52,8 @@ generated `vips.map`, static inner libraries, SONAME changes and linker flags in
 
 The actual release logs record Rust `1.100.0-nightly (787af2b8c 2026-08-25)`, cargo-c
 `0.10.25+cargo-0.99.0` and Meson `1.12.0`. Use that dated Rust toolchain rather than today's
-floating nightly. Original librsvg 2.62.91 Cargo.lock and source-local workspace are in
-its archive. After the recipe's feature edits, `cargo update --workspace` removed only
+floating nightly. The reviewed librsvg 2.62.91 `Cargo.lock` is tracked under `cargo/` and the
+same bytes are present in its source archive. After the recipe's feature edits, `cargo update --workspace` removed only
 `color_quant 1.1.0`, `gif 0.14.2`, `image-webp 0.2.4` and `weezl 0.1.12`; it
 added/upgraded nothing.
 Retained crates include that lock's dependency sources, checked against Cargo.lock hashes.
@@ -70,11 +73,14 @@ remain DLLs; “static” describes their dependencies.
 
 The pinned MXE recipes identify Rust nightly 2026-06-05 (`e7815e522`), LLVM 22.1.7,
 and MinGW-w64 commit `b536c4fdb038a9c59a7e5fb36e7d1293c4dc61d6`. Their runtime sources
-and the Rust standard-library lock's crate sources are included. The full LLVM source
-archive is an inclusive delivery choice; use its compiler-rt, libc++, libc++abi and
-libunwind recipes for the relevant runtimes. This does not assert that the whole compiler
-is incorporated in the application. The dated Unix Rust standard-library source is
-supplied separately, and readable standard-library/runtime notices accompany both sets.
+and the Rust standard-library lock's crate sources are included. The pinned `rust-src`
+archives already contain their `library/vendor` trees, so release assembly validates and records
+those Cargo closures without duplicating the vendored crates as separate `.crate` downloads.
+The full LLVM source archive is an
+inclusive delivery choice; use its compiler-rt, libc++, libc++abi and libunwind recipes for the
+relevant runtimes. This does not assert that the whole compiler is incorporated in the
+application. The dated Unix Rust standard-library source is supplied separately, and readable
+standard-library/runtime notices accompany both sets.
 
 The targets are `x86_64-w64-mingw32.static` and `aarch64-w64-mingw32.static`. With
 the build repository's `build/` mounted at `/data`, the source collection command is:
@@ -85,7 +91,7 @@ make download-vips-web MXE_TARGETS=x86_64-w64-mingw32.static \
 ```
 
 Populate MXE's `pkg` cache from the retained inventory. Most archives match recipe
-checksums directly; explicit mirror/commit substitutions in `sources.json` need the
+checksums directly; explicit mirror/commit substitutions in `source-recipe.json` need the
 corresponding filename/hash adjustment while preserving the recorded source commit.
 Do not substitute another libimagequant fork. Preserve all build/MXE patches and settings.
 GLib's GVDB and librsvg's workspace plus locked crates are included. Follow the retained
