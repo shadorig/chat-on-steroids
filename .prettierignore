@@ -1,0 +1,26 @@
+pnpm-lock.yaml
+out/
+release/
+release-next/
+build/
+resources/
+docs/licenses/
+
+# Runtime source and historical material predate the formatter. Keep this documentation/tooling
+# migration reviewable; remove these exclusions only in a dedicated format-only change.
+src/
+test/
+extension/
+native/
+artwork/
+CHANGELOG.md
+CLAUDE.md
+scripts/*
+!scripts/verify-docs.mjs
+docs/*
+!docs/README.md
+!docs/setup.md
+!docs/tool-surface.md
+!docs/plugins.md
+!docs/architecture/
+!docs/architecture/**

@@ -112,7 +112,7 @@ export interface TunnelSettings {
    * A second id rather than a second channel on the first: `tunnel-client` really does
    * multiplex channels, but ChatGPT's connector UI addresses a tunnel id and normalises
    * everything to the `main` channel, so the extra channels are reachable only from Codex
-   * and the API (`docs/tool-surface.md` §6.5). One id per connector is what actually works.
+   * and the API. One id per ChatGPT connector is what actually works.
    */
   desktopTunnelId: string;
   /** Optional shared connector for installed external MCP plugins. */
@@ -426,8 +426,8 @@ export interface SurfaceStatus {
    *
    * `state` is only ever our side of the wire — whether we published it. These two are the
    * other side: proof the user really created this connector in ChatGPT and that the model
-   * is allowed to call it. With an optional second connector the difference matters, since
-   * a healthy Core says nothing about whether Desktop was ever added.
+   * is allowed to call it. With optional connectors the difference matters, since a healthy
+   * Core says nothing about whether Desktop or Plugins was ever added.
    */
   lastRequestAt: number | null;
   lastToolCallAt: number | null;

@@ -18,7 +18,11 @@ corepack pnpm run verify     # the same gate CI runs
 corepack pnpm run dev        # Electron development build
 ```
 
-A behavior change should include a deterministic regression test where practical. Run the nearest focused tests while working and `corepack pnpm run verify` before submitting.
+A behavior change should include a deterministic regression test where practical. Run the nearest focused tests while working and `corepack pnpm run verify` before submitting. Use `corepack pnpm run format` for repository-owned formatting; the verification gate runs the matching non-mutating check, and `.prettierignore` records the deliberately incremental adoption boundary.
+
+For maintainer-facing ownership, durability and cross-process contracts, start with [`docs/architecture/README.md`](docs/architecture/README.md) and follow the focused document for the subsystem you are changing. [`docs/README.md`](docs/README.md) distinguishes maintained references from dated evidence, plans and historical reports.
+
+Do not hard-wrap ordinary Markdown prose. Keep each paragraph on one physical source line, use line breaks where Markdown structure requires them and avoid reformatting unrelated files in a behavior change.
 
 ## Packaging
 

@@ -17,7 +17,7 @@ async function runPluginTool(name: string, args: unknown): Promise<ToolResult> {
 }
 
 /** Raw SDK handlers keep external JSON Schema intact (including refs and output schemas).
- * Only the new surface uses them; Core/Desktop retain their existing registrar unchanged.
+ * Plugins uses them; Core/Desktop retain their existing registrar unchanged.
  * Admission is checked by the manager on every call, including stale cached tool names.
  */
 export function registerPluginTools(server: McpServer): PluginToolSchema[] {

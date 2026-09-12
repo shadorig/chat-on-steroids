@@ -70,9 +70,9 @@ const MAX_LABEL_CHARS = 60;
 /**
  * How long a ChatGPT model slug in a worker's `model` field may be.
  *
- * Slugs are OpenAI's vocabulary, not ours, so this is a transport bound, not a menu: anything
- * shaped like a slug passes through to the fresh-chat URL untouched, and an unknown slug
- * simply opens with the account default rather than failing the spawn.
+ * Slugs are OpenAI's vocabulary, not ours, so this is a transport bound rather than a static
+ * menu. Availability is validated against the observed account catalog when one exists, and
+ * the browser still confirms the exact choice at Send.
  */
 const MAX_MODEL_CHARS = 80;
 const MODEL_SLUG_RE = /^[A-Za-z0-9._-]{1,80}$/;

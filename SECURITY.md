@@ -8,15 +8,14 @@ Include the smallest useful reproduction, the app version, operating-system vers
 
 This is a solo-maintained beta. There is no bug bounty or guaranteed response window.
 
-Security fixes target the **latest published release**. If you can reproduce an issue safely on
-the latest version, include that result in the private report.
+Security fixes target the **latest published release**. If you can reproduce an issue safely on the latest version, include that result in the private report.
 
 ## Security model
 
 Chat On Steroids is a permission boundary between ChatGPT and the logged-in OS user running the app:
 
 - Filesystem tools validate paths against folders you explicitly approve. When a chat is bound to a Local Project, that project is an additional narrower boundary: absolute paths, relative paths, searches, patches, downloads and command starting directories cannot use a sibling folder merely because the sibling shares an approved parent root.
-- Read-only mode disables effective file writes, commands, desktop control and clipboard writes.
+- Read-only mode disables effective file writes, commands, Desktop control and clipboard writes, and refuses external plugin tool calls because their mutation behavior is outside this app's authority.
 - `exec_command` is intentionally **not** a process sandbox. Its starting directory must satisfy the current approved-root and Local Project boundary, but once launched the shell runs with the normal privileges of your account and may access paths the OS user can access.
 - Screen, mouse/keyboard and clipboard permissions are desktop-wide capabilities on Windows and macOS, not folder permissions. On macOS they start off and also require the OS's own Screen Recording and Accessibility grants.
 - MCP servers bind to loopback and use secret tokenized paths. Public reachability comes only from the tunnel you configure.
@@ -30,9 +29,9 @@ These are properties of the current design, not vulnerability reports by themsel
 
 - **Release binaries are not publisher-signed; macOS builds are also unnotarized.** Apple-silicon Mach-O files may still carry ad-hoc signatures, which do not identify a publisher or establish Gatekeeper trust. Windows SmartScreen, macOS Gatekeeper or browsers can warn. Verify release SHA-256 checksums before running them.
 - **The Linux AppImage has a sandbox-availability fallback.** Its electron-builder static launcher can add `--no-sandbox` when the host disables unprivileged user namespaces. On Debian/Ubuntu, prefer the DEB on such restrictive systems if you do not want the portable AppImage to take that fallback.
-- **Fresh installs start Core permissions enabled and read-only mode off.** Windows additionally enables Desktop permissions; Desktop is unavailable on macOS/Linux. Review permissions before connecting ChatGPT. Existing installs keep their explicit stored choices.
+- **Fresh installs start all platform-available Core permissions enabled and read-only mode off.** Windows additionally enables Desktop permissions. macOS supports Desktop but starts those app permissions off and also requires explicit Screen Recording/Accessibility grants; Linux has no Desktop connector. Review permissions before connecting ChatGPT. Existing installs keep their explicit stored choices.
 - **Application path checks are not a kernel/VM sandbox.** They substantially constrain the app's filesystem tools, but same-user filesystem races can still exist. Do not treat approved roots as isolation from a hostile local process.
-- **Command and Windows Desktop capabilities are powerful by design.** If enabled, they can act wherever your logged-in user can act, subject to normal OS privilege boundaries.
+- **Command, Desktop and plugin capabilities are powerful by design.** If enabled, they can act through your logged-in user or connected service, subject to the OS/service's own authority and permission boundaries.
 - **Session recording is intentionally detailed and is not encrypted by `safeStorage`.** Recorded conversations/tool activity stay local to this app, but anyone with access to your OS account may be able to read the session files.
 
 ## Scope

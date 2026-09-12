@@ -4,12 +4,12 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
 /**
  * The machinery every model-facing tool sits on, independent of which surface it lives on.
  *
- * The tools themselves are split by connector — `tools-core.ts` and `tools-desktop.ts` —
- * because a connector is a discovery boundary and that split is the whole point of the
- * design (see `docs/tool-surface.md` §6.4). None of what is in this file is surface-shaped:
- * error mapping, the call clock, the recording context, the agent key and the result
+ * The tools themselves are split by connector — Core, Desktop and Plugins — because a
+ * connector is a discovery boundary and that split is the point of the design (see
+ * `docs/tool-surface.md`). None of what is in this file is surface-shaped: error mapping,
+ * the call clock, the recording context, caller/agent attribution and the result
  * formatters behave identically wherever a tool is registered, and duplicating them per
- * surface is how two connectors would quietly start reporting the same thing differently.
+ * surface would let connectors quietly report the same thing differently.
  *
  * A tool first appears when its capability is enabled. For the lifetime of a running MCP
  * endpoint the exposed surface is monotonic: if that permission is later revoked, the tool
@@ -170,9 +170,9 @@ export function friendlyError(err: unknown): string {
  * here. Only a tool that ran proves the whole chain, model included, works.
  *
  * Kept per surface as well as overall. "Has ChatGPT ever run a tool here" is the only
- * honest proof a connector was created and works, and with two connectors the answer for
- * one says nothing about the other — a user whose Core connector is fine and whose
- * Desktop connector was never added would otherwise see setup reported as finished.
+ * honest proof a connector was created and works. The answer for one surface says nothing
+ * about another — a user whose Core connector is fine and whose optional connectors were
+ * never added would otherwise see setup reported as finished.
  */
 let toolCallSeenAt: number | null = null;
 const surfaceToolCallAt = new Map<SurfaceId, number>();
@@ -988,11 +988,10 @@ export interface ToolAnnotations {
 /**
  * What a surface module is handed to register its tools with.
  *
- * Passing a small object rather than the raw `McpServer` is what keeps the two surface
- * modules from being able to diverge on the things that must not differ: every tool goes
- * through `dispatch`, every tool gets the agent key under the same condition, and every
- * capability refusal reads the same. A surface decides *which* tools exist, never how a
- * tool is wired up.
+ * Passing a small object rather than the raw `McpServer` keeps the Core and Desktop surface
+ * modules from diverging on the things that must not differ: every tool goes through
+ * `dispatch`, receives the same caller/agent context and reports capability refusals
+ * consistently. A surface decides *which* tools exist, never how a tool is wired up.
  */
 export interface SurfaceRegistrar {
   ctx: ToolContext;

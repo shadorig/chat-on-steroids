@@ -34,8 +34,8 @@ const RESERVED_NAMES = new Set([
  * Root names this app keeps for itself.
  *
  * `/skills` is the virtual namespace the design reserves for progressive-disclosure skill
- * files reachable through `read` (`docs/tool-surface.md` §5). Reserving it here rather
- * than inside `read` is the point: once a user has an approved folder called `skills`,
+ * files reachable through `read`. Reserving it here rather than inside `read` is the point:
+ * once a user has an approved folder called `skills`,
  * `/skills/x/SKILL.md` is ambiguous between their disk and ours, and no amount of care in
  * the reader can undo that. Cheap to reserve now, impossible to reclaim later.
  */

@@ -187,7 +187,7 @@ function surfaceStateForConnection(state: ConnectionStatus['state']): SurfaceSta
 /**
  * Settings whose change means the existing Core tunnel can no longer represent the config.
  *
- * `desktopTunnelId` is intentionally absent: that second OpenAI tunnel is hot-swappable.
+ * Optional connector tunnel ids are intentionally absent: those OpenAI tunnels are hot-swappable.
  * Irrelevant fields are normalised out too, so editing a hidden OpenAI id while Cloudflare is
  * active does not bounce a perfectly good connection.
  */
@@ -207,12 +207,12 @@ function sameCoreTransport(
 }
 
 /**
- * Derives a second surface's public URL from the first one's.
+ * Derives an optional surface's public URL from Core's.
  *
  * Only correct for a transport that publishes a whole origin — cloudflared and a manual
- * reverse proxy — where both surfaces are already reachable at their own paths on the URL
+ * reverse proxy — where every surface is already reachable at its own path on the URL
  * the user was given. It is deliberately not used for the OpenAI tunnel, where a tunnel id
- * maps to one local URL and the second surface genuinely needs its own tunnel.
+ * maps to one local URL and each optional surface genuinely needs its own tunnel.
  */
 function siblingPublicUrl(publicUrl: string | null, localUrl: string | null): string | null {
   if (!publicUrl || !localUrl) return null;
@@ -407,9 +407,9 @@ async function stopOptionalTunnel(id: OptionalSurface, detail: string): Promise<
 /**
  * Re-applies connector settings to a connection that is already up.
  *
- * Desktop-only settings are applied without disturbing Core. A setting that actually changes
+ * Optional-connector settings are applied without disturbing Core. A setting that actually changes
  * Core's transport is different: leaving the old tunnel running made saved config, setup cards
- * and the transport doing the work disagree, and could even start a new-method Desktop tunnel
+ * and the transport doing the work disagree, and could even start a new-method optional tunnel
  * beside an old-method Core tunnel. Those deliberate connection-setting changes reconnect the
  * serialized lifecycle here; unrelated settings saves do not.
  */

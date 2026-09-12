@@ -284,7 +284,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   let retirement: Promise<void> = Promise.resolve();
   /** Consecutive failed attempts, which is what the backoff grows on. */
   let attempts = 0;
-  /** Names this connector in the log, since core and desktop both run one of these. */
+  /** Names this connector in the log because each published surface can run one of these. */
   const tag = opts.label ? `${opts.label} tunnel` : 'tunnel';
 
   const clearTimer = (): void => {

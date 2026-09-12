@@ -55,7 +55,7 @@ compression: maximum
 # libfuse2 to libfuse2t64 and does not install it by default, so use builder's static runtime
 # toolset instead. This keeps the standalone AppImage actually portable on the release target.
 toolsets:
-  appimage: "1.0.3"
+  appimage: '1.0.3'
 
 win:
   target: nsis
@@ -94,7 +94,7 @@ mac:
     - zip
   icon: build/icon.png
   category: public.app-category.developer-tools
-  minimumSystemVersion: "13.0"
+  minimumSystemVersion: '13.0'
   extendInfo:
     NSUserNotificationAlertStyle: alert
     NSScreenCaptureUsageDescription: Chat On Steroids captures a display or window only when the enabled Desktop connector asks to observe it.

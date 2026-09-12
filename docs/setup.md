@@ -39,11 +39,11 @@ Core, Desktop and Plugins are separate connectors. Configure each surface you en
 | **Desktop** | Screen inspection, mouse, keyboard and clipboard. Windows and macOS; macOS requires explicit enablement and OS permissions. |
 | **Plugins** | External MCP tools such as Blender, Playwright and Memory, plus custom local or remote servers. [Plugin guide](plugins.md). |
 
-You choose the approved folders and capabilities. File tools enforce those roots; shell commands run with your normal user privileges. Desktop access applies to the desktop, and external plugins have their own permissions. **Read-only mode** disables writes, command execution and desktop control.
+You choose the approved folders and capabilities. File tools enforce those roots; shell commands run with your normal user privileges. Desktop access applies to the desktop, and external plugins have their own permissions. **Read-only mode** disables writes, command execution, Desktop control and clipboard writes, and refuses external plugin tool calls.
 
 History is stored locally, with recording on and 30-day retention by default. Credentials use the operating system's secure storage. Review permissions before connecting: fresh installs enable Core capabilities and two workers; Windows also starts with Desktop permissions enabled.
 
-[Security policy](../SECURITY.md) · [Tool reference](tool-surface.md) · [Architecture](../AGENTS.md)
+[Security policy](../SECURITY.md) · [Tool reference](tool-surface.md) · [Architecture](architecture/README.md) · [Developer guide](../AGENTS.md)
 
 ## Sessions, workers and Astra
 
@@ -70,8 +70,6 @@ History is stored locally, with recording on and 30-day retention by default. Cr
 The MCP connector uses ChatGPT's Developer mode and tunnel interfaces. The companion also observes and automates the browser UI; this is not a public ChatGPT automation API. Your account's [terms and policies](https://openai.com/policies/) apply. Do not use it to evade limits or safety controls.
 
 ## Build from source and contribute
-
-## Development
 
 ```sh
 corepack pnpm install --frozen-lockfile

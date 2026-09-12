@@ -44,7 +44,7 @@ export interface McpEndpoint {
    * One URL per surface, each with its own token.
    *
    * Separate paths rather than separate ports: one listener is simpler to start, stop and
-   * firewall, and a public tunnel that publishes the origin publishes both surfaces with no
+   * firewall, and a public tunnel that publishes the origin publishes every surface with no
    * extra process. What matters for the design is not which socket a request arrived on but
    * which MCP server answers it, and each path is wired to exactly one (see `buildServer`).
    */
@@ -170,10 +170,10 @@ let requestSeenAt: number | null = null;
 /**
  * The same clock per connector.
  *
- * With two connectors, "ChatGPT reached this app" no longer means "both connectors were
- * created and work". A user whose Core connector is healthy and who never added the
- * optional Desktop one would otherwise be shown a finished setup, so the setup screen
- * asks each surface for itself.
+ * With separate connectors, "ChatGPT reached this app" does not mean every configured
+ * connector works. A user whose Core connector is healthy and who never added an optional
+ * connector would otherwise be shown a finished setup, so the setup screen asks each
+ * surface for itself.
  */
 const surfaceRequestAt = new Map<SurfaceId, number>();
 
@@ -221,8 +221,8 @@ interface SurfaceExposure {
 /**
  * What each independently discoverable connector has already exposed.
  *
- * Core and Desktop share one loopback listener, but they are separate MCP servers to the
- * client. Keeping this as one global snapshot let a Desktop request freeze Core's mutually
+ * All surfaces share one loopback listener, but they are separate MCP servers to the client.
+ * Keeping this as one global snapshot let a Desktop request freeze Core's mutually
  * exclusive `find`/exec choice before Core had ever been discovered, and it could similarly
  * preserve Core-only feature exposure solely because the other connector was queried first.
  * Monotonicity therefore has to be per surface, which is the same boundary ChatGPT caches.
@@ -267,9 +267,8 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   selfTestToken = randomBytes(16).toString('hex');
   tunnelProbeToken = randomBytes(16).toString('hex');
   // One path per surface, each with its own token. Distinct tokens rather than one shared
-  // secret because the two connectors are configured separately in ChatGPT and may be
-  // shared, revoked or re-pasted at different times; a single token would make "give me
-  // Desktop" and "give me everything" the same act.
+  // secret because connectors are configured separately in ChatGPT and may be shared,
+  // revoked or re-pasted at different times; one token would collapse their authority.
   const surfacePaths = SURFACE_IDS.map((id) => ({
     id,
     basePath: `/mcp/${id}/${randomBytes(32).toString('base64url')}`

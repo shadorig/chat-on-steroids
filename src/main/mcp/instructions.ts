@@ -5,9 +5,9 @@
  * Core carries adapted upstream Codex collaboration instructions followed by only the
  * available local tools. Declarations own per-tool details; live guards enforce permissions.
  *
- * Written per surface. Two connectors mean two of these, and each says only what its own
- * tools can do: telling the Core conversation about `computer` would be describing a tool
- * that server does not have, which is exactly the confusion the split exists to end.
+ * Written per surface. Each connector gets only its own instructions: telling a Core
+ * conversation about `computer` would describe a tool that server does not have, which is
+ * exactly the confusion the split exists to end.
  */
 
 import { LAUNCHES_WINDOWS_POWERSHELL_5 } from '../codex/tool-specs.js';

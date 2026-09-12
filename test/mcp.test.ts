@@ -6,12 +6,11 @@
  * the 2025-era requests ChatGPT sends today, and the 2026-07-28 envelope form — so
  * that a change in which era the client uses cannot silently break the connector.
  *
- * The other thing it exists to prove is the surface split. This app publishes two
- * independently discoverable MCP servers, Core and Desktop, and the whole point of that
- * design is that the boundary is *real*: a no-query tools/list against Core must not
- * reveal a single Desktop schema, and a Core tools/call for a Desktop tool must fail as
- * an unknown tool rather than being quietly forwarded. Those assertions live in
- * "surface boundaries" below and are the ones to look at first if this file goes red.
+ * The other thing it exists to prove is the surface split. This app publishes independently
+ * discoverable Core, Desktop and Plugins MCP servers, and the boundary must be real: a
+ * no-query tools/list against Core must not reveal a Desktop schema, and a Core tools/call
+ * for a Desktop tool must fail as unknown rather than being forwarded. The dynamic Plugins
+ * boundary has its own focused suite.
  */
 
 import http from 'node:http';
@@ -413,15 +412,15 @@ describe('endpoint hardening', () => {
     expect(lastToolCallAt()).not.toBeNull();
   });
 
-  it('counts a request to either surface as ChatGPT reaching this PC', async () => {
+  it('counts a request to an optional surface as ChatGPT reaching this PC', async () => {
     expect(lastRequestAt()).toBeNull();
     await desktop('tools/list');
     expect(lastRequestAt()).not.toBeNull();
   });
 
-  // With an optional second connector, one global clock cannot answer the question the
-  // setup screen actually asks: did the user create THIS connector in ChatGPT? Core
-  // traffic says nothing about Desktop, so each surface keeps its own pair.
+  // With separately configured connectors, one global clock cannot answer the question the
+  // setup screen actually asks: did the user create THIS connector in ChatGPT? Core traffic
+  // says nothing about an optional surface, so each connector keeps its own pair.
   it('keeps a separate arrival and tool-call clock per surface', async () => {
     expect(lastRequestAt('core')).toBeNull();
     expect(lastRequestAt('desktop')).toBeNull();
@@ -850,7 +849,7 @@ describe('surface boundaries', () => {
     }
   });
 
-  it('describes both surfaces well enough for a user to set them up and a model to find them', () => {
+  it('describes every surface well enough for a user to set it up and a model to find it', () => {
     for (const surface of SURFACE_LIST) {
       expect(surface.serverName, surface.id).toMatch(/^chat-on-steroids-/);
       expect(surface.connectorName, surface.id).toContain('Chat On Steroids');

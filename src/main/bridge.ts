@@ -4782,12 +4782,10 @@ export function commandUrl(
   // during boot, and which of the two survives has changed between builds. The content
   // script accepts either, and redeeming still requires the extension's bearer token —
   // so a copied link, a history entry or a synced tab is worth nothing on its own.
-  // A requested model rides the query only: it selects the chat's model at open and is
-  // never part of the identity the page redeems with. An unknown slug is ChatGPT's to
-  // ignore — the chat then opens with the account default. Reasoning rides beside it as
-  // declared creation intent, forwarded independently: it never selects or changes the
-  // model, and whether ChatGPT applies it is proven by the chat's own picker state, not
-  // by this URL.
+  // A requested model rides the query as an initial page hint and is never part of the
+  // identity the page redeems with. Model and reasoning remain declared creation intent:
+  // the content script must select and confirm the native picker state before Send, so this
+  // URL alone is never treated as proof that ChatGPT honored either choice.
   //
   // A cold Project-home load can fail in ChatGPT's locked-chat loader. Enter through the
   // source chat and let its native Project link initialize the fresh Project composer.
