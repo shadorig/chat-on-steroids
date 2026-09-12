@@ -868,7 +868,7 @@ describe('the ripgrep option table against the ripgrep this app ships', () => {
 
   it('lists every option the binary documents, with the right arity', () => {
     const executable = locateRipgrep();
-    // Only the packaging steps fetch ripgrep, so a plain `npm ci && npm test` has no binary
+    // Only the packaging steps fetch ripgrep, so a plain frozen pnpm install plus tests has no binary
     // to ask. The pin check above is the half that catches the change a person makes.
     if (executable === null || !existsSync(executable)) return;
 

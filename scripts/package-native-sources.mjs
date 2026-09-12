@@ -5,14 +5,15 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { expandSourceRecipe, validateSourceRecipe } from './native-source-inventory.mjs';
+import { readInstalledPackage } from './installed-packages.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const noticeDirectory = path.join(root, 'docs', 'licenses', 'native');
 const recipe = validateSourceRecipe(JSON.parse(await fs.readFile(path.join(noticeDirectory, 'source-recipe.json'), 'utf8')));
-const lock = JSON.parse(await fs.readFile(path.join(root, 'package-lock.json'), 'utf8'));
 for (const [name, version] of Object.entries(recipe.packages)) {
-  if (lock.packages[`node_modules/${name}`]?.version !== version) {
-    throw new Error(`Native source review does not cover locked ${name}; expected ${version}`);
+  const installed = await readInstalledPackage(root, name, name === 'sharp' ? {} : { fromPackage: 'sharp' });
+  if (installed.version !== version) {
+    throw new Error(`Native source review does not cover installed ${name}@${installed.version}; expected ${version}`);
   }
 }
 

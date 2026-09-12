@@ -74,9 +74,9 @@ The MCP connector uses ChatGPT's Developer mode and tunnel interfaces. The compa
 ## Development
 
 ```sh
-npm ci
-npm run dev
-npm run verify
+corepack pnpm install --frozen-lockfile
+corepack pnpm run dev
+corepack pnpm run verify
 ```
 
 Read [AGENTS.md](../AGENTS.md) before changing the app and [CONTRIBUTING.md](../CONTRIBUTING.md) before opening a PR.
@@ -84,12 +84,12 @@ Read [AGENTS.md](../AGENTS.md) before changing the app and [CONTRIBUTING.md](../
 ## Building
 
 ```sh
-npm run dist:x64          # Windows x64
-npm run dist:arm64        # Windows ARM64
-npm run dist:mac:x64      # macOS Intel
-npm run dist:mac:arm64    # macOS Apple silicon
-npm run dist:linux:x64    # Linux x64
-npm run dist:linux:arm64  # Linux ARM64
+corepack pnpm run dist:x64          # Windows x64
+corepack pnpm run dist:arm64        # Windows ARM64
+corepack pnpm run dist:mac:x64      # macOS Intel
+corepack pnpm run dist:mac:arm64    # macOS Apple silicon
+corepack pnpm run dist:linux:x64    # Linux x64
+corepack pnpm run dist:linux:arm64  # Linux ARM64
 ```
 
 Build on the target OS. The release workflow uses native runners for all six targets, checks the packaged runtimes and assembles the complete artifact set with checksums and corresponding native library sources.

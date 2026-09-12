@@ -5,6 +5,10 @@
   "license": "MIT",
   "author": "Chat On Steroids",
   "homepage": "https://github.com/shadorig/chat-on-steroids",
+  "packageManager": "pnpm@12.4.1",
+  "engines": {
+    "node": ">=22.23.2"
+  },
   "desktopName": "com.chatonsteroids.app.desktop",
   "main": "out/main/index.js",
   "scripts": {
@@ -14,8 +18,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify": "npm run verify:ci",
-    "verify:ci": "npm run rg && npm run verify:privacy && npm run verify:notices && npm run typecheck && node -e \"require('electron')\" && vitest run --exclude test/mcp-shutdown.test.ts && vitest run test/mcp-shutdown.test.ts",
+    "verify": "pnpm run verify:ci",
+    "verify:ci": "pnpm run rg && pnpm run verify:privacy && pnpm run verify:notices && pnpm run typecheck && node -e \"require('electron')\" && vitest run --exclude test/mcp-shutdown.test.ts && vitest run test/mcp-shutdown.test.ts",
     "verify:notices": "node scripts/generate-third-party-notices.mjs --check && node scripts/package-native-sources.mjs --check",
     "verify:privacy": "node scripts/verify-public-history.mjs",
     "verify:tunnel-current": "node scripts/verify-current-tunnel.mjs",
@@ -70,6 +74,7 @@
     "electron": "43.7.0",
     "electron-builder": "^26.16.1",
     "electron-vite": "^5.0.0",
+    "js-yaml": "4.3.2",
     "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
     "vite": "^7.3.6",

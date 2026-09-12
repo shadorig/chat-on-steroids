@@ -10,27 +10,27 @@ Keep changes narrow. Preserve existing permission, identity and recovery behavio
 
 ## Development setup
 
-Development requires Node 22+ and is supported on Windows, macOS and Linux. Desktop/computer-use has platform-native Windows and macOS helpers behind one protocol; Core, extension, sessions, agents and tunnel behavior must stay portable. macOS helper changes require Xcode/Swift and a packaged arm64 or x64 smoke check.
+Development uses the pinned Node 22.23.2 and pnpm 12.4.1 toolchain and is supported on Windows, macOS and Linux. Desktop/computer-use has platform-native Windows and macOS helpers behind one protocol; Core, extension, sessions, agents and tunnel behavior must stay portable. macOS helper changes require Xcode/Swift and a packaged arm64 or x64 smoke check.
 
 ```sh
-npm ci
-npm run verify     # the same gate CI runs
-npm run dev        # Electron development build
+corepack pnpm install --frozen-lockfile
+corepack pnpm run verify     # the same gate CI runs
+corepack pnpm run dev        # Electron development build
 ```
 
-A behavior change should include a deterministic regression test where practical. Run the nearest focused tests while working and `npm run verify` before submitting.
+A behavior change should include a deterministic regression test where practical. Run the nearest focused tests while working and `corepack pnpm run verify` before submitting.
 
 ## Packaging
 
 Release packages are platform/architecture-specific:
 
 ```sh
-npm run dist:x64
-npm run dist:arm64
-npm run dist:mac:x64
-npm run dist:mac:arm64
-npm run dist:linux:x64
-npm run dist:linux:arm64
+corepack pnpm run dist:x64
+corepack pnpm run dist:arm64
+corepack pnpm run dist:mac:x64
+corepack pnpm run dist:mac:arm64
+corepack pnpm run dist:linux:x64
+corepack pnpm run dist:linux:arm64
 ```
 
 Release CI builds and smoke-tests every platform/architecture on a native runner. Packaging downloads/stages pinned external assets and verifies their checksums, so the first packaging run needs network access. Do not claim a cross-OS package is validated merely because electron-builder can sometimes emit it from another host.

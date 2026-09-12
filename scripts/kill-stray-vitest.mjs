@@ -1,7 +1,7 @@
 /**
  * Reaps vitest processes that outlived the run that started them.
  *
- * Cancelling `npm test` — Ctrl-C in a terminal, or a tool stopping the shell it was
+ * Cancelling `pnpm test` — Ctrl-C in a terminal, or a tool stopping the shell it was
  * launched from — kills the shell, not the worker tree vitest forked. Each survivor keeps
  * a core at 100%, so the next run is slower than the last and the one after that slower
  * still. Eight of them were found on 2026-08-21, the oldest holding 3502 CPU-seconds

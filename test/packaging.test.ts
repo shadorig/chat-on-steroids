@@ -1,8 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-// @ts-ignore js-yaml is a transitive electron-builder dependency; tests only need its runtime parser.
+// @ts-ignore js-yaml does not ship TypeScript declarations.
 import { load as loadYaml } from 'js-yaml';
 // @ts-ignore Build scripts are intentionally plain ESM JavaScript.
 import * as packagingVersions from '../scripts/packaging-versions.mjs';
@@ -118,6 +118,33 @@ describe('cross-platform packaging targets', () => {
     ]) expect(pkg.scripts[script]).toBeTypeOf('string');
   });
 
+  it('pins the package manager and installs release-target native optionals under one root package', () => {
+    const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const workspace = yamlFile('pnpm-workspace.yaml');
+    expect(pkg.packageManager).toBe('pnpm@12.4.1');
+    expect(pkg.engines.node).toBe('>=22.23.2');
+    expect(readFileSync(path.join(root, '.node-version'), 'utf8').trim()).toBe('22.23.2');
+    expect(workspace.packages).toBeUndefined();
+    expect(workspace.includeWorkspaceRoot).toBe(true);
+    expect(workspace.engineStrict).toBe(true);
+    expect(workspace.strictDepBuilds).toBe(true);
+    expect(workspace.supportedArchitectures).toEqual({
+      os: ['win32', 'darwin', 'linux'],
+      cpu: ['x64', 'arm64'],
+      libc: ['glibc'],
+    });
+    expect(workspace.ignoredOptionalDependencies).toEqual([
+      '@img/sharp-linuxmusl-*',
+      '@img/sharp-libvips-linuxmusl-*',
+    ]);
+    expect(workspace.allowBuilds).toMatchObject({
+      'electron-winstaller@5.4.0': true,
+      'node-pty@1.2.0-beta.15': true,
+      'tree-sitter@0.25.1': true,
+      'tree-sitter-bash@0.25.1': true,
+    });
+  });
+
   it('generates notices outside tracked source and packages the generated file', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     const config = yamlFile('electron-builder.yml');
@@ -144,12 +171,12 @@ describe('cross-platform packaging targets', () => {
 
   it('pins Electron 43.7.0 exactly and proves packaged runners use those runtime bytes', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
-    const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+    const electronDirectory = realpathSync(path.join(root, 'node_modules', 'electron'));
+    const installed = JSON.parse(readFileSync(path.join(electronDirectory, 'package.json'), 'utf8'));
     const smoke = readFileSync(path.join(root, 'scripts', 'smoke-packaged-runtime.mjs'), 'utf8');
 
     expect(pkg.devDependencies.electron).toBe('43.7.0');
-    expect(lock.packages?.['']?.devDependencies?.electron).toBe('43.7.0');
-    expect(lock.packages?.['node_modules/electron']?.version).toBe('43.7.0');
+    expect(installed.version).toBe('43.7.0');
     expect(smoke).toContain('const expectedElectronVersion = sourcePackage.devDependencies?.electron;');
     expect(smoke).toContain('electron: process.versions.electron');
     expect(smoke).toContain('runtime.electron !== expectedElectronVersion');
@@ -428,10 +455,11 @@ describe('cross-platform packaging targets', () => {
     // assertions below are on the template's own text, so loading that dependency graph buys
     // no coverage and is the reason this case could hit the global 30s timeout under full-suite
     // contention while passing in about 1.5s alone.
-    const source = readFileSync(
-      path.join(root, 'node_modules', 'app-builder-lib', 'out', 'targets', 'appimage', 'appImageUtil.js'),
-      'utf8'
-    );
+    const builderDirectory = realpathSync(path.join(root, 'node_modules', 'electron-builder'));
+    const builderNodeModules = path.dirname(builderDirectory);
+    const source = readFileSync(path.join(
+      builderNodeModules, 'app-builder-lib', 'out', 'targets', 'appimage', 'appImageUtil.js'
+    ), 'utf8');
 
     expect(source).toContain('HAVE_NO_SANDBOX=0');
     expect(source).toContain('if [ "$arg" = --no-sandbox ] ; then');
@@ -642,19 +670,18 @@ Load command 11
     expect(candidate).toBeGreaterThan(preflight);
     expect(publish).toBeGreaterThan(candidate);
     expect(workflow.slice(preflight, candidate)).toContain('node scripts/check-release-absent.mjs');
-    expect(workflow.slice(preflight, candidate)).toContain('npm run verify:tunnel-current');
+    expect(workflow.slice(preflight, candidate)).toContain('node scripts/verify-current-tunnel.mjs');
     expect(workflow.slice(preflight, candidate)).toContain('Verify release metadata agrees');
     expect(workflow.slice(preflight, candidate)).toContain("APP_VERSION = '([^']+)'");
     expect(workflow.slice(preflight, candidate)).toContain('must disclose unsigned and unnotarized macOS artifacts');
     expect(workflow.slice(candidate, publish)).toContain('needs: preflight');
     expect(workflow.slice(publish)).toContain('node scripts/check-release-absent.mjs');
-    expect(workflow.slice(publish).match(/npm run verify:tunnel-current/g)).toHaveLength(1);
+    expect(workflow.slice(publish).match(/node scripts\/verify-current-tunnel\.mjs/g)).toHaveLength(1);
     expect(workflow).toContain('name: chat-on-steroids-candidate-${{ github.run_id }}');
   });
 
   it('keeps the current changelog and reviewed release notes aligned with every published artifact', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')) as { version: string };
-    const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
     const manifest = JSON.parse(readFileSync(path.join(root, 'extension', 'manifest.json'), 'utf8'));
     const versionSource = readFileSync(path.join(root, 'src', 'main', 'version.ts'), 'utf8');
     const tag = `v${pkg.version}`;
@@ -663,8 +690,6 @@ Load command 11
     const publish = readFileSync(path.join(root, '.github', 'workflows', 'publish.yml'), 'utf8');
     const release = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
 
-    expect(lock.version).toBe(pkg.version);
-    expect(lock.packages?.['']?.version).toBe(pkg.version);
     expect(manifest.version).toBe(pkg.version);
     expect(versionSource.match(/APP_VERSION = '([^']+)'/)?.[1]).toBe(pkg.version);
     expect(changelog.match(/^## \[(\d+\.\d+\.\d+)\]/m)?.[1]).toBe(pkg.version);

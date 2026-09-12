@@ -52,11 +52,10 @@ jobs:
           node <<'NODE'
           const fs = require('node:fs');
           const pkg = require('./package.json');
-          const lock = require('./package-lock.json');
           const manifest = require('./extension/manifest.json');
           const versionSource = fs.readFileSync('src/main/version.ts', 'utf8');
           const appVersion = versionSource.match(/APP_VERSION = '([^']+)'/)?.[1];
-          const versions = [pkg.version, lock.version, lock.packages?.['']?.version, manifest.version, appVersion];
+          const versions = [pkg.version, manifest.version, appVersion];
           if (versions.some((version) => version !== pkg.version)) {
             throw new Error(`Release versions disagree: ${versions.join(', ')}`);
           }
@@ -96,7 +95,7 @@ jobs:
       # A release remains reproducible because the tunnel bytes are version/checksum pinned.
       # Refuse a stale pin instead of silently changing the payload named by this tag.
       - name: Require current OpenAI tunnel-client
-        run: npm run verify:tunnel-current
+        run: node scripts/verify-current-tunnel.mjs
 
       - name: Verify public-history privacy
         run: node scripts/verify-public-history.mjs
@@ -176,7 +175,7 @@ jobs:
           set -euo pipefail
           # Repeat after the native candidate build so a new upstream release published while
           # the six runners were working cannot leave this release stale.
-          npm run verify:tunnel-current
+          node scripts/verify-current-tunnel.mjs
           node scripts/check-release-absent.mjs
           gh release create "$TAG" \
             publish/Chat-On-Steroids-Setup-x64.exe \

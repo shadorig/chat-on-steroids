@@ -1,0 +1,30 @@
+engineStrict: true
+strictDepBuilds: true
+includeWorkspaceRoot: true
+
+# Release packaging builds every supported OS/CPU pair from a native runner. Keep Sharp's
+# target-specific optional packages installed so packaging only has to select the right bytes.
+supportedArchitectures:
+  os:
+    - win32
+    - darwin
+    - linux
+  cpu:
+    - x64
+    - arm64
+  libc:
+    - glibc
+
+ignoredOptionalDependencies:
+  - '@img/sharp-linuxmusl-*'
+  - '@img/sharp-libvips-linuxmusl-*'
+
+# Dependency lifecycle scripts are code execution. Pin each reviewed package/version so a
+# dependency update that adds or changes an install script has to be reviewed explicitly.
+allowBuilds:
+  'electron-winstaller@5.4.0': true
+  'esbuild@0.25.12 || 0.28.2': true
+  'fsevents@2.3.3': true
+  'node-pty@1.2.0-beta.15': true
+  'tree-sitter@0.25.1': true
+  'tree-sitter-bash@0.25.1': true

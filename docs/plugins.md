@@ -76,12 +76,12 @@ Knowledge Memory retains its data across updates in a stable per-plugin data dir
 ## Legal notices
 
 CoS remains MIT licensed. Settings provides the bundled Third-party Notices, generated from
-production npm dependencies by `scripts/generate-third-party-notices.mjs`. Platform binary
+the installed production package graph by `scripts/generate-third-party-notices.mjs`. Platform binary
 notices remain alongside their binaries. See [catalog artwork attribution](plugin-licenses.md).
 External plugin licenses are shown per installation and remain separate from CoS's own license.
 Reviewed labels apply only to the exact catalog distribution. Knowledge Memory's reviewed
 MIT/Apache transition supersedes its incomplete manifest label; a custom version must supply
-its own license information. `npm run verify:notices` checks installed production versions,
+its own license information. `corepack pnpm run verify:notices` checks installed production versions,
 license material and catalog notice hashes on every CI platform without rewriting the local
 notice file. Packaging regenerates the notices for its installed dependencies.
 

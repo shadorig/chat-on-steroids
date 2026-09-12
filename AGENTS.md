@@ -21,7 +21,7 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-09-11**, including current working-tree changes. App/extension **2.0.10**,
+Source alignment: **2026-09-12**, including current working-tree changes. App/extension **2.0.10**,
 bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
@@ -1462,21 +1462,21 @@ the whole run replaying one long workflow; avoid optimizing speculative edge cas
 Discover current suites with `rg --files test`; do not maintain a stale suite count. Validate
 both ends of every changed protocol: app↔extension, content↔MAIN, main↔preload↔renderer,
 schema↔handler↔recorder and durable write↔restore. Run the nearest suites, adjacent boundary
-tests and `npm run verify` for production edits. Build/package when that layer can differ.
+tests and `corepack pnpm run verify` for production edits. Build/package when that layer can differ.
 
 ```sh
-npm run dev
-npm run typecheck
-npm test -- --run test/<target>.test.ts
-npm run verify:privacy
-npm run verify:notices
-npm run verify
-npm run build
-npm run dist                       # current OS, x64 + arm64
-npm run dist:dir:mac:x64            # example unpacked target on a matching host
+corepack pnpm run dev
+corepack pnpm run typecheck
+corepack pnpm exec vitest run test/<target>.test.ts
+corepack pnpm run verify:privacy
+corepack pnpm run verify:notices
+corepack pnpm run verify
+corepack pnpm run build
+corepack pnpm run dist                       # current OS, x64 + arm64
+corepack pnpm run dist:dir:mac:x64           # example unpacked target on a matching host
 ```
 
-Use `npm ci` for an intentionally needed reproducible dependency install, not as routine
+Use `corepack pnpm install --frozen-lockfile` for an intentionally needed reproducible dependency install, not as routine
 cleanup of this shared tree. `verify:ci` fetches rg, checks privacy/notices/native-source metadata,
 typechecks, verifies Electron resolves, runs Vitest excluding `mcp-shutdown`, then runs that
 socket-drain suite alone. `vitest.config.ts` forces Node, bounded hooks/tests, `CLF_BRIDGE_PORTS=0`
@@ -1516,7 +1516,7 @@ stable `userData/extension`, never an ephemeral AppImage mount.
 | --- | --- |
 | `scripts/package.mjs` | Icons → bundle → explicit target resources/native staging → builder with publishing disabled. |
 | `packaging-targets.mjs`, `packaging-versions.mjs` | Supported OS/arch vocabulary and pinned target checksums; fetchers share these authorities. |
-| `prepare-packaging-native.mjs` | Exact target node-pty/Sharp/tree-sitter from verified package material; host leftovers cannot win. |
+| `prepare-packaging-native.mjs` | Exact target node-pty/Sharp/tree-sitter from the pnpm-installed package graph; host leftovers cannot win. |
 | `prepare-macos-desktop-helper.mjs` | Thin target Swift dylib + matching N-API addon; packaged in-process permission identity. |
 | `smoke-packaged-runtime.mjs`, `smoke-macos-{bundle,gui}.mjs` | In-place resource/native-stack checks, Mac bundle/seal and real GUI startup evidence. |
 | `generate-third-party-notices.mjs`, `native-source-inventory.mjs`, `package-native-sources.mjs` | Production notices and corresponding native source archive; compact reviewed recipe plus generated downloaded/embedded Cargo-closure provenance. |
@@ -1541,11 +1541,11 @@ requires `docs/release-notes/vX.Y.Z.md`, rechecks versions/privacy/hashes and re
 release. A tag alone does not build/publish. An unpublished candidate can be built separately,
 but do not mix artifacts from another ref/run into a release.
 
-`verify:notices` checks installed production dependencies against the lockfile and rejects
-missing license material or mismatched reviewed catalog hashes. Custom package updates cannot
+`verify:notices` inventories the installed production graph through pnpm and rejects missing
+license material or mismatched reviewed catalog hashes. Custom package updates cannot
 inherit an older license review. Notice completeness and native source/replacement obligations
 are separate checks; inspect the actual assembled artifacts. Hooks installed with
-`npm run hooks:install` help keep personal identities/session provenance out of public history.
+`corepack pnpm run hooks:install` help keep personal identities/session provenance out of public history.
 Release completion requires every target, assembly/hash check, Publish and public artifact
 inspection to pass, preserving the user's exact requested title/changelog.
 

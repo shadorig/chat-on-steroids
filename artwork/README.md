@@ -1,7 +1,7 @@
 # App icon artwork
 
 The production icon is generated from `app-icon-source.png` by
-`scripts/make-icon.mjs`. Run `npm run icon` to regenerate the Windows ICO, its preview,
+`scripts/make-icon.mjs`. Run `corepack pnpm run icon` to regenerate the Windows ICO, its preview,
 and the four Chrome extension PNGs.
 
 ## 2026-08-21 redesign

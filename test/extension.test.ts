@@ -28,16 +28,10 @@ beforeAll(async () => {
 describe('extension release metadata', () => {
   it('keeps the app package, bundled extension and bridge protocol on the same release', async () => {
     const pkg = JSON.parse(await fs.readFile(path.join(process.cwd(), 'package.json'), 'utf8')) as { version: string };
-    const lock = JSON.parse(await fs.readFile(path.join(process.cwd(), 'package-lock.json'), 'utf8')) as {
-      version: string;
-      packages?: Record<string, { version?: string }>;
-    };
     const manifest = JSON.parse(
       await fs.readFile(path.join(process.cwd(), 'extension', 'manifest.json'), 'utf8')
     ) as { version: string };
     expect(pkg.version).toBe(APP_VERSION);
-    expect(lock.version).toBe(APP_VERSION);
-    expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
     expect(BRIDGE_PROTOCOL).toBe(14);
     expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 14;');

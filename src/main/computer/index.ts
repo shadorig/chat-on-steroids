@@ -527,7 +527,7 @@ function locateMacOSDesktopHelper(): string {
   const helper = candidates.find((candidate) => existsSync(candidate));
   if (helper) return helper;
   throw new ComputerError(
-    `The macOS desktop helper is missing for ${process.arch}. Run npm run desktop:mac before development, or rebuild the macOS package.`
+    `The macOS desktop helper is missing for ${process.arch}. Run pnpm run desktop:mac before development, or rebuild the macOS package.`
   );
 }
 
@@ -571,7 +571,7 @@ function locateMacOSDesktopAddon(): { addon: string; library: string } {
   const found = candidates.find((candidate) => existsSync(candidate.addon) && existsSync(candidate.library));
   if (found) return found;
   throw new ComputerError(
-    `The in-process macOS desktop backend is missing for ${process.arch}. Run npm run desktop:mac before development, or rebuild the macOS package.`
+    `The in-process macOS desktop backend is missing for ${process.arch}. Run pnpm run desktop:mac before development, or rebuild the macOS package.`
   );
 }
 
