@@ -3,8 +3,8 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
-import { validateInputImages } from '../src/main/session/input-images.js';
 import { stageInputAttachment, readInputAttachmentChunk } from '../src/main/session/input-attachments.js';
+import { createToolImageProjections, readToolImageProjections, validateInputImages } from '../src/main/session/input-image-projection.js';
 import { initSessionStore } from '../src/main/session/store.js';
 
 let directory: string;
@@ -21,6 +21,12 @@ describe('input image byte and pixel validation', () => {
     const metadata = await sharp(Buffer.from(image.preview!.split(',')[1]!, 'base64')).metadata();
     expect(metadata).toMatchObject({ format: 'webp', width: 160, height: 80 });
     expect(Buffer.from(await readInputAttachmentChunk(image, 0), 'base64')).toEqual(await fs.readFile(file));
+    const normalized = await createToolImageProjections([image]);
+    const [projection] = await readToolImageProjections(normalized);
+    expect(await sharp(Buffer.from(projection!.dataUrl.split(',')[1]!, 'base64')).metadata()).toMatchObject({ width: 1600, height: 800 });
+    expect(Buffer.from(await readInputAttachmentChunk(image, 0), 'base64')).toEqual(await fs.readFile(file));
+    await expect(createToolImageProjections(Array(5).fill(image))).rejects.toThrow('four');
+    await expect(createToolImageProjections([{ ...image, name: 'forged.png' }])).rejects.toThrow('changed');
   });
 
   it('rejects oversized source files and directories before staging', async () => {
@@ -36,6 +42,7 @@ describe('input image byte and pixel validation', () => {
     await fs.writeFile(file, 'not an image');
     const staged = await stageInputAttachment(file, new Set());
     expect(staged.preview).toBeUndefined(); // ChatGPT, not a thumbnail decoder, decides file support.
+    await expect(createToolImageProjections([staged])).rejects.toThrow();
     const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#fff' } }).png().toBuffer();
     await expect(validateInputImages([{ name: 'forged.webp', dataUrl: dataUrl(png) }])).rejects.toThrow(/Invalid image/);
     await expect(validateInputImages([{ name: 'invalid.webp', dataUrl: dataUrl(Buffer.from('invalid')) }])).rejects.toThrow();

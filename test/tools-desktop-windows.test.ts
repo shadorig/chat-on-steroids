@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { capabilityTools, DESKTOP_CAPABILITIES, type Capabilities } from '../src/shared/types.js';
 
-const native = vi.hoisted(() => ({ act: vi.fn(), getWindowState: vi.fn(), call: null as any, apis: [] as any[] }));
+const native = vi.hoisted(() => ({ act: vi.fn(), getWindowState: vi.fn(), call: null as any, apis: [] as any[],
+  allowUnattributed: false, allowComputerControl: false }));
+vi.mock('../src/main/config.js', () => ({ getConfig: () => ({ multiAgent: {
+  allowUnattributedCalls: native.allowUnattributed, allowUnattributedComputerControl: native.allowComputerControl
+} }) }));
 vi.mock('../src/main/computer/index.js', () => ({
   ComputerError: class extends Error {}, act: native.act, getWindowState: native.getWindowState
 }));
@@ -27,7 +31,8 @@ function surface(over: Partial<Capabilities> = {}) {
 }
 const window = { app: 'fixture.exe', id: 71 };
 let principalSequence = 0;
-beforeEach(() => { vi.clearAllMocks(); native.apis.length = 0; native.call = { caller: { sessionId: `test-${++principalSequence}` } }; });
+beforeEach(() => { vi.clearAllMocks(); native.apis.length = 0; native.allowUnattributed = false; native.allowComputerControl = false;
+  native.call = { caller: { sessionId: `test-${++principalSequence}` } }; });
 
 describe('Windows Desktop public registrar', () => {
   it('matches the settings tool names to registration for each Desktop permission', () => {
@@ -81,6 +86,40 @@ describe('Windows Desktop public registrar', () => {
     expect(result.structuredContent.value).toBeNull();
     expect(result.content[0].text).toContain('observe to verify');
     expect(JSON.stringify(result)).not.toContain('three');
+  });
+
+  it('scopes unattributed observation state to one process-minted invocation and rechecks opt-out', async () => {
+    await surface().call('get_window_state', { window });
+    const identified = native.apis[0];
+    const firstInvocation = {};
+    native.call = { invocation: firstInvocation, caller: { requestId: 'externally-reusable-id' } };
+    native.allowUnattributed = true;
+    await surface().call('get_window_state', { window });
+    const firstAnonymous = native.apis[1];
+    await expect(surface().call('click', { window, element_index: 2 })).rejects.toThrow(/computer input is disabled/);
+    await expect(surface().call('press_key', { window, key: 'Enter' })).rejects.toThrow(/computer input is disabled/);
+    native.allowComputerControl = true;
+    native.call = { invocation: firstInvocation, caller: { requestId: 'externally-reusable-id' } };
+    await surface().call('click', { window, element_index: 2 });
+    expect(firstAnonymous.click).toHaveBeenCalledExactlyOnceWith({ window, element_index: 2 });
+    native.call = { invocation: {}, caller: { requestId: 'externally-reusable-id' } };
+    await surface().call('click', { window, element_index: 2 });
+    expect(native.apis).toHaveLength(3);
+    expect(native.apis[2].click).toHaveBeenCalledExactlyOnceWith({ window, element_index: 2 });
+    expect(firstAnonymous.click).toHaveBeenCalledTimes(1);
+    expect(identified.click).not.toHaveBeenCalled();
+    native.call = null;
+    await expect(surface().call('drag', { window, from_x: 1, from_y: 1, to_x: 2, to_y: 2 })).rejects.toThrow(/CALLER_IDENTITY_REQUIRED/);
+    await expect(surface().call('press_key', { window, key: 'Enter' })).rejects.toThrow(/CALLER_IDENTITY_REQUIRED/);
+    expect(native.apis).toHaveLength(3);
+    native.allowUnattributed = false;
+    await expect(surface().call('click', { window, x: 2, y: 3 })).rejects.toThrow(/CALLER_IDENTITY_REQUIRED/);
+    native.allowUnattributed = true;
+    native.call = { invocation: {}, caller: { requestId: 'fresh-observation' } };
+    await surface().call('get_window_state', { window });
+    expect(native.apis).toHaveLength(4);
+    native.allowUnattributed = false;
+    await surface().call('list_windows');
   });
 
   it('returns image blocks and structured screenshot values under one combined response bound', async () => {

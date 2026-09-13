@@ -158,6 +158,7 @@ const api = {
   },
   getSessionControls: (id: string) => call<SessionControlsView>('sessions:controls', { id }),
   setSessionAutomation: (id: string, automation: SessionControlsView['automation']) => call<SessionControlsView>('sessions:automation', { id, automation }),
+  setSessionLoopTrigger: (id: string, trigger: SessionControlsView['loopTrigger']) => call<SessionControlsView>('sessions:loopTrigger', { id, trigger }),
   setSessionObjective: (id: string, text: string, mode: 'goal' | 'loop') => call<SessionControlsView>('sessions:objective', { id, text, mode }),
   compactSession: (id: string) => call<SessionControlsView>('sessions:compact', { id }),
   cancelSessionCompaction: (id: string) => call<SessionControlsView>('sessions:cancelCompaction', { id }),

@@ -28,15 +28,13 @@ describe('durable observed ChatGPT model catalog', () => {
     observeChatModels({ nonce: pendingChatModelRequest()!.nonce, models: null, error: 'picker_unavailable' });
     expect(getChatModels()).toMatchObject({ state: 'unavailable', models: [], error: expect.stringContaining('native model picker') });
   });
-  it('rechecks browser startup when an unfinished discovery is explicitly opened again', async () => {
+  it('does not duplicate an explicit browser open while the same observation request is pending', async () => {
     const wake = vi.fn(async () => {}); configureChatModelDiscovery({ wake, changed: () => {} });
     await startChatModelDiscovery();
     const pending = pendingChatModelRequest()!;
-    // The browser may have exited since the completed OS handoff. The shared
-    // browser startup owner, not the catalog nonce, decides whether it is absent.
     await startChatModelDiscovery();
     expect(pendingChatModelRequest()).toEqual(pending);
-    expect(wake.mock.calls).toEqual([[pending.nonce, true], [pending.nonce, true]]);
+    expect(wake.mock.calls).toEqual([[pending.nonce, true, expect.any(Function)]]);
   });
   it('promotes a pending passive observation once when the user explicitly refreshes', async () => {
     const wake = vi.fn(async () => {}); configureChatModelDiscovery({ wake, changed: () => {} });
@@ -44,19 +42,25 @@ describe('durable observed ChatGPT model catalog', () => {
     const passive = pendingChatModelRequest()!;
     await Promise.all([startChatModelDiscovery(), startChatModelDiscovery()]);
     expect(pendingChatModelRequest()).toEqual({ ...passive, allowOpen: true });
-    expect(wake.mock.calls).toEqual([[passive.nonce, false], [passive.nonce, true]]);
+    expect(wake.mock.calls).toEqual([
+      [passive.nonce, false, expect.any(Function)],
+      [passive.nonce, true, expect.any(Function)]
+    ]);
+    const calls = wake.mock.calls as unknown as Array<[string, boolean, () => boolean]>;
+    expect(calls[0]![2]()).toBe(false);
   });
-  it('serializes explicit promotion behind an in-flight passive wake without duplicate opening', async () => {
-    let release!: () => void;
-    const wake = vi.fn((_nonce: string, _allowOpen: boolean) => new Promise<void>(resolve => { release = resolve; }));
+  it('promotes an explicit open immediately even when the same-nonce passive wake never resolves', async () => {
+    const wake = vi.fn(() => new Promise<void>(() => {}));
     configureChatModelDiscovery({ wake, changed: () => {} });
-    const passive = startChatModelDiscovery(false);
+    await startChatModelDiscovery(false);
     const nonce = pendingChatModelRequest()!.nonce;
-    const first = startChatModelDiscovery(), second = startChatModelDiscovery();
-    expect(wake).toHaveBeenCalledTimes(1);
-    release(); await passive;
-    expect(wake.mock.calls).toEqual([[nonce, false], [nonce, true]]);
-    release(); await Promise.all([first, second]);
+    await Promise.all([startChatModelDiscovery(), startChatModelDiscovery()]);
+    expect(wake.mock.calls).toEqual([
+      [nonce, false, expect.any(Function)],
+      [nonce, true, expect.any(Function)]
+    ]);
+    const calls = wake.mock.calls as unknown as Array<[string, boolean, () => boolean]>;
+    expect(calls[0]![2]()).toBe(false);
     expect(pendingChatModelRequest()).toMatchObject({ nonce, allowOpen: true });
   });
   it('observes existing tabs once on window show without opening Chrome or invalidating ready models', async () => {
@@ -64,7 +68,7 @@ describe('durable observed ChatGPT model catalog', () => {
     await startChatModelDiscovery(false);
     const request = pendingChatModelRequest()!;
     expect(request.allowOpen).toBe(false);
-    expect(wake).toHaveBeenCalledWith(request.nonce, false);
+    expect(wake).toHaveBeenCalledWith(request.nonce, false, expect.any(Function));
     observeChatModels({ nonce: request.nonce, models });
     await startChatModelDiscovery(false); await startChatModelDiscovery(false);
     expect(wake).toHaveBeenCalledTimes(1);
@@ -83,8 +87,33 @@ describe('durable observed ChatGPT model catalog', () => {
   });
   it('turns browser launch failure into visible retry state without inventing choices', async () => {
     configureChatModelDiscovery({ wake: async () => { throw new Error('Chrome not found'); }, changed: () => {} });
-    expect(await startChatModelDiscovery()).toMatchObject({ state: 'unavailable', models: [], error: expect.stringMatching(/Chrome not found/) });
+    expect(await startChatModelDiscovery()).toMatchObject({ state: 'pending', models: [] });
+    await vi.waitFor(() => expect(getChatModels()).toMatchObject({ state: 'unavailable', models: [], error: expect.stringMatching(/Chrome not found/) }));
     expect(pendingChatModelRequest()).toBeNull();
+  });
+  it('returns pending while OS wake hangs and lets a new nonce retry after the bounded deadline', async () => {
+    const wake = vi.fn(() => new Promise<void>(() => {}));
+    configureChatModelDiscovery({ wake, changed: () => {} });
+    expect(await startChatModelDiscovery()).toMatchObject({ state: 'pending' });
+    const old = pendingChatModelRequest()!.nonce;
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(getChatModels().state).toBe('unavailable');
+    expect(await startChatModelDiscovery()).toMatchObject({ state: 'pending' });
+    expect(pendingChatModelRequest()!.nonce).not.toBe(old);
+    expect(wake).toHaveBeenCalledTimes(2);
+  });
+  it('revokes the exact browser-opening authority when discovery expires', async () => {
+    let current!: () => boolean;
+    const wake = vi.fn((_nonce: string, _allowOpen: boolean, authority: () => boolean) => {
+      current = authority;
+      return new Promise<void>(() => {});
+    });
+    configureChatModelDiscovery({ wake, changed: () => {} });
+    await startChatModelDiscovery();
+    expect(current()).toBe(true);
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(getChatModels()).toMatchObject({ state: 'unavailable' });
+    expect(current()).toBe(false);
   });
   it('reuses a pending request, accepts only its nonce, and detaches all public views', () => {
     expect(getChatModels().state).toBe('unknown');

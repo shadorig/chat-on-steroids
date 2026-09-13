@@ -8,6 +8,7 @@
  */
 
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { WebSocket } from 'ws';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -21,7 +22,10 @@ import type { Config } from '../src/shared/types.js';
 
 const recoveryBrowserWake = vi.hoisted(() => vi.fn(async (_url: string, _retry?: boolean, _background?: boolean,
   _authority?: { current(): boolean }) => {}));
-vi.mock('../src/main/browser-startup.js', () => ({ wakeBrowserUrl: recoveryBrowserWake }));
+vi.mock('../src/main/browser-startup.js', () => ({
+  installBrowserStartupPresence: vi.fn(),
+  wakeBrowserUrl: recoveryBrowserWake
+}));
 
 async function recordFinalForTest(conversationId: string, turnId: string): Promise<void> {
   await request('POST', '/events', { body: { conversationId, events: [{ kind: 'assistant_message', time: Date.now(),
@@ -65,7 +69,7 @@ const {
   GOAL_QUIET_MS,
   GOAL_SILENCE_LISTEN_MS,
   PRO_SILENCE_RETIRE_MS,
-  PRO_SILENCE_MS,
+  CONTINUATION_SILENCE_MS,
   PRO_ACTIVITY_MS,
   COMMAND_DEADLINE_MS,
   REVIVAL_ACTIVITY_MS,
@@ -89,9 +93,9 @@ const {
   goalDraftBusy,
   goalPendingReplyFor,
   acceptGoalReplyNow,
+  restoreGoalReplies,
   setGoalReplyActiveNow,
   goalSwitchFor,
-  humanReply,
   resetGoalStateForTests,
   setGoalObjective
 } = await import('../src/main/goal.js');
@@ -1180,7 +1184,7 @@ describe('activity feed', () => {
     expect(feed.body.sessionId).toBeNull();
     expect(feed.body.entries).toEqual([]);
     expect(feed.body.goal).toMatchObject({
-      enabled: true,
+      effectiveEnabled: true,
       own: true,
       mode: 'loop',
       objective: 'one cycle stop',
@@ -1504,7 +1508,7 @@ describe('automatic compaction', () => {
         expect(activity.body.tokens).toBeGreaterThan(10_000);
         expect(continuationForSession(activity.body.sessionId as string)).toBeNull();
         expect(activity.body.context).toMatchObject({ auto: false });
-        expect(activity.body.goal).toMatchObject({ enabled: false, own: true, blocked: 'blocked', pending: null });
+        expect(activity.body.goal).toMatchObject({ effectiveEnabled: false, own: true, blocked: 'blocked', pending: null });
         expect(pendingCommands().some((command) => command.what.startsWith('resume:'))).toBe(false);
 
         const manual = await request('POST', '/compact', { body: { conversationId } });
@@ -6564,6 +6568,7 @@ describe('unattributed activity recovery', () => {
     try {
       await pair();
       await events(OTHER, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() }, openTurn('turn-loop-dead')]);
+      await attributed(OTHER, false, Date.now());
       await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
       await sweepStaleSwarm(Date.now());
       const handout = await maintenance();
@@ -6598,10 +6603,10 @@ describe('unattributed activity recovery', () => {
       await events(OTHER, [{ kind: 'model_selection', model, time: Date.now() }, openTurn('pro-silent-' + model)]);
       await vi.advanceTimersByTimeAsync(1_000);
       await events(OTHER, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() }]);
-      await vi.advanceTimersByTimeAsync(PRO_SILENCE_MS - 1_001);
+      await vi.advanceTimersByTimeAsync(CONTINUATION_SILENCE_MS - 1_001);
       await sweepStaleSwarm(Date.now());
       expect(await maintenance()).toBeNull();
-      expect(PRO_SILENCE_MS).toBe(10 * 60_000);
+      expect(CONTINUATION_SILENCE_MS).toBe(10 * 60_000);
       const live = await request('GET', `/activity?conversationId=${OTHER}`);
       const { sessionControlsFor } = await import('../src/main/bridge.js');
       expect(live.body.activeTurnId).toBe('pro-silent-' + model);
@@ -6645,7 +6650,7 @@ describe('unattributed activity recovery', () => {
       const evidenceAt = proof === 'exact call' ? began + 60_000 : began;
       const { sessionActivityExpiresAt } = await import('../src/main/bridge.js');
       expect(sessionActivityExpiresAt((await getSession(sessionId))!)).toBe(evidenceAt + PRO_ACTIVITY_MS);
-      await vi.advanceTimersByTimeAsync(evidenceAt + PRO_SILENCE_MS - Date.now() - 1);
+      await vi.advanceTimersByTimeAsync(evidenceAt + CONTINUATION_SILENCE_MS - Date.now() - 1);
       await sweepStaleSwarm(Date.now());
       expect(await maintenance()).toBeNull();
       await vi.advanceTimersByTimeAsync(1);
@@ -6747,7 +6752,11 @@ describe('unattributed activity recovery', () => {
     await pair();
     await events(OTHER, [{ kind: 'model_selection', model: 'GPT-6 Pro', time: Date.now() }, openTurn('pro-old')]);
     const activity = await request('GET', `/activity?conversationId=${OTHER}`);
-    await acceptGoalReplyNow({ conversationId: OTHER, sessionId: activity.body.sessionId, turnId: 'g-silence-old', replyId: 'silence:old', eventSeq: 0, blocked: false });
+    restoreGoalReplies({ version: 1, savedAt: Date.now(), replies: [{ conversationId: OTHER,
+      sessionId: activity.body.sessionId, turnId: 'g-silence-old', replyId: 'silence:old', eventSeq: 0,
+      acceptedAt: Date.now(), state: 'pending', recovery: { proof: {
+        kind: 'recovered-silence', conversationId: OTHER, turnId: 'pro-old', headSeq: 0, mcpCallSeq: 0, modelClass: 'pro'
+      } } }] });
     await request('GET', `/activity?conversationId=${OTHER}`);
     expect(goalPendingReplyFor(OTHER)).toBeNull();
     await events(OTHER, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() + 1 }]);
@@ -6758,19 +6767,23 @@ describe('unattributed activity recovery', () => {
     } finally { resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); }
   });
 
-  for (const proof of ['missing', 'exact', 'older', 'new turn']) it(`requires ${proof} canonical Pro final proof without any recent tool call`, async () => {
+  for (const afterTurn of [false, true]) for (const proof of ['missing', 'exact', 'older', 'new turn']) it(`requires ${proof} canonical Pro final proof without any recent tool call (after-turn ${afterTurn})`, async () => {
+    const conversationId = randomUUID();
     const previous = getConfig();
     await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop' } });
     await setSecret('openRouterApiKey', 'sk-or-pro-final');
     resetGoalStateForTests();
     try {
       await pair();
-      await events(OTHER, [{ kind: 'model_selection', model: 'GPT-5.6 Pro', time: Date.now() }, openTurn('pro-final-' + proof)]);
-      if (proof !== 'missing') await events(OTHER, [{ kind: 'assistant_message', time: Date.now(), messageId: 'pro-answer-' + proof, turnId: proof === 'older' ? 'old-turn' : 'pro-final-' + proof, text: 'Finished.', state: 'final', final: true, activeNow: true }]);
-      await events(OTHER, [endTurn('pro-final-' + proof, 'completed')]);
-      if (proof === 'new turn') await events(OTHER, [openTurn('next-pro-turn')]);
-      const result = await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: 'pro-final-' + proof, clientId: 'tab-1' } });
-      expect(result.status).toBe(proof === 'exact' ? 200 : 409);
+      const { setGoalLoopTriggerNow, setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(conversationId, 'loop', true);
+      if (afterTurn) await setGoalLoopTriggerNow(conversationId, 'after-turn');
+      await events(conversationId, [{ kind: 'model_selection', model: 'GPT-5.6 Pro', time: Date.now() }, openTurn('pro-final-' + proof)]);
+      if (proof !== 'missing') await events(conversationId, [{ kind: 'assistant_message', time: Date.now(), messageId: 'pro-answer-' + proof, turnId: proof === 'older' ? 'old-turn' : 'pro-final-' + proof, text: 'Finished.', state: 'final', final: true, activeNow: true }]);
+      await events(conversationId, [endTurn('pro-final-' + proof, 'completed')]);
+      if (proof === 'new turn') await events(conversationId, [openTurn('next-pro-turn')]);
+      const result = await request('POST', '/goal/draft', { body: { conversationId: conversationId, turnId: 'pro-final-' + proof, clientId: 'tab-1' } });
+      expect(result.status, JSON.stringify(result.body)).toBe(afterTurn && proof === 'exact' ? 200 : 409);
     } finally {
       resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous);
     }
@@ -6895,6 +6908,7 @@ describe('unattributed activity recovery', () => {
         await pair();
         const turnId = `turn-loop-${what.length}`;
         await events(OTHER, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() }, openTurn(turnId)]);
+        await attributed(OTHER, false, Date.now());
         await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
         await sweepStaleSwarm(Date.now());
         const handout = await maintenance();
@@ -7052,6 +7066,7 @@ describe('unattributed activity recovery', () => {
     try {
       await pair();
       await events(OTHER, [{ kind: 'model_selection', model: 'GPT-5.6 Sol', reasoningEffort: 'high', time: Date.now() }, openTurn('turn-lost')]);
+      await attributed(OTHER, false, Date.now());
       await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS);
       await sweepStaleSwarm(Date.now());
       const handout = await maintenance();
@@ -7072,6 +7087,94 @@ describe('unattributed activity recovery', () => {
       await saveConfig(previous);
       vi.useRealTimers();
     }
+  });
+
+  it('files one opted-in Pro Loop ticket on refresh, defers native busy, and revokes it on MCP work', async () => {
+    const OTHER = 'c9191919-1111-2222-3333-444444444444';
+    const previous = getConfig();
+    const goal = await import('../src/main/goal.js');
+    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop' } });
+    await setSecret('openRouterApiKey', 'sk-or-pro-loop-test');
+    resetGoalStateForTests();
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await goal.setGoalSwitchNow(OTHER, 'loop', true);
+      await goal.setGoalLoopTriggerNow(OTHER, 'after-turn');
+      await events(OTHER, [{ kind: 'model_selection', model: 'gpt-5.6-pro', reasoningEffort: 'pro', time: Date.now() }, openTurn('pro-loop-after-turn')]);
+      await attributed(OTHER, false, Date.now());
+      // Canonical revisions spend sequence numbers without adding presentation rows.
+      for (const text of ['Working', 'Working on the requested pass']) await events(OTHER, [{ kind: 'assistant_message',
+        messageId: 'pro-loop-interim', turnId: 'pro-loop-after-turn', time: Date.now(), text, state: 'streaming', activeNow: true }]);
+      await vi.advanceTimersByTimeAsync(CONTINUATION_SILENCE_MS - 1);
+      expect(await maintenance()).toBeNull();
+      expect(goalPendingReplyFor(OTHER)).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      await sweepStaleSwarm(Date.now());
+      const repair = await maintenance();
+      expect(repair?.reason).toBe('silence');
+      await maintenance(repair!.token);
+      const ticket = goalPendingReplyFor(OTHER)!;
+      expect(ticket).toMatchObject({ recovery: { proof: { turnId: 'pro-loop-after-turn', modelClass: 'pro', kind: 'recovered-silence' } } });
+      const busy = await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: ticket.turnId, nativeBusy: true } });
+      expect(busy.body.error).toBe('chat_still_working');
+      const deferred = goalPendingReplyFor(OTHER)!;
+      expect(deferred.recovery?.notBefore).toBe(Date.now() + 5 * 60_000);
+      goal.restoreGoalReplies(goal.snapshotGoalReplies());
+      expect(goalPendingReplyFor(OTHER)).toEqual(deferred);
+      const waiting = await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: ticket.turnId, terminalRequired: true } });
+      expect(waiting.body.error).toBe('chat_still_working');
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      const ready = await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: ticket.turnId, terminalRequired: true } });
+      expect(`${ready.status} ${JSON.stringify(ready.body)}`).toMatch(/^200 /);
+      await vi.advanceTimersByTimeAsync(1000);
+      await attributed(OTHER, false, Date.now());
+      await request('GET', `/activity?conversationId=${OTHER}`);
+      expect(goalPendingReplyFor(OTHER)).toBeNull();
+      await vi.advanceTimersByTimeAsync(CONTINUATION_SILENCE_MS - 1);
+      expect(await maintenance()).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      await sweepStaleSwarm(Date.now());
+      expect((await maintenance())?.reason).toBe('silence');
+    } finally {
+      resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); vi.useRealTimers();
+    }
+  });
+
+  it.each(['completed', 'thinking_failed'])('lets opted-in Pro Loop draft at its confirmed %s boundary', async kind => {
+    const OTHER = kind === 'completed' ? 'c9292929-1111-2222-3333-444444444444' : 'c9393939-1111-2222-3333-444444444444';
+    const previous = getConfig();
+    const goal = await import('../src/main/goal.js');
+    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'loop' } });
+    await setSecret('openRouterApiKey', 'sk-or-pro-loop-boundary'); resetGoalStateForTests();
+    vi.useFakeTimers();
+    try {
+      await pair(); await goal.setGoalSwitchNow(OTHER, 'loop', true); await goal.setGoalLoopTriggerNow(OTHER, 'after-turn');
+      const turn = `pro-loop-${kind}`;
+      await events(OTHER, [{ kind: 'model_selection', model: 'gpt-5.6-pro', reasoningEffort: 'pro', time: Date.now() }, openTurn(turn)]);
+      if (kind === 'thinking_failed') await attributed(OTHER, false, Date.now());
+      await vi.advanceTimersByTimeAsync(330000);
+      if (kind === 'completed') {
+        await events(OTHER, [{ kind: 'assistant_message', messageId: `answer-${turn}`, turnId: turn, time: Date.now(),
+          text: 'The requested pass is complete.', final: true, state: 'final', activeNow: true, goalEligible: true }, endTurn(turn, 'completed')]);
+      } else await events(OTHER, [{ kind: 'turn_end', turnId: turn, outcome: 'failed', reason: 'thinking_failed', time: Date.now() }]);
+      const pending = goalPendingReplyFor(OTHER);
+      expect(pending).not.toBeNull();
+      if (kind === 'thinking_failed') {
+        expect((await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: pending!.turnId, nativeBusy: true } })).body.error).toBe('chat_still_working');
+        goal.restoreGoalReplies(goal.snapshotGoalReplies());
+        await vi.advanceTimersByTimeAsync(5 * 60_000 - 1);
+        expect((await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: pending!.turnId, terminalRequired: true } })).body.error).toBe('chat_still_working');
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      const reply = await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: pending!.turnId, terminalRequired: true } });
+      expect(`${reply.status} ${JSON.stringify(reply.body)}`).toMatch(/^200 /);
+      if (kind === 'thinking_failed') {
+        await goal.setGoalSwitchNow(OTHER, 'loop', false);
+        await request('GET', `/activity?conversationId=${OTHER}`);
+        expect((await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: pending!.turnId } })).status).toBe(409);
+      }
+    } finally { resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); vi.useRealTimers(); }
   });
 
   it('leaves a silent plain chat where it fell when tab recovery is off', async () => {
@@ -7122,13 +7225,25 @@ describe('unattributed activity recovery', () => {
     }
   });
 
-  /**
-   * The other half of "an ordinary chat is recovered exactly like Prime".
-   *
-   * The silence deadline already reopened this chat, but only two minutes after its last sign
-   * of life. A closed tab is first-hand proof that the page is gone now, and the user watching
-   * a Worker come straight back while their own chat sat there dead is the whole bug.
-   */
+  it('keeps a completed chat closed across repeated history visits with an older unended turn', async () => {
+    const SOLO = 'b2b2b2b2-1111-2222-3333-444444444444';
+    await pair();
+    await events(SOLO, [openTurn('turn-orphan-before-reload')]);
+    await attributed(SOLO);
+    await events(SOLO, [openTurn('turn-latest-completed'), endTurn('turn-latest-completed', 'completed')]);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await request('POST', '/closed', { body: { conversationId: SOLO } });
+      expect(await maintenance()).toBeNull();
+      // Opening history hydrates the recorder; it must not revive the orphan.
+      await events(SOLO, [{ kind: 'conversation_title', time: Date.now(), text: 'Settled chat' }]);
+      expect(liveConversations().find(entry => entry.conversationId === SOLO)?.activeTurnId).toBeNull();
+    }
+    // Explicit new work in the same chat still earns ordinary recovery.
+    await events(SOLO, [openTurn('turn-new-work')]);
+    await request('POST', '/closed', { body: { conversationId: SOLO } });
+    expect(await maintenance()).toMatchObject({ conversationId: SOLO, reason: 'no-tab' });
+  });
+
   it('reopens an ordinary chat that uses this connector the moment its last tab closes mid-turn', async () => {
     const SOLO = 'b2b2b2b2-1111-2222-3333-444444444444';
     await pair();
@@ -7771,7 +7886,7 @@ describe('the goal loop over the bridge', () => {
       expect(await commitContinuation(continuation.token, to)).toBe(true);
 
       const oldFeed = await request('GET', `/activity?conversationId=${from}`);
-      expect(oldFeed.body.goal).toMatchObject({ enabled: false, own: true, blocked: 'continued', pending: null });
+      expect(oldFeed.body.goal).toMatchObject({ effectiveEnabled: false, own: true, blocked: 'continued', pending: null });
       expect((await request('POST', '/goal/draft', {
         body: { conversationId: from, turnId: 'g-retired-goal', terminalRequired: true, clientId: 'old-page' }
       })).body.error).toBe('conversation_superseded');
@@ -7848,7 +7963,7 @@ describe('the goal loop over the bridge', () => {
     const feed = await request('GET', `/activity?conversationId=${to}`);
     expect(feed.status).toBe(200);
     expect(feed.body.sessionId).toBe(shadow.id);
-    expect(feed.body.goal).toMatchObject({ enabled: true, objective: 'finish the release from the resumed prime chat' });
+    expect(feed.body.goal).toMatchObject({ effectiveEnabled: true, objective: 'finish the release from the resumed prime chat' });
     expect(goalObjectiveFor(from)).toBe('');
     expect(goalObjectiveFor(to)).toBe('finish the release from the resumed prime chat');
 
@@ -7936,7 +8051,7 @@ describe('the goal loop over the bridge', () => {
     const reply = await request('GET', '/activity?conversationId=cafe0001-0000-4000-8000-000000000001');
     expect(reply.status).toBe(200);
     expect(reply.body.goal).toMatchObject({
-      enabled: true,
+      effectiveEnabled: true,
       hasKey: true,
       model: 'deepseek/deepseek-v4-flash',
       draft: null
@@ -8116,9 +8231,9 @@ describe('the goal loop over the bridge', () => {
 
     // The feed is what arms the loop in the page, so the refusal has to be visible there
     // rather than only at the moment the draft would be paid for.
-    expect((await request('GET', `/activity?conversationId=${worker}`)).body.goal.enabled).toBe(false);
+    expect((await request('GET', `/activity?conversationId=${worker}`)).body.goal.effectiveEnabled).toBe(false);
     // A chat that belongs to no agent in the run is an ordinary chat and keeps the loop.
-    expect((await request('GET', `/activity?conversationId=${solo}`)).body.goal.enabled).toBe(true);
+    expect((await request('GET', `/activity?conversationId=${solo}`)).body.goal.effectiveEnabled).toBe(true);
 
     // And the route refuses independently, because the page's copy is always a poll old.
     const drafted = await request('POST', '/goal/draft', { body: { conversationId: worker, turnId: 'g-worker' } });
@@ -8247,7 +8362,7 @@ describe('the goal loop over the bridge', () => {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
       expect(calls).toBe(1);
-      expect(feed.body.goal.draft.reply).toBe(humanReply('what about the tests'));
+      expect(feed.body.goal.draft.reply).toBe('what about the tests');
 
       const acked = await request('POST', '/goal/ack', {
         body: { conversationId: 'cafe0003-0000-4000-8000-000000000003', token: started.body.goal.token }
@@ -8273,7 +8388,7 @@ describe('the goal loop over the bridge', () => {
     expect(getConfig().compaction.auto).toBe(true);
     expect(getConfig().goal.enabled).toBe(false);
     expect(reply.body.context.auto).toBe(true);
-    expect(reply.body.goal).toMatchObject({ enabled: false, hasKey: true });
+    expect(reply.body.goal).toMatchObject({ configuredEnabled: false, effectiveEnabled: false, hasKey: true });
 
     const readOnly = getConfig().readOnly;
     const capabilities = { ...getConfig().capabilities };
@@ -8300,9 +8415,9 @@ describe('the goal loop over the bridge', () => {
     const loop = await request('POST', '/settings', { body: { loop: true } });
     expect(loop.status).toBe(200);
     expect(getConfig().goal).toMatchObject({ enabled: true, mode: 'loop' });
-    expect(loop.body.goal).toMatchObject({ enabled: true, mode: 'loop' });
+    expect(loop.body.goal).toMatchObject({ configuredEnabled: true, effectiveEnabled: true, mode: 'loop' });
     // The page is told the mode as well, which is the whole reason it can never draw both on.
-    expect((await request('GET', '/settings')).body.goal).toMatchObject({ enabled: true, mode: 'loop' });
+    expect((await request('GET', '/settings')).body.goal).toMatchObject({ configuredEnabled: true, effectiveEnabled: true, mode: 'loop' });
 
     // Turning Goal on is what turns Loop off. One write, not two.
     expect((await request('POST', '/settings', { body: { goal: true } })).status).toBe(200);
@@ -8370,7 +8485,7 @@ describe('the goal loop over the bridge', () => {
 
     const feed = await request('GET', `/activity?conversationId=${chat}`);
     expect(feed.body.goal).toMatchObject({
-      enabled: false,
+      effectiveEnabled: false,
       objective: 'port the module and make the suite green',
       blocked: ''
     });
@@ -8423,14 +8538,14 @@ describe('the goal loop over the bridge', () => {
 
     // Nothing has been said about this chat's own switch yet, so its goal still speaks for it.
     const inherited = await request('GET', `/activity?conversationId=${chat}`);
-    expect(inherited.body.goal).toMatchObject({ enabled: false, own: false, objective: 'port the module' });
+    expect(inherited.body.goal).toMatchObject({ effectiveEnabled: false, own: false, objective: 'port the module' });
 
     // Off, chosen here. The write is chat-scoped, which is what makes it this chat's own answer.
     const off = await request('POST', '/settings', { body: { conversationId: chat, goal: false } });
     expect(off.status).toBe(200);
-    expect(off.body.goal).toMatchObject({ enabled: false, own: true });
+    expect(off.body.goal).toMatchObject({ configuredEnabled: false, effectiveEnabled: false, own: true });
     const stopped = await request('GET', `/activity?conversationId=${chat}`);
-    expect(stopped.body.goal).toMatchObject({ enabled: false, own: true, objective: 'port the module' });
+    expect(stopped.body.goal).toMatchObject({ effectiveEnabled: false, own: true, objective: 'port the module' });
 
     const drafted = await request('POST', '/goal/draft', { body: { conversationId: chat, turnId: 'g-off' } });
     expect(drafted.status).toBe(409);
@@ -8438,7 +8553,7 @@ describe('the goal loop over the bridge', () => {
 
     // And back on, into the same goal, without retyping it.
     const on = await request('POST', '/settings', { body: { conversationId: chat, loop: true } });
-    expect(on.body.goal).toMatchObject({ enabled: true, own: true, mode: 'loop' });
+    expect(on.body.goal).toMatchObject({ configuredEnabled: true, effectiveEnabled: true, own: true, mode: 'loop' });
     const realFetch = globalThis.fetch;
     globalThis.fetch = (async () =>
       Response.json({
@@ -8491,7 +8606,7 @@ describe('the goal loop over the bridge', () => {
     });
     expect(looped.status).toBe(200);
     // Answered back rather than assumed, because the sheet draws the mode from this reply.
-    expect(looped.body).toMatchObject({ objective: 'build the voxel sandbox', enabled: true, mode: 'loop' });
+    expect(looped.body).toMatchObject({ objective: 'build the voxel sandbox', configuredEnabled: true, effectiveEnabled: true, mode: 'loop' });
     expect(goalDrivingMode(chat)).toBe('loop');
     // Durable before the response was written, on the same terms as the goal itself: a mode
     // that survives only in memory is a mode a restart turns back into a Goal that may stop.
@@ -8507,7 +8622,7 @@ describe('the goal loop over the bridge', () => {
     const backToGoal = await request('POST', '/goal/objective', {
       body: { conversationId: chat, text: 'build the voxel sandbox', mode: 'goal' }
     });
-    expect(backToGoal.body).toMatchObject({ enabled: true, mode: 'goal' });
+    expect(backToGoal.body).toMatchObject({ configuredEnabled: true, effectiveEnabled: true, mode: 'goal' });
     expect(goalDrivingMode(chat)).toBe('goal');
 
     // And clearing the goal ends the run it named. Writing the goal is what switched this
@@ -8516,7 +8631,7 @@ describe('the goal loop over the bridge', () => {
     const cleared = await request('POST', '/goal/objective', {
       body: { conversationId: chat, text: '', mode: 'goal' }
     });
-    expect(cleared.body).toMatchObject({ objective: '', enabled: false });
+    expect(cleared.body).toMatchObject({ objective: '', configuredEnabled: false, effectiveEnabled: false });
     expect(goalSwitchFor(chat)).toMatchObject({ enabled: false, own: true });
   });
 
@@ -8543,28 +8658,28 @@ describe('the goal loop over the bridge', () => {
       });
     }
     // Both inherit the app-wide setting until one of them says otherwise.
-    expect((await request('GET', `/activity?conversationId=${driven}`)).body.goal.enabled).toBe(true);
-    expect((await request('GET', `/activity?conversationId=${other}`)).body.goal.enabled).toBe(true);
+    expect((await request('GET', `/activity?conversationId=${driven}`)).body.goal.effectiveEnabled).toBe(true);
+    expect((await request('GET', `/activity?conversationId=${other}`)).body.goal.effectiveEnabled).toBe(true);
 
     const off = await request('POST', '/settings', { body: { conversationId: driven, goal: false } });
     expect(off.status).toBe(200);
-    expect(off.body.goal).toMatchObject({ enabled: false });
-    expect((await request('GET', `/activity?conversationId=${driven}`)).body.goal.enabled).toBe(false);
+    expect(off.body.goal).toMatchObject({ configuredEnabled: false, effectiveEnabled: false });
+    expect((await request('GET', `/activity?conversationId=${driven}`)).body.goal.effectiveEnabled).toBe(false);
     // The chat that said nothing is untouched, and so is the app-wide default it follows.
-    expect((await request('GET', `/activity?conversationId=${other}`)).body.goal.enabled).toBe(true);
+    expect((await request('GET', `/activity?conversationId=${other}`)).body.goal.effectiveEnabled).toBe(true);
     expect(getConfig().goal.enabled).toBe(true);
-    expect((await request('GET', '/settings')).body.goal.enabled).toBe(true);
+    expect((await request('GET', '/settings')).body.goal.configuredEnabled).toBe(true);
 
     // Loop in one chat is Loop in that chat. The other keeps answering `goal`, which is what
     // makes the two switches mutually exclusive per conversation rather than across the app.
     const loop = await request('POST', '/settings', { body: { conversationId: other, loop: true } });
-    expect(loop.body.goal).toMatchObject({ enabled: true, mode: 'loop' });
+    expect(loop.body.goal).toMatchObject({ configuredEnabled: true, effectiveEnabled: true, mode: 'loop' });
     expect((await request('GET', `/activity?conversationId=${other}`)).body.goal).toMatchObject({
-      enabled: true,
+      effectiveEnabled: true,
       mode: 'loop'
     });
     expect((await request('GET', `/activity?conversationId=${driven}`)).body.goal).toMatchObject({
-      enabled: false,
+      effectiveEnabled: false,
       mode: 'goal'
     });
     expect(getConfig().goal.mode).toBe('goal');
@@ -8867,7 +8982,7 @@ describe('the goal loop over the bridge', () => {
     expect(refused.body.error).toBe('goal_worker_chat');
 
     const feed = await request('GET', `/activity?conversationId=${worker}`);
-    expect(feed.body.goal).toMatchObject({ enabled: false, objective: '', blocked: 'worker' });
+    expect(feed.body.goal).toMatchObject({ effectiveEnabled: false, objective: '', blocked: 'worker' });
   });
 
   it('keeps the worker Goal fence after its owner parks', async () => {
@@ -8894,7 +9009,7 @@ describe('the goal loop over the bridge', () => {
     expect(refused.status).toBe(409);
     expect(refused.body.error).toBe('goal_worker_chat');
     const feed = await request('GET', `/activity?conversationId=${worker}`);
-    expect(feed.body.goal).toMatchObject({ enabled: false, objective: '', blocked: 'worker' });
+    expect(feed.body.goal).toMatchObject({ effectiveEnabled: false, objective: '', blocked: 'worker' });
   });
 
   it('keeps the Goal fence on an explicitly retired worker conversation', async () => {
@@ -8938,7 +9053,7 @@ describe('the goal loop over the bridge', () => {
     expect(refused.body.error).toBe('goal_worker_chat');
 
     const feed = await request('GET', `/activity?conversationId=${worker}`);
-    expect(feed.body.goal).toMatchObject({ enabled: false, objective: '', blocked: 'worker' });
+    expect(feed.body.goal).toMatchObject({ effectiveEnabled: false, objective: '', blocked: 'worker' });
     expect(feed.body.retiredWorker).toMatchObject({ id: 'worker-1', conversationId: worker });
   });
 
@@ -8961,7 +9076,7 @@ describe('the goal loop over the bridge', () => {
       const opened = await request('POST', '/goal/open', { body: { text: 'rewrite the parser in rust' } });
       expect(opened.status).toBe(200);
       expect(opened.body).toEqual({
-        reply: humanReply('rewrite the parser in rust'),
+        reply: 'rewrite the parser in rust',
         model: 'deepseek/deepseek-v4-flash'
       });
       // The opening turn is the last *conversation* message; the closing reminder the goal
@@ -9016,7 +9131,8 @@ describe('the goal loop over the bridge', () => {
     expect(reply.body.goal).toEqual({
       backend: 'api',
       provider: 'openrouter',
-      enabled: true,
+      configuredEnabled: true,
+      effectiveEnabled: true,
       // The app-wide setting belongs to no chat, so it is nobody's own answer: this is what a
       // chat that has never moved its own switch inherits.
       own: false,
@@ -9034,7 +9150,7 @@ describe('the goal loop over the bridge', () => {
       sessions: { ...defaultConfig().sessions, record: true },
       goal: { ...defaultConfig().goal, backend: 'api', enabled: false }
     });
-    expect((await request('GET', '/settings')).body.goal.enabled).toBe(false);
+    expect((await request('GET', '/settings')).body.goal.configuredEnabled).toBe(false);
     expect((await request('GET', '/settings', { auth: null })).status).toBe(401);
   });
 

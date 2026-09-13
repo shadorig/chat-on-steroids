@@ -7,12 +7,13 @@ import { wakeBrowserWork } from './browser-wake.js';
 import { getChatModels, startChatModelDiscovery, configureChatModelDiscovery } from './chat-models.js';
 import { releaseSessionFinish, requestSessionFinishGoal } from './session/finish.js';
 import { GOAL_MARKER_INSTRUCTION } from '../shared/goal-templates.js';
-import { validateInputImages } from './session/input-images.js';
+import { validateInputImages } from './session/input-image-projection.js';
 import { stageInputAttachment, type AttachmentSource } from './session/input-attachments.js';
 import { recordDeliveredInput, recordedInputImage } from './session/input-history.js';
+import { preferQueuedInputOverGoalRecovery } from './session/recovery-arbitration.js';
 import { UI_BASE_ZOOM, titleBarOverlayForTheme } from './window-layout.js';
 import { usageOverview } from './session/usage.js';
-import { inputArgs, listInputs, editQueuedInput, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
+import { inputArgs, listInputs, retainedInputBlobIds, editQueuedInput, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
 import { draftOpeningMessage, onGoalChange, nativeGoalFailure } from './goal.js';
 import { cancelTaskRequest, runTaskRequest } from './task-request.js';
 import { randomUUID } from 'node:crypto';
@@ -65,7 +66,7 @@ import {
   bridgeStatus,
   sessionActivityExpiresAt,
   sessionInputActivity,
-  sessionControlsFor, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, cancelSessionCompaction,
+  sessionControlsFor, stopSessionTurn, setSessionAutomation, setSessionLoopTrigger, setSessionObjective, compactSession, cancelSessionCompaction,
   cancelWorkerCommands,
   chatUrl,
   onBridgeChange,
@@ -173,6 +174,7 @@ const settingsPatch = z.object({
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
     maxWorkers: z.number().int().min(1).max(8),
     allowUnattributedCalls: z.boolean(),
+    allowUnattributedComputerControl: z.boolean(),
     recoverAgentTabs: z.boolean()
   }),
   mcp: z.object({ instructions: z.string().trim().max(MAX_MCP_INSTRUCTIONS_CHARS) }).strict().optional(),
@@ -299,6 +301,11 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         current.multiAgent.allowUnattributedCalls,
         base.multiAgent.allowUnattributedCalls,
         wanted.multiAgent.allowUnattributedCalls
+      ),
+      allowUnattributedComputerControl: pick(
+        current.multiAgent.allowUnattributedComputerControl,
+        base.multiAgent.allowUnattributedComputerControl,
+        wanted.multiAgent.allowUnattributedComputerControl
       ),
       recoverAgentTabs: pick(
         current.multiAgent.recoverAgentTabs,
@@ -796,7 +803,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   const stageFiles = async (sources: AttachmentSource[]) => {
-    const retained = new Set((await listInputs()).filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).flatMap(row => row.attachments?.map(file => file.id) ?? []));
+    const retained = await retainedInputBlobIds();
     const result = [];
     for (const source of sources) result.push(await stageInputAttachment(source, retained));
     return result;
@@ -840,6 +847,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { id, automation } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']) }).parse(payload);
     return setSessionAutomation(id, automation);
   });
+  handle('sessions:loopTrigger', async (payload) => {
+    const { id, trigger } = sessionIdArg.extend({ trigger: z.enum(['session-finish', 'after-turn']) }).parse(payload);
+    return setSessionLoopTrigger(id, trigger);
+  });
   handle('sessions:objective', async (payload) => {
     const { id, text, mode } = sessionIdArg.extend({ text: z.string().max(16000), mode: z.enum(['goal', 'loop']) }).parse(payload);
     return setSessionObjective(id, text, mode);
@@ -870,7 +881,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { id, sourceSessionId } = z.object({ id: z.string().uuid(), sourceSessionId: z.string().min(8).max(64) }).parse(payload);
     return retryGoalBrowserHelper(sourceSessionId, id);
   });
-  handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: z.string().trim().min(1).max(16000), afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
+  handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: inputArgs.shape.text, afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
   handle('sessions:cancelInput', async (payload) => cancelDesktopInput(z.object({ id: z.string().uuid() }).parse(payload).id));
   handle('sessions:inputAutomation', async payload => {
     const { id, mode } = z.object({ id: z.string().uuid(), mode: z.enum(['off', 'goal', 'loop']) }).parse(payload);
@@ -1047,6 +1058,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   };
   configureInputDelivery({
     activity: sessionInputActivity,
+    queuedAfterTurn: async entry => {
+      if (!entry.sessionId || !entry.conversationId) return;
+      await preferQueuedInputOverGoalRecovery(entry.sessionId, entry.conversationId);
+    },
     wakeDecision: async (entry, signal) => {
       signal.throwIfAborted();
       if (!await startBridge()) throw new Error('The browser bridge could not start');
@@ -1090,7 +1105,6 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       if (phase === 'after-send' && held.enabled && live.enabled && live.mode === held.mode) await setGoalReplyActiveNow(conversationId, true);
     }
   });
-
   let statePushGeneration = 0;
   const pushState = (): void => {
     const generation = ++statePushGeneration;
@@ -1117,9 +1131,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       return drafted;
     }, publish);
   });
-  configureChatModelDiscovery({ changed: () => push('chatModels:changed', getChatModels()), wake: async (nonce, allowOpen) => {
+  configureChatModelDiscovery({ changed: () => push('chatModels:changed', getChatModels()), wake: async (nonce, allowOpen, current) => {
+    if (!current()) return;
     if (!await startBridge()) throw new Error('The browser bridge could not start');
-    if (allowOpen) await wakeBrowserUrl(`https://chatgpt.com/?cos-model-catalog=${nonce}`, true, true);
+    if (allowOpen) await wakeBrowserUrl(`https://chatgpt.com/?cos-model-catalog=${nonce}`, true, true, { current });
   } });
   onUpdateChange(pushState);
   onMacOSDesktopAccessChange(pushState);

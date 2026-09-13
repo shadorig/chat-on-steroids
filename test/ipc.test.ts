@@ -127,6 +127,7 @@ it('does not authorize the composer Generate Goal action from an absent or stale
 
 it('round-trips Goal controls and cannot revive old periodic input when Off cancellation fails then On retries', async () => {
   const outbox = await import('../src/main/session/input.js');
+  const { encodeInputState } = await import('../src/main/session/input-state.js');
   const durable = await import('../src/main/durable.js');
   const store = await import('../src/main/session/store.js');
   const original = await outbox.listInputs();
@@ -160,7 +161,7 @@ it('round-trips Goal controls and cannot revive old periodic input when Off canc
     expect(await outbox.offerToolInput(session.id, 'periodic-settings-chat', 'later-request', Date.now())).toEqual({ messages: [], reminder: '' });
   } finally {
     write?.mockRestore();
-    await writeDurableNow('session-input', original); outbox.resetInputForTests();
+    await writeDurableNow('session-input', encodeInputState(original)); outbox.resetInputForTests();
   }
 });
 
@@ -293,7 +294,7 @@ beforeEach(async () => {
   await saveConfig({
     ...defaultConfig(),
     sessions: { ...defaultConfig().sessions, record: true },
-    multiAgent: { enabled: true, maxWorkers: 3, allowUnattributedCalls: false, recoverAgentTabs: true }
+    multiAgent: { enabled: true, maxWorkers: 3, allowUnattributedCalls: false, allowUnattributedComputerControl: false, recoverAgentTabs: true }
   });
 });
 

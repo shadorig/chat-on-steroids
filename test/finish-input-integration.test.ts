@@ -7,9 +7,9 @@ vi.mock('../src/main/mcp/call-context.js', async original => ({ ...await origina
 import { initConfigPath, defaultConfig, saveConfig } from '../src/main/config.js';
 import { initDurableStore, resetDurableForTests, flushDurable } from '../src/main/durable.js';
 import { initSessionStore, createSession, appendEvent, observeSessionModel, resetSessionStoreForTests, flushSessions } from '../src/main/session/store.js';
-import { setGoalSwitchNow, resetGoalStateForTests } from '../src/main/goal.js';
+import { automaticFinishEnabled, setGoalSwitchNow, resetGoalStateForTests } from '../src/main/goal.js';
 import { announceSessionFinish, settleSessionFinishForTests, setFinishNotifier } from '../src/main/session/finish.js';
-import { listInputs, offerToolInput, resetInputForTests, pendingBrowserInputs } from '../src/main/session/input.js';
+import { installInputAuthority, listInputs, offerToolInput, resetInputForTests, pendingBrowserInputs } from '../src/main/session/input.js';
 let directory = '';
 afterEach(async () => {
   await flushSessions(); await flushDurable();
@@ -21,6 +21,9 @@ describe('finish producer to durable injection integration', () => {
   it.each(['goal', 'loop'] as const)('Notify with armed %s produces and retains one real tool injection', async mode => {
     directory = await makeTempDir('clf-finish-input-');
     initConfigPath(directory); initDurableStore(directory); initSessionStore(directory);
+    // Production installs this dependency from main/index after durable Goal state is restored.
+    // This integration test bypasses app startup, so compose the same authority explicitly.
+    installInputAuthority({ automaticFinishEnabled });
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, finishTool: true, finishAction: 'notify' } });
     const conversationId = randomUUID();
     const session = await createSession({ conversationId, title: 'Finish integration' });

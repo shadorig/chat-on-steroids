@@ -1,7 +1,7 @@
 import type { InputEntry } from './input.js';
 import { browserInputModel } from '../../shared/input.js';
 import { getSession, observeSessionModel, readAsset, readEvents, upsertMessageEvent, writeAsset } from './store.js';
-import { validateInputImages } from './input-images.js';
+import { readToolImageProjections, validateInputImages } from './input-image-projection.js';
 import sharp from 'sharp';
 
 /** Project a tool handout or proven delivery into history, never the enqueue intent. */
@@ -13,7 +13,7 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>): Promise
   const messageId = offered ? `input:${entry.id}` : entry.messageId!;
   const time = offered ? entry.offeredAt! : entry.deliveredAt!;
   if (!await getSession(sessionId)) return false;
-  const images = entry.images ?? [];
+  const images = [...entry.images ?? [], ...(entry.projectedImages?.length ? await readToolImageProjections(entry.projectedImages) : [])];
   const text = entry.deliveryText ?? entry.text;
   await validateInputImages(images);
   const assets = [];
@@ -32,6 +32,7 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>): Promise
     // Tool delivery has no native user row and keeps the stable input id as its key.
     messageId, inputId: entry.id, inputDelivery: offered ? 'offered' : 'confirmed', authoredText: entry.text,
     ...(entry.attachments?.length ? { attachments: entry.attachments } : {}),
+    ...(entry.attachmentDelivery === 'tool-image-projection' ? { attachmentDelivery: 'tool-image-projection' as const } : {}),
     // Injection does not change the running model. Only the native send path verifies
     // picker selection before delivery; a later sparse browser echo keeps this evidence.
     ...(!messageId.startsWith('input:') && selection.model

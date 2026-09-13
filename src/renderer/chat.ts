@@ -4,13 +4,14 @@ import { marked, Marked } from 'marked';
 import { safeExternalLink } from '../shared/external-link.js';
 import { createAgentPanel } from './agent-panel.js';
 import { renderAgentPlan } from './agent-plan.js';
-import { userPromptText } from '../shared/user-prompt.js';
+import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
 import { preserveTimelineViewport } from './timeline-scroll.js';
 import { toolResultText } from './tool-result.js';
 import { communicationTitle, foldAgentCommunication } from './agent-communication.js';
 import { initContextMeter, paintContextMeter } from './context-meter.js';
 import { isAstraModel } from '../shared/chat-models.js';
 import type { InputImage, InputAttachment, InputAutomation } from '../shared/input.js';
+import { canAttemptImageProjection, canAttemptToolText, isFollowupInput } from '../shared/input.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject } from '../shared/projects.js';
 import type { TaskProgress } from '../shared/task-progress.js';
@@ -604,8 +605,8 @@ function paintSessions(): void {
   const group = (key: string, workers: SessionSummary[], parentRow?: HTMLElement, target = rows): void => {
     const button = el('button', 'worker-toggle');
     button.append(icon('i-chev'));
-    ui(button, 'title', () => t("{0} sub-agents · {1} active", [workers.length, workers.filter(sessionWorking).length]));
-    ui(button, 'aria-label', () => t("{0} {1} sub-agents", [expandedWorkers.has(key) ? t("Collapse") : t("Expand"), workers.length]));
+    ui(button, 'title', () => t("{0} workers · {1} active", [workers.length, workers.filter(sessionWorking).length]));
+    ui(button, 'aria-label', () => t("{0} {1} workers", [expandedWorkers.has(key) ? t("Collapse") : t("Expand"), workers.length]));
     button.setAttribute('type', 'button'); button.setAttribute('aria-expanded', String(expandedWorkers.has(key)));
     button.addEventListener('click', (event) => { event.stopPropagation(); expandedWorkers.has(key) ? expandedWorkers.delete(key) : expandedWorkers.add(key); paintSessions(); });
     if (parentRow) { parentRow.append(button); parentRow.title += ` · ${button.title}`; } else target.push(button);
@@ -628,7 +629,7 @@ function paintSessions(): void {
   if (otherWorkers.length) {
     const history = document.createElement('details'); history.className = 'session-diagnostics';
     history.open = expandedWorkers.has('other-workers');
-    history.append(el('summary', '', () => t("Sub-agent history · {0}", [otherWorkers.length])));
+    history.append(el('summary', '', () => t("Worker history · {0}", [otherWorkers.length])));
     history.append(...otherWorkers.map(sessionRow));
     history.addEventListener('toggle', () => { if (history.isConnected) history.open ? expandedWorkers.add('other-workers') : expandedWorkers.delete('other-workers'); });
     rows.push(history);
@@ -809,30 +810,60 @@ function paintGoalProgress(): void {
   row.replaceChildren(marker, body);
 }
 const cancelledStarts = new Set<string>();
-const queuedFollowup = (entry: InputEntry): boolean => entry.mode === 'finish' || (entry.mode === 'after-turn' && !!entry.sessionId && entry.purpose !== 'decision');
 function pendingComposerInput(): InputEntry | undefined {
-  return [...startingInputs.values(), ...pendingComposerInputs].find(entry => (!queuedFollowup(entry) || entry.state === 'browser') && ['queued', 'browser'].includes(entry.state) &&
+  return [...startingInputs.values(), ...pendingComposerInputs].find(entry => (!isFollowupInput(entry) || entry.state === 'browser') && ['queued', 'browser'].includes(entry.state) &&
     (selectedId ? (entry.sessionId ?? entry.deliveredSessionId) === selectedId :
       (pendingNewInput?.generation === selectionGeneration && pendingNewInput.id === entry.id) || (!entry.sessionId && !entry.deliveredSessionId && entry.purpose !== 'decision')));
 }
 let durationTimer: number | undefined;
+type ComposerDeliveryMode = 'auto' | 'after-turn' | 'finish';
+/** One projection owns both what the composer shows and what Send persists. */
+function composerDeliveryDecision(files: Array<InputImage | InputAttachment>, text: string, explicit?: 'finish'): {
+  mode: ComposerDeliveryMode;
+  visibleMode: ComposerDeliveryMode;
+  nativeFiles: boolean;
+  mustWait: boolean;
+  working: boolean;
+  queueAtFinish: boolean;
+  canInject: boolean;
+  canSendDirectly: boolean;
+} {
+  const current = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration;
+  const working = current && controlledTurnId !== null;
+  const queueAtFinish = current && controlledQueueAtFinish;
+  const canInject = current && controlledCanInject;
+  const canSendDirectly = current && controlledCanSendDirectly;
+  const nativeFiles = files.some(file => 'id' in file) && !(canInject && canAttemptImageProjection(files));
+  const mustWait = nativeFiles || (canInject && !canAttemptToolText(text));
+  const visibleMode: ComposerDeliveryMode = explicit ?? (mustWait && working
+    ? 'after-turn'
+    : $<HTMLSelectElement>('sendMode').value as ComposerDeliveryMode);
+  // Native files really do wait for the next browser turn. Astra finish-only policy applies only
+  // to text/derived tool delivery; never silently relabel a native-file upload as session finish.
+  const mode: ComposerDeliveryMode = visibleMode === 'after-turn' && queueAtFinish && !nativeFiles ? 'finish' : visibleMode;
+  return { mode, visibleMode, nativeFiles, mustWait, working, queueAtFinish, canInject, canSendDirectly };
+}
 function paintDeliveryControls(): void {
   paintGoalProgress();
-  const working = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledTurnId !== null;
-  const queueAtFinish = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledQueueAtFinish;
-  const canInject = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledCanInject;
-  const canSendDirectly = selectedId !== null && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledCanSendDirectly;
-  $('queueAtFinish').hidden = !queueAtFinish;
-  ui($('afterTurnLabel'), 'textContent', () => queueAtFinish ? t("Queue at Session finish") : t("After this turn"));
+  const files = imageDrafts.get(draftKey()) ?? [];
+  const decision = composerDeliveryDecision(files, $<HTMLTextAreaElement>('chatInput').value);
+  const { working, queueAtFinish, canInject, canSendDirectly, nativeFiles, mustWait } = decision;
+  $('queueAtFinish').hidden = !queueAtFinish || nativeFiles;
+  ui($('afterTurnLabel'), 'textContent', () => queueAtFinish && !nativeFiles ? t("Queue at Session finish") : t("After this turn"));
   const generate = $<HTMLButtonElement>('generateFinishGoal');
   const queued = [...startingInputs.values(), ...pendingComposerInputs].some(entry =>
     (entry.sessionId ?? entry.deliveredSessionId) === selectedId && ['queued', 'browser', 'tool'].includes(entry.state));
   generate.hidden = !working || !controlledFinishWaiting || queued || controlledStopPending || !!finishGoalDraftView;
   generate.disabled = generate.dataset.busy === `${selectedId}:${controlledTurnId}`;
   const sendOption = $<HTMLSelectElement>('sendMode').querySelector('option[value="auto"]');
-  const immediateLabel = () => canSendDirectly ? t("Send directly") : canInject ? t("Inject now") : t("Send");
+  const immediateLabel = () => mustWait && working ? (queueAtFinish && !nativeFiles ? t("Queue at Session finish") : t("After this turn"))
+    : canSendDirectly ? t("Send directly") : canInject ? t("Current turn") : t("Send");
   if (sendOption) ui(sendOption, 'textContent', immediateLabel);
   ui($('immediateDeliveryLabel'), 'textContent', immediateLabel);
+  const immediateAction = $('sendOptions').querySelector<HTMLElement>('[data-delivery="auto"]');
+  if (immediateAction) immediateAction.hidden = mustWait && working;
+  const optimizedImages = canInject && files.length > 0 && canAttemptImageProjection(files) && !mustWait;
+  $('deliveryNote').hidden = !(optimizedImages && decision.visibleMode === 'auto');
   if (!canInject && !canSendDirectly && !queueAtFinish) $<HTMLSelectElement>('sendMode').value = 'auto';
   const pending = pendingComposerInput();
   const stop = (working || !!pending) && !currentPreparedPlan() && !$<HTMLTextAreaElement>('chatInput').value.trim() && !(imageDrafts.get(draftKey())?.length);
@@ -852,7 +883,7 @@ function paintDeliveryControls(): void {
   ui(send, 'title', () => stop && !working && pending ? t("Cancel delivery") : preparedPlan && !stop ? planAction : planMode && !stop ? t("Click to generate plan") : '');
   send.classList.toggle('is-stop', stop);
   for (const button of $('sendOptions').querySelectorAll<HTMLElement>('[data-delivery]')) {
-    button.setAttribute('aria-checked', String(button.dataset.delivery === $<HTMLSelectElement>('sendMode').value));
+    button.setAttribute('aria-checked', String(button.dataset.delivery === (mustWait && working ? 'after-turn' : $<HTMLSelectElement>('sendMode').value)));
   }
 }
 function dockAction(label: string | (() => string), symbol: string, click: (event: MouseEvent) => void): HTMLButtonElement {
@@ -1057,6 +1088,7 @@ async function refreshSessionControls(): Promise<void> {
   const planHost = $('agentPlan');
   if (planHost.dataset.sessionId !== (id ?? '')) renderAgentPlan(planHost, id, null);
   const menu = $('sessionControls');
+  $('loopTriggerRow').hidden = true;
   if (controlledSessionId !== id || controlledSelection !== selectionGeneration) {
     // Retire the previous selection's projection before awaiting the new owner's IPC.
     // Replace the translation binding too, so a locale refresh cannot revive its status.
@@ -1099,10 +1131,12 @@ async function refreshSessionControls(): Promise<void> {
   paintTaskActions();
   const draftMode = $<HTMLSelectElement>('chatAutomation');
   if (!draftMode.dataset.edited) draftMode.value = controls.automation;
+  $('loopTriggerRow').hidden = controls.automation !== 'loop' || !controls.loopTriggerAvailable;
+  $<HTMLSelectElement>('loopTrigger').value = controls.loopTrigger;
   paintAutomationSwitch();
   $<HTMLButtonElement>('compactSession').disabled = !!controls.blocked || !!controls.job?.busy;
   $('cancelCompaction').hidden = !controls.job?.busy;
-  ui($('sessionControlStatus'), 'textContent', () => controls.blocked === 'worker' ? t("This sub-agent is managed by its prime.") : controls.blocked === 'blocked' ? t("This chat is blocked.") : controls.job?.busy ? t("Compaction is running in ChatGPT.") : '');
+  ui($('sessionControlStatus'), 'textContent', () => controls.blocked === 'worker' ? t("This worker is managed by its parent chat.") : controls.blocked === 'blocked' ? t("This chat is blocked.") : controls.job?.busy ? t("Compaction is running in ChatGPT.") : '');
 }
 
 async function navigateHistory(before: number | null, prepend = false): Promise<void> {
@@ -1501,6 +1535,11 @@ function toolBody(event: Extract<SessionEvent, { kind: 'tool_call' }>, context?:
   const images = call.assets?.filter(asset => ['image/png', 'image/jpeg', 'image/webp'].includes(asset.mimeType)) ?? [];
   const readable = toolResultText(call.result.text, call.result.truncated, images.length > 0);
   if (readable) raw.append(textBlock('pre', readable, call.result.truncated && images.length === 0, call.result.chars));
+  // Older recordings did not retain the reason an image asset was omitted. Explain
+  // the missing local preview without inferring a historical provider receipt.
+  if (call.tool === 'view_image' && call.outcome === 'ok' && images.length === 0) {
+    raw.append(el('p', 'meta', () => t("No image preview was retained in this recording.")));
+  }
   if (images.length && (context?.id || selectedId)) {
     const id = context?.id ?? selectedId!, generation = selectionGeneration;
     const attachments = el('div', 'tool-images');
@@ -1555,6 +1594,9 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
       if (event.attachments?.length) attachments.append(...event.attachments.map(file => attachmentCard(file)));
       const assets = event.assets?.filter(asset => asset.mimeType === 'image/webp').slice(0, 4) ?? [];
       if (event.attachments?.length || assets.length) box.append(attachments);
+      if (event.attachmentDelivery === 'tool-image-projection') {
+        box.append(el('p', 'meta', () => t("Current turn received optimized image copies; the original attachments are shown above.")));
+      }
       // Native ChatGPT can prepend a blank paragraph. Ignore it only when a
       // complete instruction frame validates; keep the authored suffix exact.
       const userText = event.authoredText ?? userPromptText(event.message.text.trimStart()) ?? event.message.text;
@@ -2479,6 +2521,7 @@ export function chatSettingsPatch(current: Config): {
       enabled: $<HTMLInputElement>('homeMaEnabled').checked,
       maxWorkers: number('maWorkers', current.multiAgent.maxWorkers, 1, 8),
       allowUnattributedCalls: $<HTMLInputElement>('allowUnattributedCalls').checked,
+      allowUnattributedComputerControl: $<HTMLInputElement>('allowUnattributedComputerControl').checked,
       recoverAgentTabs: $<HTMLInputElement>('recoverAgentTabs').checked
     },
     goal: {
@@ -2823,6 +2866,7 @@ const CHAT_INPUTS = [
   'autoCompactTokens',
   'maWorkers',
   'allowUnattributedCalls',
+  'allowUnattributedComputerControl',
   'recoverAgentTabs',
   'goalProvider',
   'goalBaseUrl',
@@ -2858,6 +2902,12 @@ export function chatApply(state: AppState, previous?: Config): void {
     config.multiAgent.allowUnattributedCalls,
     previous?.multiAgent.allowUnattributedCalls
   );
+  applyChatChecked(
+    $<HTMLInputElement>('allowUnattributedComputerControl'),
+    config.multiAgent.allowUnattributedComputerControl,
+    previous?.multiAgent.allowUnattributedComputerControl
+  );
+  syncUnattributedComputerControl();
   applyChatChecked(
     $<HTMLInputElement>('recoverAgentTabs'),
     config.multiAgent.recoverAgentTabs,
@@ -2956,7 +3006,7 @@ async function refreshInputQueue(): Promise<void> {
   const belongsToSelection = (entry: { id: string; sessionId: string | null; deliveredSessionId?: string | null }): boolean => selectedId === null
     ? pendingNewInput?.generation === selectionGeneration && entry.id === pendingNewInput.id
     : (entry.sessionId ?? entry.deliveredSessionId) === selectedId;
-  const queuedTasks = all.filter(entry => belongsToSelection(entry) && queuedFollowup(entry) && ['queued', 'tool', 'browser'].includes(entry.state));
+  const queuedTasks = all.filter(entry => belongsToSelection(entry) && isFollowupInput(entry) && ['queued', 'tool', 'browser'].includes(entry.state));
   // The first input already durably owns every later stage. Show that authority
   // until its native receipt materializes the actual queue, without a blank gap.
   const staged = [...all, ...[...startingInputs.values()].filter(entry => !all.some(row => row.id === entry.id))]
@@ -3034,7 +3084,7 @@ async function refreshInputQueue(): Promise<void> {
       };
       const edit = dockAction(() => t("Edit queued task"), 'i-pencil', () => {});
       edit.onclick = () => {
-        const field = document.createElement('textarea'); field.dir = 'auto'; field.value = entry.text; field.maxLength = 16000; ui(field, 'aria-label', () => t("Queued task"));
+        const field = document.createElement('textarea'); field.dir = 'auto'; field.value = entry.text; field.maxLength = MAX_CHATGPT_MESSAGE_CHARS; ui(field, 'aria-label', () => t("Queued task"));
         const contents = [...card.childNodes];
         const save = el('button', 'btn', () => t("Save")) as HTMLButtonElement; save.type = 'button';
         save.onclick = async () => {
@@ -3066,7 +3116,7 @@ async function refreshInputQueue(): Promise<void> {
   const unbound = (entry: InputEntry) => selectedId === null && !entry.sessionId && !entry.deliveredSessionId && entry.purpose !== 'decision' && ['queued', 'browser'].includes(entry.state);
   const notice = (entry: InputEntry) => (belongsToSelection(entry) || (selectedId === null && !entry.sessionId && !entry.deliveredSessionId)) && entry.purpose !== 'decision' &&
     ['failed', 'cancelled'].includes(entry.state) && !!entry.error && !dismissedInputNotices.has(entry.id);
-  const rows = all.filter((entry) => !dismissedInputNotices.has(entry.id) && !(entry.state === 'tool' && entry.historyRecorded) && !(queuedFollowup(entry) && ['queued', 'tool', 'browser'].includes(entry.state)) && (belongsToSelection(entry) || unbound(entry) || notice(entry)) &&
+  const rows = all.filter((entry) => !dismissedInputNotices.has(entry.id) && !(entry.state === 'tool' && entry.historyRecorded) && !(isFollowupInput(entry) && ['queued', 'tool', 'browser'].includes(entry.state)) && (belongsToSelection(entry) || unbound(entry) || notice(entry)) &&
     (notice(entry) || unbound(entry) || selectedId !== null || projectGroup(entry.projectId) === selectedProjectId) &&
     (notice(entry) || !['sent', 'cancelled'].includes(entry.state) || (entry.state === 'sent' && entry.messageId && !entry.historyRecorded)));
   for (const entry of startingInputs.values()) if (belongsToSelection(entry) && !all.some(row => row.id === entry.id)) rows.push(entry);
@@ -3154,8 +3204,8 @@ async function retryPlannedInput(entry: InputEntry): Promise<void> {
   if (dismissedInputNotices.has(entry.id) || entry.stagesApplied || !['failed', 'cancelled'].includes(entry.state)) return;
   // The outbox retains the authored workflow after failure. Retry that payload, not
   // its stage-one display text, and never revive the old browser claim/receipt.
-  const { sessionId, projectId, text, objective, stages, images, attachments, automation, model, reasoningEffort, afterTurn } = entry;
-  const args: InputArgs = { id: crypto.randomUUID(), sessionId, projectId, text, objective, stages, images, attachments,
+  const { sessionId, projectId, text, objective, stages, images, attachments, attachmentDelivery, automation, model, reasoningEffort, afterTurn } = entry;
+  const args: InputArgs = { id: crypto.randomUUID(), sessionId, projectId, text, objective, stages, images, attachments, attachmentDelivery,
     automation, model, reasoningEffort, afterTurn, mode: entry.requestedMode ?? entry.mode, dueAt: Date.now() };
   const generation = selectionGeneration;
   // Hide during the attempt, but persist dismissal only after its replacement is durable.
@@ -3239,12 +3289,13 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
   if (!modelSettings) { toast(t("Model discovery could not confirm your selection. Choose an available model and thinking effort, then send again.")); return false; }
   const sessionId = selectedId;
   const generation = selectionGeneration;
-  const chosenMode = delivery ?? $<HTMLSelectElement>('sendMode').value;
-  const mode = chosenMode === 'after-turn' && controlledSessionId === selectedId && controlledSelection === selectionGeneration && controlledQueueAtFinish ? 'finish' : chosenMode;
+  const mode = composerDeliveryDecision(images, input.value, delivery).mode;
   const dueAt = Date.now();
   const id = crypto.randomUUID();
   const authoredDraft = input.value;
-  const attachmentPayload = { images: images.filter((file): file is InputImage => 'dataUrl' in file), attachments: images.filter((file): file is InputAttachment => 'id' in file) };
+  const attachmentPayload = { images: images.filter((file): file is InputImage => 'dataUrl' in file), attachments: images.filter((file): file is InputAttachment => 'id' in file),
+    ...(mode === 'auto' && !plan && selectedId && controlledSessionId === selectedId && controlledSelection === generation &&
+      controlledCanInject && images.some(file => 'id' in file) && canAttemptImageProjection(images) ? { attachmentDelivery: 'tool-image-projection' as const } : {}) };
   const objective = plan ? planObjective : mode === 'finish' ? undefined : $<HTMLTextAreaElement>('sessionObjective').value.trim() || undefined;
   startingInputs.set(id, { id, sessionId, projectId, text, ...attachmentPayload, stages: plan?.slice(1), objective, mode: mode === 'finish' ? 'finish' : mode === 'auto' ? 'auto' : 'after-turn',
     dueAt, ...modelSettings, state: 'queued', owner: null, createdAt: dueAt, conversationId: null });
@@ -3345,9 +3396,10 @@ function selectNewChat(projectId: string | null = null): void {
 
 export function initChat(next: Deps): void {
   deps = next;
+  $<HTMLTextAreaElement>('chatInput').maxLength = MAX_CHATGPT_MESSAGE_CHARS;
   const agentToggle = el('button', 'btn btn-icon', '◫') as HTMLButtonElement;
   agentToggle.id = 'agentPanelToggle'; agentToggle.type = 'button'; agentToggle.hidden = true;
-  ui(agentToggle, 'aria-label', () => t("Toggle sub-agent side panel")); agentToggle.setAttribute('aria-expanded', 'false');
+  ui(agentToggle, 'aria-label', () => t("Toggle worker side panel")); agentToggle.setAttribute('aria-expanded', 'false');
   $('themeBtn').before(agentToggle);
   const agentToolGroups = new Map<string, HTMLDetailsElement>();
   agentPanel = createAgentPanel({
@@ -3408,6 +3460,17 @@ export function initChat(next: Deps): void {
       select.disabled = false;
       if (id === selectedId && generation === selectionGeneration) { delete select.dataset.edited; void refreshSessionControls(); }
       paintAutomationSwitch();
+    }
+  });
+  $('loopTrigger').addEventListener('change', async () => {
+    const id = selectedId, generation = selectionGeneration;
+    if (!id) return;
+    const select = $<HTMLSelectElement>('loopTrigger');
+    select.disabled = true;
+    try { await run(api.setSessionLoopTrigger(id, select.value === 'after-turn' ? 'after-turn' : 'session-finish')); }
+    finally {
+      select.disabled = false;
+      if (id === selectedId && generation === selectionGeneration) void refreshSessionControls();
     }
   });
   $('sessionObjective').addEventListener('input', () => { cancelGoalRequest(); goalIntentGeneration++; $('sessionObjective').dataset.edited = 'true'; delete $('sessionObjective').dataset.saved; paintTaskActions(); });
@@ -3663,6 +3726,7 @@ export function initChat(next: Deps): void {
     );
   });
 
+  $('allowUnattributedCalls').addEventListener('change', syncUnattributedComputerControl);
   for (const id of CHAT_INPUTS) {
     $(id).addEventListener('change', () => void deps.save());
   }
@@ -3684,4 +3748,11 @@ export function initChat(next: Deps): void {
     Object.assign(goalProgress, progress); paintGoalProgress();
   });
   api.onSwarmChanged(paintSwarm);
+}
+
+function syncUnattributedComputerControl(): void {
+  const parent = $<HTMLInputElement>('allowUnattributedCalls');
+  const child = $<HTMLInputElement>('allowUnattributedComputerControl');
+  child.disabled = !parent.checked;
+  child.closest<HTMLElement>('.setting')?.toggleAttribute('data-disabled', child.disabled);
 }

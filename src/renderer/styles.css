@@ -1010,7 +1010,7 @@ main {
   color: var(--faint);
 }
 
-/* Informational rows inside the Sub-agents group. The group has one master exposure
+/* Informational rows inside the Workers group. The group has one master exposure
    switch, so drawing six fake per-tool checkboxes would imply controls that do not exist. */
 .tools .tool.is-static {
   cursor: default;
@@ -2367,7 +2367,7 @@ input.num {
   font-weight: 600;
 }
 
-/* A setup step that silently does nothing when skipped — sub-agents without the companion
+/* A setup step that silently does nothing when skipped — workers without the companion
    extension. Uses the same --red as the error surfaces so it reads as a prerequisite rather
    than as decoration, and it stays legible in both themes because --red is defined per theme. */
 .hint.is-required {
@@ -2656,6 +2656,8 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
 [data-view='settings'] .pane h3 { margin: 24px 0 10px; }
 [data-view='settings'] .pane > h3:first-child { margin-top: 0; }
 [data-view='settings'] .setting { padding: 15px 0; }
+[data-view='settings'] .setting-dependent { padding-left: 18px; }
+[data-view='settings'] .setting[data-disabled] .setting-text { opacity: 0.55; }
 [data-view='settings'] .setting select { max-width: 46%; min-width: 100px; border-radius: 8px; background: var(--hover); }
 [data-panel='home'] .card > h2 { text-transform: none; letter-spacing: 0; font-size: 14px; min-height: 0; padding: 9px 20px; }
 .settings-heading .eyebrow { display: none; }
@@ -2680,6 +2682,7 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
 .setting > input[type='checkbox']:checked { background: var(--ink); }
 .setting > input[type='checkbox']:checked::after { left: 16px; background: var(--page); }
 .setting > input[type='checkbox']:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+.setting > input[type='checkbox']:disabled { cursor: default; opacity: 0.45; }
 .sidebar-sessions h2 { display: flex; justify-content: space-between; align-items: center; font-size: 11px; font-weight: 500; color: var(--faint); }
 .sidebar-sessions h2 .btn { font-size: 0; padding: 4px; }
 .sidebar-sessions h2 .btn .ico { width: 14px; height: 14px; }

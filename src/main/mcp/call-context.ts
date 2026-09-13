@@ -65,6 +65,12 @@ export interface CallCaller {
 }
 
 export interface CallContext {
+  /**
+   * Process-minted identity of one outer tool invocation. Nested code-mode calls share the same
+   * object; unrelated inbound requests can never choose or reuse it. Optional only for tests and
+   * legacy in-process seams that do not grant anonymous stateful authority.
+   */
+  invocation?: { readonly id: string };
   /** Result publication belongs to the transport, not to the generation-wide request ID. */
   publication?: OutputPublication;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */

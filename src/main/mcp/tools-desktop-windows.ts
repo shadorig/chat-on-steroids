@@ -4,28 +4,43 @@ import { act, getWindowState, ComputerError } from '../computer/index.js';
 import { createWindowsComputerApi, WINDOWS_API_METHODS, WINDOWS_API_SCHEMAS, type WindowsComputerApi } from '../computer/windows-api.js';
 import { browserTabChord, isBrowserProcess } from '../computer/browser-chords.js';
 import { currentCall, noteCount } from './call-context.js';
+import { getConfig } from '../config.js';
 import { fail, type SurfaceRegistrar, type ToolContent, type ToolResult } from './kernel.js';
-import { WINDOWS_COMPUTER_READ_METHODS, WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
+import { WINDOWS_COMPUTER_INPUT_METHODS, WINDOWS_COMPUTER_READ_METHODS } from '../../shared/windows-computer.js';
 import { toolDeclaration } from './tool-declarations.js';
 
 const READ_METHODS = new Set<string>(WINDOWS_COMPUTER_READ_METHODS);
-const STATE_INPUT_METHODS = new Set<string>(WINDOWS_COMPUTER_STATE_INPUT_METHODS);
+const INPUT_METHODS = new Set<string>(WINDOWS_COMPUTER_INPUT_METHODS);
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024 - 64 * 1024;
 // Only disposable observation indexes/geometry live here; the native frame/ref owner still
-// validates generation, identity and current geometry. A missing caller cannot borrow a
-// different conversation's latest element indexes. No images or userData are persisted.
+// validates generation, identity and current geometry. Identified state follows its proven
+// session/chat. Unattributed state follows one process-minted outer invocation object through
+// nested code-mode calls and disappears with that object; no external request id can reclaim it.
 const contexts = new Map<string, WindowsComputerApi>();
+const anonymousContexts = new WeakMap<object, WindowsComputerApi>();
 const MAX_CONTEXTS = 32;
 
 function apiForCaller(method: string): WindowsComputerApi {
-  const caller = currentCall()?.caller;
+  const call = currentCall();
+  const caller = call?.caller;
+  const settings = getConfig().multiAgent;
+  const allowUnattributed = settings.allowUnattributedCalls;
+  const allowUnattributedControl = allowUnattributed && settings.allowUnattributedComputerControl;
   const principal = caller?.sessionId ? `session:${caller.sessionId}`
     : caller?.conversationId ? `chat:${caller.conversationId}` : null;
-  if (!principal) {
-    if (STATE_INPUT_METHODS.has(method)) {
-      throw new ComputerError('CALLER_IDENTITY_REQUIRED: indexed and coordinate input requires this conversation’s exact companion identity; no input ran.');
+  if (!principal && allowUnattributed && call?.invocation) {
+    if (INPUT_METHODS.has(method) && !allowUnattributedControl) {
+      throw new ComputerError('CALLER_IDENTITY_REQUIRED: unattributed computer input is disabled; no input ran.');
     }
-    // Unattributed reads/simple exact-window operations remain useful, but never publish
+    let api = anonymousContexts.get(call.invocation);
+    if (!api) { api = createWindowsComputerApi(); anonymousContexts.set(call.invocation, api); }
+    return api;
+  }
+  if (!principal) {
+    if (INPUT_METHODS.has(method)) {
+      throw new ComputerError('CALLER_IDENTITY_REQUIRED: desktop input requires an exact chat/session or one explicitly permitted unattributed invocation; no input ran.');
+    }
+    // Unattributed reads remain useful, but never publish
     // an implicit latest-observation authority that another anonymous call could consume.
     return createWindowsComputerApi();
   }

@@ -40,7 +40,7 @@ const MODEL_REQUEST_TIMEOUT_MS = 190_000;
 /** The reason a deadline aborts with, so it is a fact the caller can act on rather than prose. */
 const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 14;
+const BRIDGE_PROTOCOL = 15;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -1984,6 +1984,7 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       continue;
     }
     offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target,
+      ...(input.recoveryTurnId ? { recoveryTurnId: input.recoveryTurnId } : {}),
       ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.lifetime ? { lifetime: input.lifetime } : {}) });
   }
 }
@@ -2739,7 +2740,7 @@ const HANDLERS = {
       return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
     }
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
-      method: 'POST', body: JSON.stringify({ id, owner, conversationId, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
+      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryBusyTurnId: typeof message.recoveryBusyTurnId === 'string' ? message.recoveryBusyTurnId : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, reason: message.reason === 'pickup_withdrawn_before_send' ? message.reason : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
     });
     if (typeof message.response === 'string' && message.lifetime !== 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
       // Accepting the answer retires the helper's work, not the user's tab or draft.
@@ -3129,6 +3130,7 @@ const HANDLERS = {
         conversationId,
         turnId: String(message.turnId || ''),
         clientId: String(source.tab),
+        ...(message.nativeBusy === true ? { nativeBusy: true } : {}),
         ...(message.terminalRequired === true ? { terminalRequired: true } : {})
       })
     });
@@ -3254,6 +3256,7 @@ const HANDLERS = {
     const conversationId = cleanConversationId(tabConversations[key]) ?? requestedConversation;
     const body = {};
     if (typeof message.autoCompact === 'boolean') body.autoCompact = message.autoCompact;
+    if (message.loopTrigger === 'after-turn' || message.loopTrigger === 'session-finish') body.loopTrigger = message.loopTrigger;
     // Goal and Loop are one setting behind two switches, and the app refuses a body carrying
     // both. Pass through whichever one the sheet actually moved.
     if (typeof message.goal === 'boolean') body.goal = message.goal;

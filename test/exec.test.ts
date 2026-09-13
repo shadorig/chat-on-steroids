@@ -12,7 +12,6 @@ import {
   launchCommand,
   normaliseTimeout,
   prepareCommand,
-  prepareShellCommand,
   runCommand,
   runPowerShell,
   terminateProcessTree
@@ -379,33 +378,5 @@ describe.runIf(IS_WINDOWS)('runPowerShell', () => {
   it('starts the captured output with the text, not with a byte-order mark', async () => {
     const result = await runPowerShell("Write-Output 'plain'", cwd, 30_000);
     expect(result.stdout.startsWith('﻿')).toBe(false);
-  });
-});
-
-/**
- * cmd.exe does not read the quoting Node writes.
- *
- * Node escapes an inner `"` as `\"`, which is the convention for an ordinary Windows
- * program; cmd takes the backslashes literally, so `node -e "console.log(123)"` reached it
- * as something it could not run. The part that makes this a trust bug rather than a bug is
- * what cmd does then: it exits 0. The call was reported as having succeeded, with no
- * output and no side effect — a command that silently did not run.
- *
- * What that line does once it reaches the shell is covered end to end against a real
- * cmd.exe in the process manager's tests, which is the path `exec_command` takes.
- */
-describe.runIf(IS_WINDOWS)('the command line prepared for cmd.exe', () => {
-  it('hands the line to Windows as written rather than letting Node quote it', () => {
-    const prepared = prepareShellCommand('node -e "console.log(1)"', 'cmd');
-    expect(prepared.windowsVerbatimArguments).toBe(true);
-    // Verbatim and the wrapping quotes are one decision: without the quotes there is no
-    // outer pair for `/s` to strip, and a script containing `&` would be split by cmd.
-    expect(prepared.args).toEqual(['/d', '/s', '/c', '"node -e "console.log(1)""']);
-  });
-
-  it('leaves the PowerShell path on its encoded command', () => {
-    const prepared = prepareShellCommand('Write-Output 1', 'powershell');
-    expect(prepared.windowsVerbatimArguments).toBeUndefined();
-    expect(prepared.args).toContain('-EncodedCommand');
   });
 });

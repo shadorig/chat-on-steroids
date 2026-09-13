@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import sharp from 'sharp';
 import {
   FsOpError,
   MAX_WRITE_BYTES,
@@ -408,6 +409,16 @@ describe('image and binary helpers', () => {
     const target = at('corrupt.png');
     await fs.writeFile(target, corrupt);
     await expect(readImageFile(target)).rejects.toThrow(/invalid or corrupt PNG/i);
+  });
+
+  it('stops JPEG parsing at the codestream EOI even when trailing bytes contain another FF D9', async () => {
+    const jpeg = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#fff' } }).jpeg().toBuffer();
+    const trailer = Buffer.from([0x74, 0x72, 0x61, 0x69, 0x6c, 0xff, 0xd9, 0x6d, 0x6f, 0x72, 0x65]);
+    const target = at('jpeg-with-trailer.jpg');
+    await fs.writeFile(target, Buffer.concat([jpeg, trailer]));
+    const image = await readImageFile(target);
+    expect(image.mimeType).toBe('image/jpeg');
+    expect(image.bytes).toBe(jpeg.length + trailer.length);
   });
 
   it('decodes standard and URL-safe base64 strictly', () => {

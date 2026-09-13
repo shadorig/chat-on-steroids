@@ -8,6 +8,10 @@ export default defineConfig({
     // defaults are too tight.
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    // The suite also drives the real Windows capture helper and contains durable-store stress
+    // cases. Letting a high-core workstation spawn one worker per core makes those tests fight
+    // over native capture/IO and can turn a 6-second 8,400-event case into a 60-second timeout.
+    maxWorkers: 4,
     env: {
       // Never let a test bind — or worse, fall through to — the shipped bridge range.
       // The developer's own installed app is usually listening on 8765 while the suite

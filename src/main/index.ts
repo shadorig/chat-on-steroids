@@ -13,8 +13,9 @@ import { flushLogBeforeExit, initLogFile, logError, logInfo, logWarn, snapshotLo
 import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
 import { pluginManager } from './plugins/manager.js';
-import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
+import { installBridgeRuntimeDependencies, recoveryInputAllowed, setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
 import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
+import { cancelUsageOverview, warmUsageOverview } from './session/usage.js';
 import {
   flushRecorder,
   queueDeterministicAttributionRepair,
@@ -49,11 +50,13 @@ import {
   GOAL_SWITCHES_STATE,
   restoreGoalObjectives,
   restoreGoalReplies,
+  automaticFinishEnabled,
   restoreGoalSwitches,
   type GoalObjectivesSnapshot,
-  type GoalRepliesSnapshot,
+  type StoredGoalRepliesSnapshot,
   type GoalSwitchesSnapshot
 } from './goal.js';
+import { installInputAuthority } from './session/input.js';
 import {
   CONTINUATIONS_STATE,
   restoreContinuations,
@@ -88,6 +91,7 @@ let quitting = false;
 let shutdownStarted = false;
 let shutdownComplete = false;
 let stopSessionRetention: (() => void) | null = null;
+let usageWarmupTimer: ReturnType<typeof setTimeout> | null = null;
 
 // One instance only: two copies would fight over the tunnel and the config file.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -328,7 +332,7 @@ void app.whenReady().then(async () => {
   const savedGoalSwitches = await readDurable<GoalSwitchesSnapshot>(GOAL_SWITCHES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalSwitches(savedGoalSwitches);
-  const savedGoalReplies = await readDurable<GoalRepliesSnapshot>(GOAL_REPLIES_STATE);
+  const savedGoalReplies = await readDurable<StoredGoalRepliesSnapshot>(GOAL_REPLIES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalReplies(savedGoalReplies);
   // Request ownership must exist before either side of the bridge can race in. A request id
@@ -339,6 +343,11 @@ void app.whenReady().then(async () => {
   // turn today, and a block that loads after the first call is a tool the turn already got.
   await restoreBlockedChats();
   if (windowActivation.isDisabled()) return;
+  // Cross-domain runtime dependencies are installed here, once, after their durable owners have
+  // been restored and before IPC/browser work can observe them. Importing a leaf module never
+  // mutates another module's authority.
+  installInputAuthority({ automaticFinishEnabled, recoveryAllowed: recoveryInputAllowed });
+  installBridgeRuntimeDependencies();
   setAgentConversationLookup(agentConversation);
   // The prime's chat is the user's own, so no extension report can name it. It is bound
   // when the recorder manages to place the prime's first call. See recordToolCall.
@@ -467,6 +476,13 @@ void app.whenReady().then(async () => {
   // push, every failure ends inside it, and its own timer keeps it running for a tray app that
   // is never restarted.
   startUpdateChecks();
+  // Give window/bootstrap work first claim on startup. Usage then warms opportunistically;
+  // opening the panel joins this same calculation instead of launching a second history scan.
+  usageWarmupTimer = setTimeout(() => {
+    usageWarmupTimer = null;
+    void warmUsageOverview().catch((error: Error) => logWarn(`usage background refresh failed: ${error.message}`));
+  }, 3_000);
+  usageWarmupTimer.unref?.();
 });
 
 app.on('before-quit', () => {
@@ -475,6 +491,8 @@ app.on('before-quit', () => {
   // From this point `will-quit` owns a bounded teardown. A Dock click/relaunch arriving while
   // that sequence drains must not recreate or reveal a window after the tray has disappeared.
   windowActivation.disable();
+  if (usageWarmupTimer) clearTimeout(usageWarmupTimer); usageWarmupTimer = null;
+  cancelUsageOverview();
 });
 
 app.on('window-all-closed', () => {

@@ -69,4 +69,7 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
 // 14 — browser evidence can carry a project input claim so the app binds Local Project authority
 // before normal request-id publication, while a durable pre-Send fence covers document loss in the
 // narrow post-Send gap. A 13 companion can publish correlation without that claim/fence contract.
-export const BRIDGE_PROTOCOL = 14;
+// 15 — Goal activity now distinguishes configured from currently effective switch state, recovered
+// continuation pickup carries exact source-turn identity/busy deferral, and pre-Send withdrawal has
+// an explicit failure reason. A 14 companion silently drops or misreads those fields.
+export const BRIDGE_PROTOCOL = 15;

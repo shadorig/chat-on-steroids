@@ -24,6 +24,7 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
 
 import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
@@ -91,7 +92,7 @@ import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import { acknowledgeBackgroundExecOutput, backgroundExecRecoveryNotices, offerBackgroundExecOutput } from '../codex/ownership.js';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
-import { unattributedRepairEta } from '../bridge.js';
+import { unattributedRepairEta } from './recovery-notice.js';
 import { conversationAttachment, readOverflowText } from '../session/store.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 
@@ -453,6 +454,7 @@ export async function dispatch(
   // those gaps describes a machine that has not finished changing. The counter therefore
   // opens with the request and closes with it.
   const context: CallContext = {
+    invocation: parent?.invocation ?? { id: randomUUID() },
     publication: parent?.publication ?? inboundPublication() ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
     transportKey,

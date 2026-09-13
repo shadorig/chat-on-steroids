@@ -33,8 +33,8 @@ describe('extension release metadata', () => {
     ) as { version: string };
     expect(pkg.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(14);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 14;');
+    expect(BRIDGE_PROTOCOL).toBe(15);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 15;');
   });
 
   /**
@@ -726,6 +726,30 @@ function journalOf(session: FakeStorageArea): any[] {
   const value = session.data.journal;
   return Array.isArray(value) ? value : [];
 }
+
+it('forwards the exact reversible pre-Send withdrawal reason to the app', async () => {
+  const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+  const requests: Array<{ route: string; body: any }> = [];
+  const worker = loadWorker({
+    local: new FakeStorageArea({ port: 8765, token: 'paired-token' }), session: new FakeStorageArea(),
+    tabsGet: async () => ({ id: 1, url: `https://chatgpt.com/c/${conversationId}` }),
+    fetch: async (input, init) => {
+      const route = new URL(input).pathname;
+      if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      requests.push({ route, body: init?.body ? JSON.parse(String(init.body)) : null });
+      return response(200, { ok: true });
+    }
+  });
+  await worker.registerTab(1);
+  expect((await worker.send({
+    type: 'desktop_input', id: 'ffffffff-1111-4222-8333-444444444444',
+    owner: '1:document-1-0:0', conversationId, fail: true,
+    reason: 'pickup_withdrawn_before_send', error: 'After-turn pickup was withdrawn before Send.'
+  })).ok).toBe(true);
+  expect(requests).toContainEqual({ route: '/input/fail', body: expect.objectContaining({
+    reason: 'pickup_withdrawn_before_send', error: 'After-turn pickup was withdrawn before Send.'
+  }) });
+});
 
 describe('accepted helper tab cleanup', () => {
   for (const outcome of ['accepted', 'rejected', 'navigated', 'pinned', 'busy', 'draft', 'pinned-during-proof'] as const) {

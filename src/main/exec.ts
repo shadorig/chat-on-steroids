@@ -28,7 +28,6 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 300_000;
 export const MAX_OUTPUT_BYTES = 100_000;
 export const MAX_SCRIPT_CHARS = 8_000;
-export const MAX_SHELL_COMMAND_CHARS = 32_000;
 export const MAX_ENV_VARS = 64;
 export const MAX_ENV_KEY_CHARS = 128;
 export const MAX_ENV_VALUE_CHARS = 8_192;
@@ -118,8 +117,6 @@ export interface PreparedCommand {
   env: NodeJS.ProcessEnv;
   /**
    * Hand the arguments to Windows as written instead of letting Node quote them.
-   *
-   * Only ever set for `cmd.exe`, and it is not a preference — see prepareShellCommand.
    */
   windowsVerbatimArguments?: boolean;
 }
@@ -402,51 +399,6 @@ export function cleanPowerShellStderr(stderr: string): string {
     .map((match) => decodePowerShellXmlText(match[1] ?? '').trim())
     .filter(Boolean);
   return [plainPrefix, ...records].filter(Boolean).join('\n').trim();
-}
-
-export type AgentShell = 'powershell' | 'cmd';
-
-/** Build a shell command for a managed Codex-style exec session without using Node's shell=true. */
-export function prepareShellCommand(
-  script: string,
-  shellKind: AgentShell,
-  envOverrides?: CommandEnvironment
-): PreparedCommand {
-  if (typeof script !== 'string' || script.trim() === '') throw new ExecError('cmd must be a non-empty string');
-  if (script.includes('\0')) throw new ExecError('cmd contains a null byte');
-  if (script.length > MAX_SHELL_COMMAND_CHARS) {
-    throw new ExecError(`cmd is too long (limit ${MAX_SHELL_COMMAND_CHARS} characters)`);
-  }
-  const env = childEnv(envOverrides);
-  if (shellKind === 'cmd') {
-    return {
-      file: process.env.ComSpec || 'cmd.exe',
-      // The script is wrapped and passed verbatim, and the two go together.
-      //
-      // Node quotes arguments for a normal Windows program, which escapes an inner `"` as
-      // `\"`. cmd.exe has never used that convention: it saw the backslashes as part of the
-      // text, so `node -e "console.log(123)"` reached it as something it could not run —
-      // and cmd exits 0 in that case, so the call came back *successful* with no output and
-      // no side effect. A command that silently does not run is worse than one that fails.
-      //
-      // Verbatim alone is not enough: without the wrapping quotes a script containing `&`
-      // or `|` would be split by cmd's own parser. `/s` is the switch that makes cmd strip
-      // exactly the outer pair and treat everything between as the command, which is why
-      // the wrapping is safe for scripts that contain quotes of their own.
-      args: ['/d', '/s', '/c', `"${script}"`],
-      env,
-      windowsVerbatimArguments: true
-    };
-  }
-  const shell = findPowerShell();
-  if (!shell) throw new ExecError('PowerShell was not found on this system');
-  const cleanScript = `${CONSOLE_UTF8}${GET_CONTENT_UTF8}$ProgressPreference='SilentlyContinue'; ${script}`;
-  const encoded = Buffer.from(cleanScript, 'utf16le').toString('base64');
-  return {
-    file: shell,
-    args: ['-NoProfile', '-NonInteractive', '-NoLogo', '-OutputFormat', 'Text', '-EncodedCommand', encoded],
-    env
-  };
 }
 
 /** Runs a PowerShell script in an approved working directory. */

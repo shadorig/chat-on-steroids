@@ -23,6 +23,7 @@ describe('portable browser-backed feature parity', () => {
         enabled: true,
         maxWorkers: 2,
         allowUnattributedCalls: true,
+        allowUnattributedComputerControl: false,
         recoverAgentTabs: false
       });
       expect(configuredBrowserBridgeRequired(config)).toBe(true);

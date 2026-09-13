@@ -93,21 +93,76 @@ afterEach(() => {
   globalThis.fetch = realFetch;
 });
 
-it('keeps a withdrawn synthetic reply revoked when the deletion write fails and Goal is re-armed', async () => {
+it('persists Pro Loop delivery across toggles and restart without granting Goal browser continuation', async () => {
+  const id = 'pro-loop-delivery-test';
+  const session = await createSession({ conversationId: id });
+  await observeSessionModel(session.id, id, 'gpt-5.6-pro', Date.now(), 'pro');
+  await goal.setGoalSwitchNow(id, 'loop', true);
+  expect(await goal.requiresFinishOnlyContinuation(session.id, id)).toBe(true);
+  await goal.setGoalLoopTriggerNow(id, 'after-turn');
+  expect(await goal.effectiveLoopAfterTurnFor(session.id, id)).toBe(true);
+  expect(await goal.requiresFinishOnlyContinuation(session.id, id)).toBe(false);
+  const saved = goal.snapshotGoalSwitches();
+  goal.restoreGoalSwitches(saved);
+  expect(goal.loopTriggerPreferenceFor(id)).toBe('after-turn');
+  expect(await goal.effectiveLoopAfterTurnFor(session.id, id)).toBe(true);
+  await goal.setGoalSwitchNow(id, 'loop', false);
+  expect(goal.loopTriggerPreferenceFor(id)).toBe('after-turn');
+  expect(await goal.effectiveLoopAfterTurnFor(session.id, id)).toBe(false);
+  await goal.setGoalSwitchNow(id, 'loop', true);
+  expect(await goal.effectiveLoopAfterTurnFor(session.id, id)).toBe(true);
+  await observeSessionModel(session.id, id, 'gpt-5.6-sol', Date.now() + 1, 'high');
+  expect(goal.loopTriggerPreferenceFor(id)).toBe('after-turn');
+  expect(await goal.effectiveLoopAfterTurnFor(session.id, id)).toBe(false);
+  await observeSessionModel(session.id, id, 'gpt-6-pro', Date.now() + 2, 'pro');
+  expect(await goal.effectiveLoopAfterTurnFor(session.id, id)).toBe(false);
+  expect(await goal.requiresFinishOnlyContinuation(session.id, id)).toBe(true);
+  await observeSessionModel(session.id, id, 'gpt-5.6-pro', Date.now() + 3, 'pro');
+  expect(await goal.effectiveLoopAfterTurnFor(session.id, id)).toBe(true);
+});
+
+it('stores Loop delivery without pinning an inherited automation setting', async () => {
+  const id = 'inherited-loop-delivery';
+  const session = await createSession({ conversationId: id });
+  await observeSessionModel(session.id, id, 'gpt-5.6-pro', Date.now(), 'pro');
+  const inherited = defaultConfig();
+  await saveConfig({ ...inherited, goal: { ...inherited.goal, enabled: true, mode: 'loop' } });
+  expect(goal.goalSwitchFor(id)).toMatchObject({ enabled: true, mode: 'loop', own: false, loopTrigger: 'session-finish' });
+  await goal.setGoalLoopTriggerNow(id, 'after-turn');
+  expect(goal.goalSwitchFor(id)).toMatchObject({ enabled: true, mode: 'loop', own: false, loopTrigger: 'after-turn' });
+  goal.restoreGoalSwitches(goal.snapshotGoalSwitches());
+  expect(goal.goalSwitchFor(id).own).toBe(false);
+  await saveConfig({ ...inherited, goal: { ...inherited.goal, enabled: false, mode: 'goal' } });
+  expect(goal.goalSwitchFor(id)).toMatchObject({ enabled: false, mode: 'goal', own: false, loopTrigger: 'after-turn' });
+});
+
+it('rolls back a failed recovery revocation and keeps the successful tombstone impossible to re-arm', async () => {
   const conversationId = 'deletion-failure-pro';
   const session = await createSession({ conversationId, title: 'Synthetic revocation' });
-  await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'silence:old', turnId: 'g-silence-old', eventSeq: 1, blocked: false });
+  goal.restoreGoalReplies({ version: 1, savedAt: Date.now(), replies: [{ conversationId, sessionId: session.id,
+    replyId: 'silence:old', turnId: 'g-silence-old', eventSeq: 1, acceptedAt: Date.now(), state: 'pending',
+    recovery: { proof: { kind: 'recovered-silence', conversationId, turnId: 'source-turn', headSeq: 1, mcpCallSeq: 1, modelClass: 'pro' } } }] });
   goal.startGoalDraft({ conversationId, sessionId: session.id, turnId: 'g-silence-old', deferStart: true });
   const durable = await import('../src/main/durable.js');
   const write = durable.writeDurableNow;
-  const spy = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(write).mockRejectedValueOnce(new Error('deletion write failed'));
+  const spy = vi.spyOn(durable, 'writeDurableNow').mockRejectedValueOnce(new Error('revocation write failed')).mockImplementation(write);
   try {
-    await expect(goal.withdrawSilenceGoalReplyNow(conversationId, 'silence:old')).rejects.toThrow('deletion write failed');
-    await goal.setGoalReplyActiveNow(conversationId, false);
+    await expect(goal.withdrawRecoveryGoalReplyNow(conversationId, 'silence:old')).rejects.toThrow('revocation write failed');
+    expect(goal.goalPendingReplyFor(conversationId)).not.toBeNull();
+    await goal.withdrawRecoveryGoalReplyNow(conversationId, 'silence:old');
     await goal.setGoalReplyActiveNow(conversationId, true);
     expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
     expect(goal.goalViewFor(conversationId)).toBeNull();
   } finally { spy.mockRestore(); }
+});
+
+it('writes proof-bearing Goal obligations under a new snapshot version while still reading shipped v1 state', async () => {
+  const conversationId = 'goal-recovery-snapshot-version';
+  const session = await createSession({ conversationId, title: 'Snapshot version' });
+  goal.restoreGoalReplies({ version: 1, savedAt: Date.now(), replies: [{ conversationId, sessionId: session.id,
+    replyId: 'legacy-final', turnId: 'legacy-turn', eventSeq: 1, acceptedAt: Date.now(), state: 'pending' }] });
+  expect(goal.goalPendingReplyFor(conversationId)?.replyId).toBe('legacy-final');
+  expect(goal.snapshotGoalReplies()).toMatchObject({ version: 2 });
 });
 
 it('projects the driver for each mode and preserves the active draft identity', async () => {
@@ -413,8 +468,7 @@ describe('what leaves this machine', () => {
     const view = await settled('c-goal-2');
 
     expect(view.stage).toBe('ready');
-    // The streamed text, typed: see `humanReply` and the block at the bottom of this file.
-    expect(view.reply).toBe(goal.humanReply('what about the tests'));
+    expect(view.reply).toBe('what about the tests');
     expect(sent.url).toBe('https://openrouter.ai/api/v1/chat/completions');
     expect((sent.headers as Record<string, string>).authorization).toBe('Bearer sk-or-test');
     expect(sent.body.model).toBe('deepseek/deepseek-v4-flash');
@@ -654,7 +708,7 @@ describe('the reply', () => {
     goal.startGoalDraft({ sessionId, conversationId: 'c-eof', turnId: 'g-1' });
     const view = await settled('c-eof');
     expect(view.stage).toBe('ready');
-    expect(view.reply).toBe(goal.humanReply('last token survives'));
+    expect(view.reply).toBe('last token survives');
   });
 
   it('treats the SSE DONE marker as terminal and ignores records after it', async () => {
@@ -672,7 +726,7 @@ describe('the reply', () => {
     goal.startGoalDraft({ sessionId, conversationId: 'c-done-terminal', turnId: 'g-1' });
     const view = await settled('c-done-terminal');
     expect(view.stage).toBe('ready');
-    expect(view.reply).toBe(goal.humanReply('keep this reply'));
+    expect(view.reply).toBe('keep this reply');
   });
 
   it('fails a partial completion when the provider emits a streamed error', async () => {
@@ -784,7 +838,7 @@ describe('the reply', () => {
     const view = await settled('c-again');
     expect(attempts).toBe(2);
     expect(view.stage).toBe('ready');
-    expect(view.reply).toBe(goal.humanReply('the real instruction'));
+    expect(view.reply).toBe('the real instruction');
   });
 
   /** …and never for a failure that would only be paid for again. */
@@ -859,7 +913,7 @@ describe('the reply', () => {
     goal.startGoalDraft({ sessionId, conversationId: 'c-structured-continue', turnId: 'g-1' });
     const view = await settled('c-structured-continue');
     expect(view.stage).toBe('ready');
-    expect(view.reply).toBe(goal.humanReply('what about the tests'));
+    expect(view.reply).toBe('what about the tests');
     expect(view.reply).not.toContain('<|');
   });
 
@@ -916,7 +970,7 @@ describe('the reply', () => {
       goal.startGoalDraft({ sessionId, conversationId, turnId: 'g-1' });
       const view = await settled(conversationId);
       expect(view.stage, content).toBe('ready');
-      expect(view.reply).toBe(goal.humanReply('Run the tests next.'));
+      expect(view.reply).toBe('Run the tests next.');
     }
   });
 
@@ -1028,7 +1082,7 @@ describe('one draft per generation', () => {
 
     goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-ack', turnId: 'g-1' });
     const view = await settled('c-ack');
-    expect(view.reply).toBe(goal.humanReply('one more thing'));
+    expect(view.reply).toBe('one more thing');
 
     expect(goal.ackGoalDraft('c-ack', view.token)).toBe(true);
     expect(goal.goalViewFor('c-ack')).toBeNull();
@@ -1437,94 +1491,24 @@ describe('the model catalogue', () => {
   });
 });
 
-/**
- * The draft as it would have been typed, not as a model writes.
- *
- * Two separate claims, and the second one is the load-bearing one: the em dash goes, and a
- * couple of the mistakes a person leaves behind go in — but the whole thing has to be a pure
- * function of the draft, because a retried request has to be handed back the same message.
- */
-describe('the message a person would have typed', () => {
-  it('leaves no em dash anywhere in the reply', () => {
-    const written =
-      'the picker stops at twenty — scrolling loads nothing. page a screenful before the end ' +
-      '— the button below the list is not where anyone looks.';
-    const typed = goal.humanReply(written);
-    expect(typed).not.toMatch(/[—–]/);
-    // A comma is that sentence typed, so the shape of the sentence survives.
-    expect(typed).toContain('at twenty, scrolling loads nothing');
-  });
-
-  it('keeps a line that opens with a dash a line, and a range a range', () => {
-    // Two lines in, two lines out: a dash opening a line is a bullet, and the horizontal-only
-    // whitespace class is what keeps the newline from being swallowed with it.
-    const lines = goal.humanReply('— check the tests\n— then ship it').split('\n');
-    expect(lines.length).toBe(2);
-    expect(lines.every((line) => /^[a-z]/.test(line))).toBe(true);
-    expect(goal.humanReply('it took 10—20 seconds')).toContain('10-20');
-  });
-
-  it('never leaves a doubled comma where the dash already had one', () => {
-    expect(goal.humanReply('two things, — the tests and the build')).not.toMatch(/,\s*,/);
-  });
-
-  it('puts a mistake in, and not many', () => {
-    const written = 'that does not fix it. the answer still renders twice, look at the id-less sections';
-    const typed = goal.humanReply(written);
-    expect(typed).not.toBe(written);
-    const differing = [...written].filter((letter, at) => letter !== typed[at]).length;
-    // A slip, not a rewrite. Every mutation here is one character long.
-    expect(differing).toBeGreaterThan(0);
-    expect(typed.length).toBeGreaterThanOrEqual(written.length - 3);
-  });
-
-  it('hands back the identical message every time it is asked', () => {
-    const written =
-      'the settings sheet still overflows on the right, can you cap the column and check the ' +
-      'select as well. i really do not want another guess about it.';
-    const once = goal.humanReply(written);
-    expect(goal.humanReply(written)).toBe(once);
-    expect(goal.humanReply(written)).toBe(once);
-    // And a different draft is not the same draft: the seed is the text, not a constant.
-    expect(goal.humanReply(`${written} also the picker.`)).not.toBe(once);
-  });
-
-  /**
-   * The one thing a typo here could actually break. This message is about to be acted on by
-   * ChatGPT, and a mistake inside a path or a command is a different instruction rather than
-   * a slip — so prose is the only place they are allowed.
-   */
-  it('never touches a path, a command or anything in backticks', () => {
-    const written =
-      'run `npm run verify` first and then look at src/renderer/chat.ts, the guard is in ' +
-      'maybeSendGoalReply and the report is at https://example.com/build/latest please';
-    const typed = goal.humanReply(written);
-    expect(typed).toContain('`npm run verify`');
-    expect(typed).toContain('src/renderer/chat.ts');
-    expect(typed).toContain('https://example.com/build/latest');
-  });
-
-  it('leaves a message with nothing to spoil exactly as it was', () => {
-    expect(goal.humanReply('ok cool')).toBe('ok cool');
-  });
-
-  it('is what the page is actually handed', async () => {
-    const session = await createSession({ title: 'goal', conversationId: 'c-typed' });
+describe('authored continuation text', () => {
+  it('hands the provider-authored instruction to the page without mutation', async () => {
+    const session = await createSession({ title: 'goal', conversationId: 'c-authored' });
     await appendEvent(session.id, {
       time: 1_000,
       source: 'extension',
       kind: 'user_message',
       message: { text: 'keep going', truncated: false, chars: 10 }
     });
+    const reply = 'the tests still fail — inspect `src/parser.ts` before changing it';
     globalThis.fetch = (async () =>
-      stream([delta('the tests still fail — look at the id-less sections'), 'data: [DONE]\n'])) as never;
+      stream([delta(reply), 'data: [DONE]\n'])) as never;
 
-    goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-typed', turnId: 'g-typed' });
-    const view = await settled('c-typed');
+    goal.startGoalDraft({ sessionId: session.id, conversationId: 'c-authored', turnId: 'g-authored' });
+    const view = await settled('c-authored');
 
     expect(view.stage).toBe('ready');
-    expect(view.reply).not.toMatch(/[—–]/);
-    expect(view.reply).toBe(goal.humanReply('the tests still fail — look at the id-less sections'));
+    expect(view.reply).toBe(reply);
   });
 });
 
@@ -1951,13 +1935,13 @@ describe('a chat driven towards a specific goal', () => {
    * has been told "not you" cannot be talked back into it by a later change somewhere else.
    */
   it('lets one chat answer the Goal switch for itself, and leaves the rest inheriting', async () => {
-    expect(goal.goalSwitchFor('c-switch-quiet')).toEqual({ enabled: true, mode: 'goal', own: false });
+    expect(goal.goalSwitchFor('c-switch-quiet')).toEqual({ enabled: true, mode: 'goal', own: false, loopTrigger: 'session-finish' });
 
     expect(await goal.setGoalSwitchNow('c-switch-loud', 'loop', true)).toEqual({ enabled: true, mode: 'loop' });
-    expect(goal.goalSwitchFor('c-switch-loud')).toEqual({ enabled: true, mode: 'loop', own: true });
+    expect(goal.goalSwitchFor('c-switch-loud')).toEqual({ enabled: true, mode: 'loop', own: true, loopTrigger: 'session-finish' });
     expect(goal.goalDrivingMode('c-switch-loud')).toBe('loop');
     // Its neighbour, and the app-wide setting the neighbour still follows, are untouched.
-    expect(goal.goalSwitchFor('c-switch-quiet')).toEqual({ enabled: true, mode: 'goal', own: false });
+    expect(goal.goalSwitchFor('c-switch-quiet')).toEqual({ enabled: true, mode: 'goal', own: false, loopTrigger: 'session-finish' });
     expect(goal.goalDrivingMode('c-switch-quiet')).toBe('goal');
 
     // Turning off the mode that is *not* running changes nothing, exactly as the app-wide
@@ -1980,13 +1964,13 @@ describe('a chat driven towards a specific goal', () => {
     expect(goal.goalSwitchFor('c-switch-parent').own).toBe(false);
 
     goal.restoreGoalSwitches(saved);
-    expect(goal.goalSwitchFor('c-switch-parent')).toEqual({ enabled: true, mode: 'loop', own: true });
+    expect(goal.goalSwitchFor('c-switch-parent')).toEqual({ enabled: true, mode: 'loop', own: true, loopTrigger: 'session-finish' });
 
     // Compact & Resume replaces the conversation and the loop goes on running in its
     // replacement; leaving the override behind would hand chat B back to the app-wide setting.
     expect(goal.moveGoalSwitch('c-switch-parent', 'c-switch-child')).toBe(true);
     expect(goal.goalSwitchFor('c-switch-parent').own).toBe(false);
-    expect(goal.goalSwitchFor('c-switch-child')).toEqual({ enabled: true, mode: 'loop', own: true });
+    expect(goal.goalSwitchFor('c-switch-child')).toEqual({ enabled: true, mode: 'loop', own: true, loopTrigger: 'session-finish' });
 
     // The app's own switch going off is the master stop and reaches every override there is.
     goal.clearAllGoalSwitches();
@@ -2100,7 +2084,7 @@ describe('opening a chat on a goal', () => {
     const drafted = await goal.draftOpeningMessage('  rewrite the parser in rust  ');
 
     expect(drafted).toEqual({
-      reply: goal.humanReply('rewrite the parser in rust — start with the lexer'),
+      reply: 'rewrite the parser in rust — start with the lexer',
       model: 'deepseek/deepseek-v4-flash'
     });
     expect(seen[0]!.content).toContain('they have handed you the wheel');
@@ -2319,7 +2303,7 @@ describe('the loop that never stops', () => {
     const view = await settled('c-loop-retry');
 
     expect(view.stage).toBe('ready');
-    expect(view.reply).toBe(goal.humanReply('keep going, the export is missing'));
+    expect(view.reply).toBe('keep going, the export is missing');
     expect(bodies).toHaveLength(2);
     // The second attempt is the first one plus the refusal, so the model is told exactly what
     // was wrong with the answer it just gave.
@@ -2363,7 +2347,7 @@ describe('the loop that never stops', () => {
     const drafted = await goal.draftOpeningMessage('scrape the prices into a csv');
 
     expect(drafted).toEqual({
-      reply: goal.humanReply('start on the scraper, one row per product'),
+      reply: 'start on the scraper, one row per product',
       model: 'deepseek/deepseek-v4-flash'
     });
     expect(seen[0]!.content).toBe(goal.goalLoopPrompt());
@@ -2389,7 +2373,7 @@ it('publishes actual opening response deltas before one validated final result',
   let completed = false; void result.then(() => { completed = true; });
   expect(completed).toBe(false);
   emit(' then implement"}'); controller.enqueue(encoder.encode('data: [DONE]\n\n')); controller.close();
-  expect(await result).toMatchObject({ reply: goal.humanReply('Inspect then implement') });
+  expect(await result).toMatchObject({ reply: 'Inspect then implement' });
 });
 
 it('never owes or generates a browser continuation for Astra even with Goal armed', async () => {

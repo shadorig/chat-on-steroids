@@ -252,7 +252,7 @@ function buildGroups(): void {
     return root;
   });
 
-  // Recording and sub-agents are tool surfaces exactly like the file and desktop
+  // Recording and workers are tool surfaces exactly like the file and desktop
   // permissions — `session` and `agents` are two of the nine tools ChatGPT can discover —
   // and they used to be checkboxes buried in a settings pane behind a gear. Every switch
   // that decides what ChatGPT can reach now lives in this one list. Chat settings keeps
@@ -280,11 +280,11 @@ function buildGroups(): void {
   const enabled = document.createElement('input');
   enabled.type = 'checkbox';
   enabled.id = 'homeMaEnabled';
-  ui(enabled, 'title', () => t("Expose or hide the sub-agent tools in ChatGPT"));
+  ui(enabled, 'title', () => t("Expose or hide worker tools in ChatGPT"));
   // The only multi-agent exposure control there is. Chat settings used to carry a second
   // checkbox for the same flag, which this one had to mirror by hand.
   enabled.addEventListener('change', () => void save());
-  const agents = groupShell('agents', 'Sub-agents', 'i-bolt', enabled);
+  const agents = groupShell('agents', 'Workers', 'i-bolt', enabled);
 
   const tools = el('div', 'tools');
   const agentTools: Array<[string, string]> = [

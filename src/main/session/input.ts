@@ -1,10 +1,9 @@
-import { REASONING_EFFORTS } from '../../shared/session.js';
 /** User-authored input has one durable owner across browser and MCP delivery.
  * A claimed browser send is never automatically retried: losing the ACK is ambiguous.
  * Tool delivery repeats under a stable message id until a later request proves receipt.
  */
 import { z } from 'zod';
-import { browserInputModel, type InputImage } from '../../shared/input.js';
+import { browserInputModel, isFollowupInput, MAX_PROJECTED_IMAGE_COUNT, MAX_TOOL_INPUT_TEXT_BYTES, TOOL_INPUT_HEADER, type BrowserInputFailureReason, type InputImage } from '../../shared/input.js';
 import type { SessionSummary } from '../../shared/session.js';
 import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
@@ -23,84 +22,55 @@ import {
 } from '../local-projects/service.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
-import { logInfo } from '../logger.js';
+import { logInfo, logWarn } from '../logger.js';
 import { noteChatOrigin } from './recorder.js';
 import { isAstraModel, isProModel } from '../../shared/chat-models.js';
 import { inFlightToolCalls } from '../mcp/call-context.js';
-import { automaticFinishEnabled } from '../goal.js';
 import { finishInstruction } from '../../shared/finish.js';
-import { attachmentSchema, validateInputAttachments } from './input-attachments.js';
+import { validateInputAttachments } from './input-attachments.js';
+import { createToolImageProjections, deleteToolImageProjections, readToolImageProjections,
+  type ProjectedImageRef } from './input-image-projection.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
+import { deferRecoveryGrant, validateRecoveryProof, type RecoveryGrant } from './recovery-proof.js';
+import { inputArgs, inputEntrySchema, decodeInputState, encodeInputState, type InputArgs, type InputEntry } from './input-state.js';
+import {
+  followupPermitTurnId,
+  recoveryGrantFor,
+  validateFollowupPermit,
+  type FollowupPermit
+} from './input-followup.js';
 
-export const inputArgs = z.object({
-  projectId: z.string().uuid().nullable().optional(),
-  automation: z.enum(['off', 'goal', 'loop']).optional(),
-  objective: z.string().trim().max(16000).optional(),
-  stages: z.array(z.string().trim().min(1).max(16000)).max(11).optional(),
-  images: z.array(z.object({ name: z.string().min(1).max(110), dataUrl: z.string().max(512100).regex(/^data:image\/webp;base64,[A-Za-z0-9+/]+={0,2}$/) })).max(4).optional(),
-  attachments: z.array(attachmentSchema).max(20).optional(),
-  id: z.string().uuid(),
-  sessionId: z.string().min(8).max(64).nullable(),
-  text: z.string().trim().min(1).max(16000),
-  mode: z.enum(['auto', 'after-turn', 'finish']),
-  afterTurn: z.boolean().optional(),
-  dueAt: z.number().int().nonnegative(),
-  model: z.string().max(80).nullable(),
-  reasoningEffort: z.enum(REASONING_EFFORTS).nullable()
-});
-export type InputArgs = z.infer<typeof inputArgs>;
-const entrySchema = inputArgs.extend({
-  /** Exact tool-free turn this explicit browser correction may interrupt. */
-  directTurn: z.object({ id: z.string().min(1).max(256), startedAt: z.number() }).optional(),
-  finishOwner: z.object({ turnId: z.string().min(1).max(256), periodic: z.boolean(), userRequested: z.boolean().optional() }).optional(),
-  requestedMode: z.enum(['auto', 'after-turn', 'finish']).optional(),
-  transportIntent: z.enum(['tool', 'browser']).optional(),
-  text: z.string().min(1).max(240000),
-  deliveryText: z.string().min(1).max(240000).optional(),
-  purpose: z.enum(['user', 'decision']).optional(),
-  lifetime: z.literal('temporary-planner').optional(),
-  decisionSourceSessionId: z.string().min(8).max(64).optional(),
-  response: z.string().max(16000).optional(),
-  state: z.enum(['queued', 'browser', 'tool', 'sent', 'cancelled', 'failed', 'decision']),
-  offeredAt: z.number().optional(),
-  sendAuthorizedAt: z.number().optional(),
-  requiresAuthorization: z.boolean().optional(),
-  error: z.string().max(200).optional(),
-  owner: z.string().nullable(),
-  createdAt: z.number(),
-  conversationId: z.string().nullable(),
-  deliveredSessionId: z.string().min(8).max(64).nullable().optional(),
-  messageId: z.string().min(1).max(256).optional(),
-  deliveredAt: z.number().optional(),
-  stagesApplied: z.boolean().optional(),
-  historyRecorded: z.boolean().optional(),
-  completedTurnId: z.string().max(256).optional(),
-  queueOrder: z.number().int().nonnegative().optional(),
-  projectAuthorityEra: z.string().uuid().optional()
-});
-export type InputEntry = z.infer<typeof entrySchema>;
+export { inputArgs } from './input-state.js';
+export type { InputArgs, InputEntry } from './input-state.js';
 const STATE = 'session-input';
-const TOOL_INPUT_TEXT_BYTES = 128000;
-export const TOOL_INPUT_HEADER = '\n--- New instructions from the user ---\n';
+export { TOOL_INPUT_HEADER } from '../../shared/input.js';
 export interface ToolInputBatch {
   messages: Array<{ text: string; images: InputImage[] }>;
   /** One transport instruction after the complete batch, including its images. */
   reminder: string;
 }
-export interface InputActivity { possible: boolean; exact: boolean; model?: 'pro' | 'other' | 'unknown' }
+export interface InputActivity { possible: boolean; exact: boolean; model?: 'pro' | 'non-pro' | 'unknown' }
 type InputDeliveryHooks = {
   activity?: (session: SessionSummary) => InputActivity;
   wakeDecision?: (entry: Readonly<InputEntry>, signal: AbortSignal) => Promise<void>;
   bindHelper?: (conversationId: string, sourceSessionId: string | null) => Promise<void>;
   recordDelivered?: (entry: Readonly<InputEntry>) => Promise<boolean>;
   prepareText?: (entry: Readonly<InputEntry>, limits: PromptLimits) => string | Promise<string>;
+  queuedAfterTurn?: (entry: Readonly<InputEntry>) => Promise<void>;
   applyAutomation: (conversationId: string, automation: NonNullable<InputArgs['automation']>, phase: 'before-send' | 'after-send', objective?: string) => Promise<void>;
   changed: () => void;
 };
+type InputAuthorityHooks = {
+  automaticFinishEnabled?: (conversationId: string) => boolean;
+  recoveryAllowed?: (conversationId: string) => boolean;
+};
 let deliveryHooks: InputDeliveryHooks | null = null;
+let authorityHooks: InputAuthorityHooks = {};
 /** Installed once by IPC before bridge/MCP startup; avoids a Goal/input import cycle. */
 export function configureInputDelivery(hooks: InputDeliveryHooks): void { deliveryHooks = hooks; }
+/** The main composition root installs the complete authority set before IPC/browser work starts. */
+export function installInputAuthority(hooks: InputAuthorityHooks): void { authorityHooks = { ...hooks }; }
 /** One delivery policy for composer presentation, admission and the final send fence. */
 export async function sessionInputPolicy(sessionId: string, observedActivity?: InputActivity): Promise<{ queueAtFinish: boolean; canInject: boolean; directTurn: InputEntry['directTurn'] | null; browserAllowed: boolean; settled: boolean }> {
   const [end] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
@@ -127,12 +97,16 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
     settled: terminal && (session.lastToolCallAt ?? 0) <= end.time };
 }
 async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
+  if (entry.attachmentDelivery === 'tool-image-projection') return false;
   if (entry.mode === 'finish' && entry.sessionId && entry.afterTurn !== true) {
     const session = await getSession(entry.sessionId);
     const selection = session?.selectedModel;
     if (selection?.conversationId === session?.conversationId && isAstraModel(selection?.model, selection?.reasoningEffort)) return false;
   }
   if (!entry.sessionId) return entry.transportIntent !== 'tool';
+  // Recovery can leave the recorder's source turn open. Its durable proof establishes the
+  // exact unchanged work; the native page must still be idle for Send.
+  if (entry.followupPermit) return Boolean(await validateFollowupPermit(entry, conversationId => authorityHooks.recoveryAllowed?.(conversationId) === true));
   const policy = await sessionInputPolicy(entry.sessionId);
   if (entry.directTurn) {
     const session = await getSession(entry.sessionId);
@@ -160,7 +134,7 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
     if (current.some(row => row.sessionId === sessionId && row.state === 'browser')) return false;
     for (const row of current) {
       if (row.sessionId !== sessionId || row.dueAt > Date.now()) continue;
-      if (row.attachments?.length) continue;
+      if (row.attachments?.length && row.attachmentDelivery !== 'tool-image-projection') continue;
       if (row.mode === 'after-turn' || (row.mode === 'finish' && !finishBoundary)) continue;
       if (row.state === 'tool') return true;
       if (row.state === 'queued') return row.mode === 'auto' || (finishBoundary && row.mode === 'finish');
@@ -170,6 +144,7 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
 }
 let entries: InputEntry[] | null = null;
 let chain: Promise<unknown> = Promise.resolve();
+const enqueueFlights = new Map<string, { fingerprint: string; work: Promise<InputEntry> }>();
 // A timestamp written before the claim commit cannot prove that its response was
 // available. Restart discards this evidence and repeats the stable message id.
 const offered = new Map<string, number>();
@@ -190,9 +165,8 @@ function serial<T>(work: () => Promise<T>): Promise<T> {
 async function load(): Promise<InputEntry[]> {
   if (entries) return expireQueued(entries);
   const raw = await readDurable<unknown>(STATE);
-  const parsed = z.array(entrySchema).safeParse(raw ?? []);
-  if (!parsed.success) throw new Error('The message outbox could not be read safely');
-  entries = parsed.data;
+  const decoded = decodeInputState(raw);
+  entries = decoded.entries;
   // Old receipts are recovery evidence, not a reason to replay every already-stamped
   // transcript before the sidebar appears. The existing catalog proves an origin is
   // durable; only missing/ambiguous rows need the normal origin repair path below.
@@ -220,7 +194,7 @@ async function load(): Promise<InputEntry[]> {
   }
   const recovered = entries.map((row): InputEntry => row.purpose === 'decision' && !terminal(row) && !decisionWaiters.has(row.id)
     ? { ...row, state: 'cancelled' } : row);
-  if (recovered.some((row, i) => row !== entries![i])) {
+  if (decoded.migrated || recovered.some((row, i) => row !== entries![i])) {
     try { await commit(recovered); }
     catch (error) { entries = null; throw error; }
   }
@@ -250,14 +224,11 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
   return entries!;
 }
 async function commit(next: InputEntry[]): Promise<void> {
-  // A temporary planner keeps only ownership metadata across restart, never its task or answer.
-  const durableRows = (rows: InputEntry[]) => rows.map(row => row.lifetime === 'temporary-planner'
-    ? { ...row, text: '[Temporary planner]', deliveryText: undefined, response: undefined } : row);
-  try { await writeDurableNow(STATE, durableRows(next)); }
+  try { await writeDurableNow(STATE, encodeInputState(next)); }
   catch (error) {
     // durable.ts retries failed generations. Never let a rejected send claim or
     // enqueue become live later behind the caller's back.
-    writeDurableSoon(STATE, durableRows(entries ?? []));
+    writeDurableSoon(STATE, encodeInputState(entries ?? []));
     throw error;
   }
   entries = next;
@@ -296,35 +267,38 @@ async function prepare(entry: InputEntry, suffix = ''): Promise<InputEntry> {
       : entry.text;
   const mandatoryOverhead = `${TOOL_INPUT_HEADER}\n\n${finishInstruction(getConfig().ui.finishLeadMinutes)}`;
   const deliveryText = entry.deliveryText ?? await deliveryHooks?.prepareText?.({ ...entry, text: text + suffix }, {
-    maxChars: MAX_CHATGPT_MESSAGE_CHARS, maxBytes: TOOL_INPUT_TEXT_BYTES - Buffer.byteLength(mandatoryOverhead)
+    maxChars: MAX_CHATGPT_MESSAGE_CHARS, maxBytes: MAX_TOOL_INPUT_TEXT_BYTES - Buffer.byteLength(mandatoryOverhead)
   }) ?? text + suffix;
   // A single input must fit the tool envelope by itself. Aggregate batching below
   // may defer a second input, but cannot silently defer an individually impossible one.
   const envelope = `${TOOL_INPUT_HEADER}${deliveryText}\n\n${finishInstruction(getConfig().ui.finishLeadMinutes)}`;
-  if (!deliveryText || deliveryText.length > MAX_CHATGPT_MESSAGE_CHARS || Buffer.byteLength(envelope) > TOOL_INPUT_TEXT_BYTES)
+  if (!deliveryText || deliveryText.length > MAX_CHATGPT_MESSAGE_CHARS || Buffer.byteLength(envelope) > MAX_TOOL_INPUT_TEXT_BYTES)
     throw new Error('Prepared message exceeds the delivery limit; shorten the request or plan');
   return { ...entry, deliveryText };
 }
-/** Explicit follow-ups spend one verified completed turn; each transport elects its eligible FIFO. */
-const queuedFollowup = (row: InputEntry): boolean => row.mode === 'finish' || (row.mode === 'after-turn' && !!row.sessionId && row.purpose !== 'decision');
+function authoredToolEnvelopeFits(text: string): boolean {
+  const instruction = finishInstruction(getConfig().ui.finishLeadMinutes);
+  return Buffer.byteLength(`${TOOL_INPUT_HEADER}${text}\n\n${instruction}`) <= MAX_TOOL_INPUT_TEXT_BYTES;
+}
 function append(current: InputEntry[], entry: InputEntry, stackDirect = false): InputEntry[] {
-  if (queuedFollowup(entry)) {
-    const positioned = current.filter(row => row.sessionId === entry.sessionId && queuedFollowup(row) && !terminal(row) && row.queueOrder !== undefined);
+  if (isFollowupInput(entry)) {
+    const positioned = current.filter(row => row.sessionId === entry.sessionId && isFollowupInput(row) && !terminal(row) && row.queueOrder !== undefined);
     if (positioned.length) entry = { ...entry, queueOrder: Math.max(...positioned.map(row => row.queueOrder!)) + 1 };
   }
   // Only ordinary browser sends occupy the global composer slot. Durable tool
   // intent can queue independently; actual handout still fences browser claims.
-  if (!stackDirect && entry.purpose !== 'decision' && !queuedFollowup(entry) && current.some(row => (row.transportIntent !== 'tool' || row.sessionId === entry.sessionId) && (row.sessionId === entry.sessionId || (!row.finishOwner && !entry.finishOwner)) && row.purpose !== 'decision' &&
+  if (!stackDirect && entry.purpose !== 'decision' && !isFollowupInput(entry) && current.some(row => (row.transportIntent !== 'tool' || row.sessionId === entry.sessionId) && (row.sessionId === entry.sessionId || (!row.finishOwner && !entry.finishOwner)) && row.purpose !== 'decision' &&
       !(!entry.finishOwner && row.finishOwner && row.state === 'tool') &&
-      (!queuedFollowup(row) || row.state === 'browser') && ['queued', 'browser', 'tool'].includes(row.state))) {
+      (!isFollowupInput(row) || row.state === 'browser') && ['queued', 'browser', 'tool'].includes(row.state))) {
     throw new Error('One message is already awaiting delivery. Cancel it before sending another.');
   }
   const active = current.filter((row) => !terminal(row) || needsHistory(row) || pendingStages(row));
   const reserved = (row: InputEntry) => row.stagesApplied ? [] : row.stages ?? [];
-  if ([...active, entry].reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify({ ...row, images: undefined, stages: reserved(row) })), 0) > 1024000) {
+  if ([...active, entry].reduce((sum, row) => sum + Buffer.byteLength(JSON.stringify({ ...row, images: undefined, projectedImages: undefined, stages: reserved(row) })), 0) > 1024000) {
     throw new Error('The message queue is full');
   }
   const imageBytes = (row: InputEntry): number => (row.images ?? []).reduce((sum, image) => sum + image.dataUrl.length, 0) +
+    (row.projectedImages ?? []).reduce((sum, image) => sum + image.size, 0) +
     (row.attachments ?? []).reduce((sum, file) => sum + (file.preview?.length ?? 0), 0);
   if ([...active, entry].reduce((sum, row) => sum + imageBytes(row), 0) > 4 * 1024 * 1024) throw new Error('The image queue is full');
   const history = current.filter((row) => terminal(row) && !needsHistory(row) && !pendingStages(row)).slice(-50);
@@ -352,22 +326,78 @@ async function finishInputCurrent(entry: InputEntry): Promise<boolean> {
     session.activeTurnId === entry.finishOwner.turnId && session.finishTurn?.turnId === entry.finishOwner.turnId &&
     !session.finishTurn.released && config.ui.finishTool === true && !isChatBlocked(session.conversationId) &&
     session.origin?.kind !== 'worker' && session.origin?.kind !== 'helper' &&
-    (entry.finishOwner.userRequested === true || automaticFinishEnabled(session.conversationId));
+    (entry.finishOwner.userRequested === true || authorityHooks.automaticFinishEnabled?.(session.conversationId) === true);
 }
-export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
-  return serial(async () => {
-    const input = inputArgs.parse(raw);
-    if (input.stages !== undefined && JSON.stringify([input.text, ...input.stages]).length > 12000)
-      throw new Error('Keep the complete plan below 12,000 characters');
+type PreparedImageProjection = { images: ProjectedImageRef[]; owner: { conversationId: string; turnId: string } };
+async function prepareImageProjection(input: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<PreparedImageProjection | null> {
+  if (input.attachmentDelivery !== 'tool-image-projection') return null;
+  if (!input.sessionId || input.mode !== 'auto' || finishOwner || input.stages?.length ||
+      (input.images?.length ?? 0) + (input.attachments?.length ?? 0) > MAX_PROJECTED_IMAGE_COUNT) {
+    throw new Error('Inject up to four images into an active chat; otherwise use Send or After this turn');
+  }
+  const [policy, owner] = await Promise.all([sessionInputPolicy(input.sessionId), getSession(input.sessionId)]);
+  if (!policy.canInject || !owner?.activeTurnId || !owner.conversationId) throw new Error('Inject images into an active chat');
+  return {
+    owner: { conversationId: owner.conversationId, turnId: owner.activeTurnId },
+    images: await createToolImageProjections(input.attachments ?? [])
+  };
+}
+
+export async function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
+  const input = inputArgs.parse(raw);
+  const fingerprint = JSON.stringify([input, finishOwner ?? null]);
+  const running = enqueueFlights.get(input.id);
+  if (running) {
+    if (running.fingerprint !== fingerprint) throw new Error('Message id already belongs to different input');
+    return { ...await running.work };
+  }
+  const work = enqueueInputOnce(input, finishOwner);
+  enqueueFlights.set(input.id, { fingerprint, work });
+  try {
+    const result = await work;
+    if (result.sessionId && result.conversationId && isFollowupInput(result) && result.state === 'queued') {
+      await deliveryHooks?.queuedAfterTurn?.(result).catch(error =>
+        logWarn(`input: could not reconcile queued instruction with recovered continuation: ${String(error)}`));
+    }
+    return result;
+  }
+  finally { if (enqueueFlights.get(input.id)?.work === work) enqueueFlights.delete(input.id); }
+}
+
+async function enqueueInputOnce(input: InputArgs, finishOwner?: InputEntry['finishOwner']): Promise<InputEntry> {
+  if (input.stages !== undefined && JSON.stringify([input.text, ...input.stages]).length > 12000)
+    throw new Error('Keep the complete plan below 12,000 characters');
+  // Sharp work is deliberately outside the outbox serialization. The exact source owner is
+  // captured before it and revalidated inside the commit transaction below.
+  const preparedProjection = await prepareImageProjection(input, finishOwner);
+  let projectionOwned = false;
+  try { return await serial(async () => {
     const current = await load();
     const prior = current.find((entry) => entry.id === input.id);
     if (prior) {
       if (JSON.stringify(inputArgs.parse({ ...prior, mode: prior.requestedMode ?? prior.mode })) !== JSON.stringify(input)) throw new Error('Message id already belongs to different input');
       return { ...prior };
     }
-    const policy = input.sessionId ? await sessionInputPolicy(input.sessionId) : null;
+    let policy = input.sessionId ? await sessionInputPolicy(input.sessionId) : null;
     const requestedMode = input.mode;
-    if (input.attachments?.length) {
+    if (input.mode === 'auto' && policy?.canInject && !authoredToolEnvelopeFits(input.text)) {
+      throw new Error('This message is too large for Current turn. Choose After this turn.');
+    }
+    let projectedImages = preparedProjection?.images;
+    let imageOwner = preparedProjection?.owner;
+    if (input.attachmentDelivery === 'tool-image-projection') {
+      if (preparedProjection && input.sessionId) {
+        const owner = await getSession(input.sessionId);
+        if (!policy?.canInject || owner?.activeTurnId !== preparedProjection.owner.turnId ||
+            owner.conversationId !== preparedProjection.owner.conversationId) {
+          throw new Error('The active chat changed while preparing images; send again');
+        }
+      }
+      if (!input.sessionId || input.mode !== 'auto' || finishOwner || input.stages?.length || !policy?.canInject ||
+          (input.images?.length ?? 0) + (input.attachments?.length ?? 0) > MAX_PROJECTED_IMAGE_COUNT)
+        throw new Error('Inject up to four images into an active chat; otherwise use Send or After this turn');
+      if (!projectedImages || !imageOwner) throw new Error('Image projection was not prepared');
+    } else if (input.attachments?.length) {
       await validateInputAttachments(input.attachments);
       // Native files belong to the next browser message, never a tool-result injection.
       if (finishOwner) throw new Error('Automatic finish messages cannot attach files');
@@ -379,10 +409,10 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     }
     // Unattributed work can fence browser Send without making this chat a tool recipient.
     // Leave that input neutral until the existing serialized claim selects a safe transport.
-    const transportIntent = input.attachments?.length ? 'browser' as const : input.mode === 'auto' && !finishOwner
+    const transportIntent = input.attachmentDelivery === 'tool-image-projection' ? 'tool' as const : input.attachments?.length ? 'browser' as const : input.mode === 'auto' && !finishOwner
       ? policy?.canInject ? 'tool' as const : !policy || policy.browserAllowed || policy.directTurn ? 'browser' as const : undefined : undefined;
     const directTurn = input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
-    const entry: InputEntry = { ...input, ...(directTurn ? { directTurn } : {}), ...(transportIntent ? { transportIntent } : {}), ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
+    const entry: InputEntry = { ...input, ...(projectedImages ? { projectedImages } : {}), ...(directTurn ? { directTurn } : {}), ...(transportIntent ? { transportIntent } : {}), ...(requestedMode !== input.mode ? { requestedMode } : {}), ...(finishOwner ? { finishOwner } : {}), state: 'queued', owner: null, createdAt: Date.now(), conversationId: null };
     if (input.projectId) {
       await resolveAvailableProjectDirectory(input.projectId);
       const era = currentProjectAuthorityEra();
@@ -397,6 +427,12 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     }
     entry.conversationId = await target(entry);
     if (finishOwner && !(await finishInputCurrent(entry))) throw new Error('The automatic follow-up no longer belongs to an active turn');
+    if (imageOwner) {
+      policy = await sessionInputPolicy(input.sessionId!);
+      const owner = await getSession(input.sessionId!);
+      if (!policy.canInject || owner?.activeTurnId !== imageOwner.turnId || owner.conversationId !== imageOwner.conversationId || entry.conversationId !== imageOwner.conversationId)
+        throw new Error('The active chat changed while preparing images; send again');
+    }
     // User input supersedes only automatic work that has never been handed out.
     // Offered tool receipts retain their identity until a later request proves receipt.
     const prioritized = !finishOwner ? current.map(row => row.sessionId === entry.sessionId && row.finishOwner && row.state === 'queued'
@@ -406,8 +442,14 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     // checkpoint atomically; no composer text or first-send receipt owns its life.
     if (entry.mode === 'finish') next = materializeStages(next, entry);
     await commit(next);
+    projectionOwned = true;
     return { ...next.find(row => row.id === entry.id)! };
-  });
+  }); } finally {
+    if (preparedProjection && !projectionOwned) {
+      await deleteToolImageProjections(preparedProjection.images)
+        .catch(error => logWarn(`input: could not roll back unused image projection: ${String(error)}`));
+    }
+  }
 }
 function materializeStages(current: InputEntry[], entry: InputEntry): InputEntry[] {
   const sessionId = entry.sessionId ?? entry.deliveredSessionId;
@@ -438,6 +480,18 @@ export function listInputs(): Promise<InputEntry[]> {
     return ordered(await load()).map((entry) => ({ ...entry }));
   });
 }
+/** The outbox owns blob lifetime. IPC/staging must not reconstruct this state machine. */
+export function retainedInputBlobIds(): Promise<Set<string>> {
+  return serial(async () => {
+    const current = await load();
+    const retained = new Set<string>();
+    for (const row of current) {
+      if (!terminal(row)) for (const file of row.attachments ?? []) retained.add(file.id);
+      if (!terminal(row) || needsHistory(row)) for (const image of row.projectedImages ?? []) retained.add(image.id);
+    }
+    return retained;
+  });
+}
 /** A sent receipt survives a recorder failure. Existing outbox reads retry publication,
  * never transport; the stable canonical key makes a lost recording ACK idempotent. */
 async function publishHistory(): Promise<void> {
@@ -449,7 +503,18 @@ async function publishHistory(): Promise<void> {
     catch { /* delivered, retained, and still visible until canonical recording succeeds */ }
   }
   if (recorded.size) {
-    try { await commit(current.map(row => recorded.has(row.id) ? { ...row, historyRecorded: true } : row)); }
+    const releasedProjections = current.flatMap(row => recorded.has(row.id) && terminal(row) ? row.projectedImages ?? [] : []);
+    try {
+      await commit(current.map(row => recorded.has(row.id)
+        // The projection is transport material, not authored identity. Once canonical history
+        // owns its asset bytes *and receipt is terminal*, retaining another base64 copy in the
+        // outbox only burns durable quota. A live tool offer still needs the bytes for same-call
+        // replay until a later exact invocation proves receipt. Authored identity stays intact.
+        ? { ...row, historyRecorded: true, ...(terminal(row) ? { projectedImages: undefined } : {}) }
+        : row));
+      if (releasedProjections.length) void deleteToolImageProjections(releasedProjections)
+        .catch(error => logWarn(`input: could not prune recorded image projection: ${String(error)}`));
+    }
     catch { /* the durable delivery receipt remains; canonical retry is idempotent */ }
   }
 }
@@ -472,7 +537,7 @@ export function cancelInput(id: string): Promise<boolean> {
 export function reorderQueuedInputs(sessionId: string, ids: string[]): Promise<boolean> {
   return serial(async () => {
     const current = await load();
-    const queue = current.filter(row => row.sessionId === sessionId && queuedFollowup(row) && row.state === 'queued');
+    const queue = current.filter(row => row.sessionId === sessionId && isFollowupInput(row) && row.state === 'queued');
     // A stale snapshot must not move claimed input or omit newly queued work.
     if (!ids.length || ids.length !== queue.length || new Set(ids).size !== ids.length ||
         queue.some(row => !ids.includes(row.id))) return false;
@@ -496,9 +561,9 @@ export function cancelFinishInputs(periodicOnly: boolean): Promise<void> {
 
 export function editQueuedInput(id: string, text: string, afterTurn?: boolean): Promise<boolean> {
   return serial(async () => {
-    const value = z.string().trim().min(1).max(16000).parse(text);
+    const value = inputArgs.shape.text.parse(text);
     const current = await load();
-    const row = current.find(entry => entry.id === id && entry.state === 'queued' && queuedFollowup(entry));
+    const row = current.find(entry => entry.id === id && entry.state === 'queued' && isFollowupInput(entry));
     if (!row) return false;
     if (current.filter(entry => !terminal(entry)).reduce((sum, entry) => sum + Buffer.byteLength(entry === row ? value : entry.text), 0) > 1024000) throw new Error('Queued messages exceed the text limit');
     await commit(current.map(entry => entry === row ? { ...row, text: value, ...(afterTurn === undefined ? {} : { afterTurn }), deliveryText: undefined } : entry));
@@ -584,38 +649,133 @@ export function noteInputStartupError(id: string, error: string | null): Promise
     return { ...next };
   });
 }
+function queuedAfterTurn(row: InputEntry, session: SessionSummary): boolean {
+  const astra = session.selectedModel?.conversationId === session.conversationId &&
+    isAstraModel(session.selectedModel.model, session.selectedModel.reasoningEffort);
+  return row.sessionId === session.id && isFollowupInput(row) && row.state === 'queued' && row.dueAt <= Date.now() &&
+    (row.mode !== 'finish' || row.afterTurn === true || !astra);
+}
+export async function hasQueuedAfterTurnInput(sessionId: string): Promise<boolean> {
+  return serial(async () => {
+    const session = await getSession(sessionId);
+    return !!session && (await load()).some(row => queuedAfterTurn(row, session));
+  });
+}
+
+export type RecoveryInputBinding =
+  | { kind: 'none' }
+  | { kind: 'invalid' }
+  | { kind: 'blocked' }
+  | { kind: 'bound'; inputId: string };
+
+/**
+ * Give one already-proven recovery checkpoint to the durable user-input outbox.
+ *
+ * This function deliberately does not synthesize or choose a Goal continuation. It answers the
+ * arbitration question the outbox alone can answer: is there an explicit user instruction that
+ * owns this checkpoint, or transport custody that prevents anybody else from taking it? The
+ * caller may consider synthetic Goal work only after `none`.
+ */
+export function bindRecoveryToQueuedInput(input: {
+  sessionId: string;
+  conversationId: string;
+  grant: RecoveryGrant;
+  current: () => boolean;
+}): Promise<RecoveryInputBinding> {
+  return serial(async () => {
+    const current = await load();
+    const session = await getSession(input.sessionId);
+    if (!input.current() || !session || session.conversationId !== input.conversationId || isChatBlocked(input.conversationId) ||
+        session.origin?.kind === 'worker' || session.origin?.kind === 'helper' || inFlightToolCalls(input.conversationId) > 0) return { kind: 'invalid' };
+    const proof = input.grant.proof;
+    if (proof.conversationId !== input.conversationId || !await validateRecoveryProof(input.sessionId, proof) || !input.current()) return { kind: 'invalid' };
+    const sameBoundary = current.find(row => row.sessionId === input.sessionId && row.followupPermit &&
+      followupPermitTurnId(row.followupPermit) === proof.turnId);
+    if (sameBoundary?.state === 'browser') return { kind: 'bound', inputId: sameBoundary.id };
+    if (sameBoundary && sameBoundary.state !== 'queued') return { kind: 'blocked' };
+    if (current.some(row => row.sessionId === input.sessionId && (row.state === 'browser' || row.state === 'tool'))) return { kind: 'blocked' };
+    // One source turn may own at most one outbox row. If a queued row already names this turn,
+    // update that exact row or block; never select a second row and duplicate the checkpoint.
+    if (sameBoundary && !queuedAfterTurn(sameBoundary, session)) return { kind: 'blocked' };
+    const row = sameBoundary ?? ordered(current).find(row => queuedAfterTurn(row, session));
+    if (!row) return { kind: 'none' };
+    const held = recoveryGrantFor(row);
+    if (held?.proof.turnId === proof.turnId && held.proof.kind === proof.kind &&
+        held.proof.headSeq === proof.headSeq && held.proof.mcpCallSeq === proof.mcpCallSeq) return { kind: 'bound', inputId: row.id };
+    if (!input.current()) return { kind: 'invalid' };
+    // A settled failure is stronger causal proof than a recovered-silence assumption for the
+    // same source turn, but it does not prove the provider stopped after native Stop. Preserve
+    // that exact turn's existing busy-listen deadline while replacing the proof itself.
+    const grant: RecoveryGrant = held?.proof.turnId === proof.turnId && held.notBefore
+      ? { ...input.grant, notBefore: Math.max(held.notBefore, input.grant.notBefore ?? 0) }
+      : input.grant;
+    await commit(current.map(entry => entry === row ? { ...entry, followupPermit: { kind: 'recovery', grant } } : entry));
+    return { kind: 'bound', inputId: row.id };
+  });
+}
+
+/** Provider busy extends an existing proof; it never grants Send authority. */
+export function deferRecoveryInput(id: string, conversationId: string, turnId: string): Promise<boolean> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === id && entry.state === 'queued' && entry.followupPermit?.kind === 'recovery' &&
+      entry.followupPermit.grant.proof.conversationId === conversationId && entry.followupPermit.grant.proof.turnId === turnId);
+    if (row?.followupPermit?.kind !== 'recovery' || !await validateFollowupPermit(row, id => authorityHooks.recoveryAllowed?.(id) === true)) return false;
+    const permit: FollowupPermit = { kind: 'recovery', grant: deferRecoveryGrant(row.followupPermit.grant) };
+    await commit(current.map(entry => entry === row ? { ...row, followupPermit: permit } : entry));
+    return true;
+  });
+}
+
+function requeueWithoutSpentPermit(row: InputEntry, preserveRecovery = false): InputEntry {
+  return { ...row, state: 'queued', owner: null, followupPermit: preserveRecovery && row.followupPermit?.kind === 'recovery' ? row.followupPermit : undefined,
+    offeredAt: undefined, sendAuthorizedAt: undefined, requiresAuthorization: undefined, deliveryText: undefined, error: undefined };
+}
+/** New work revokes an unspent ticket. Authorized sends retain custody until their exact receipt/failure. */
+export function revokeRecoveryInputs(sessionId: string): Promise<void> {
+  return serial(async () => {
+    const current = await load();
+    const next = current.map(row => row.sessionId === sessionId && row.followupPermit?.kind === 'recovery' &&
+      (row.state === 'queued' || (row.state === 'browser' && row.sendAuthorizedAt === undefined)) ? requeueWithoutSpentPermit(row) : row);
+    if (next.some((row, index) => row !== current[index])) await commit(next);
+  });
+}
+
 /** Metadata only. Text is disclosed to one document only after an exclusive durable claim. */
-async function completedStageBoundary(entry: InputEntry, current: InputEntry[]): Promise<string | null> {
-  if (!entry.sessionId || !queuedFollowup(entry)) return null;
+async function claimableFollowupPermit(entry: InputEntry, current: InputEntry[]): Promise<FollowupPermit | null> {
+  if (!entry.sessionId || !isFollowupInput(entry)) return null;
   // Finish-only stages have no browser authority. They must not block a later
   // explicit After This Turn instruction from spending this completed turn.
   let first: InputEntry | undefined;
   for (const row of ordered(current)) {
-    if (row.sessionId === entry.sessionId && queuedFollowup(row) && row.state === 'queued' && row.dueAt <= Date.now() && await browserInputAllowed(row)) { first = row; break; }
+    if (row.sessionId === entry.sessionId && isFollowupInput(row) && row.state === 'queued' && row.dueAt <= Date.now() && await browserInputAllowed(row)) { first = row; break; }
   }
   if (first?.id !== entry.id) return null;
-  const session = await getSession(entry.sessionId);
-  if (!session || session.activeTurnId || session.origin?.kind === 'worker') return null;
-  // The newest exact lifecycle event must be completion, never interruption, a
-  // historical final, or merely an idle page. One durable claim spends this end.
-  const [end] = await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
-  if (end?.kind !== 'turn_end' || end.outcome !== 'completed' || !end.turnId || end.time < entry.createdAt) return null;
-  if (current.some(row => row.sessionId === entry.sessionId && (row.completedTurnId === end.turnId || row.state === 'tool' || row.state === 'browser'))) return null;
-  if (current.some(row => row.sessionId === entry.sessionId && !queuedFollowup(row) && row.purpose !== 'decision' &&
+  const permit = await validateFollowupPermit(entry, id => authorityHooks.recoveryAllowed?.(id) === true);
+  if (!permit) return null;
+  const turnId = followupPermitTurnId(permit);
+  // One source turn releases at most one row. A claimed, sent, failed-ambiguous or deferred row
+  // retains that spent boundary in durable history so a restart cannot hand the same turn to the
+  // next queued checkpoint.
+  if (current.some(row => row !== entry && row.sessionId === entry.sessionId && row.followupPermit &&
+      followupPermitTurnId(row.followupPermit) === turnId)) return null;
+  if (current.some(row => row.sessionId === entry.sessionId && row.state === 'tool')) return null;
+  if (current.some(row => row.sessionId === entry.sessionId && !isFollowupInput(row) && row.purpose !== 'decision' &&
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
-  return end.turnId;
+  return permit;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recoveryTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
+    const result: Array<{ id: string; conversationId: string | null; recoveryTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (!preparable(entry) || entry.dueAt > Date.now()) continue;
-      if (queuedFollowup(entry) && !(entry.state === 'browser' && entry.completedTurnId) && !(await completedStageBoundary(entry, current))) continue;
+      if (isFollowupInput(entry) && !(entry.state === 'browser' && entry.followupPermit) && !(await claimableFollowupPermit(entry, current))) continue;
       if (!(await browserInputAllowed(entry))) continue;
       try {
         const conversationId = await target(entry);
         result.push({ id: entry.id, conversationId,
+          ...(entry.followupPermit?.kind === 'recovery' ? { recoveryTurnId: entry.followupPermit.grant.proof.turnId } : {}),
           ...(entry.directTurn ? { directTurn: entry.directTurn } : {}),
           ...(entry.state === 'queued' && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId && entry.conversationId !== conversationId
             ? { supersededConversationId: entry.conversationId } : {}),
@@ -630,18 +790,18 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     const current = await load();
     const entry = current.find((row) => row.id === id);
     if (!entry || !preparable(entry) || (entry.state === 'browser' && !requiresAuthorization) || entry.dueAt > Date.now() || !owner) return null;
-    const completedTurnId = queuedFollowup(entry) ? entry.state === 'browser' ? entry.completedTurnId : await completedStageBoundary(entry, current) : undefined;
-    if (queuedFollowup(entry) && !completedTurnId) return null;
+    const followupPermit = isFollowupInput(entry) ? entry.state === 'browser' ? entry.followupPermit : await claimableFollowupPermit(entry, current) : undefined;
+    if (isFollowupInput(entry) && !followupPermit) return null;
     if (await target(entry) !== conversationId) return null;
     if (!(await browserInputAllowed(entry))) return null;
     if (entry.purpose === 'decision' && !decisionWaiters.has(id)) return null;
     if (entry.projectId) await resolveAvailableProjectDirectory(entry.projectId);
     if (entry.sessionId) {
       if (current.some((row) => row.id !== id && row.sessionId === entry.sessionId && ['browser', 'tool'].includes(row.state))) return null;
-      const first = ordered(current).find((row) => row.sessionId === entry.sessionId && row.state === 'queued' && queuedFollowup(row) === queuedFollowup(entry) && row.dueAt <= Date.now());
-      // Follow-ups were already elected by completedStageBoundary with live
+      const first = ordered(current).find((row) => row.sessionId === entry.sessionId && row.state === 'queued' && isFollowupInput(row) === isFollowupInput(entry) && row.dueAt <= Date.now());
+      // Follow-ups were already elected by claimableFollowupPermit with live
       // transport eligibility. Direct messages retain their separate FIFO.
-      if (entry.state === 'queued' && !queuedFollowup(entry) && first !== entry) return null;
+      if (entry.state === 'queued' && !isFollowupInput(entry) && first !== entry) return null;
     }
     // The completion appendix is mandatory text too: budget it before optional AGENTS.md,
     // then freeze the complete message once. A repeated claim keeps those exact bytes.
@@ -654,7 +814,7 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
       ? finishInstruction(settings.finishLeadMinutes) : '';
     const suffix = instruction && !entry.text.includes(instruction) ? '\n\n' + instruction : '';
     let claimed: InputEntry;
-    try { claimed = await prepare({ ...entry, ...(completedTurnId ? { completedTurnId } : {}),
+    try { claimed = await prepare({ ...entry, ...(followupPermit ? { followupPermit } : {}),
       ...(entry.transportIntent === 'tool' ? { transportIntent: 'browser' } : {}),
       state: 'browser', owner, conversationId, offeredAt: entry.offeredAt ?? Date.now(), requiresAuthorization }, suffix); }
     catch (error) {
@@ -790,7 +950,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
     let payloadFull = false;
     const prepareEntry = async (entry: InputEntry): Promise<InputEntry> => {
       if (entry.sessionId !== sessionId || entry.dueAt > Date.now()) return entry;
-      if (entry.attachments?.length) return entry;
+      if (entry.attachments?.length && entry.attachmentDelivery !== 'tool-image-projection') return entry;
       if (entry.directTurn && entry.state === 'queued' && session.activeTurnId !== entry.directTurn.id) return entry;
       // ChatGPT may reuse one request id for the whole server turn. Receipt follows
       // the actual invocation start, never a change in that grouping id.
@@ -799,7 +959,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
       if (payloadFull || (inputTaken && (entry.mode === 'finish' || entry.finishOwner)) || (entry.finishOwner && entry.createdAt >= startedAt)) return entry;
       if (entry.mode === 'finish' && !finishBoundary) return entry;
       // After-turn tasks own a future browser turn; they cannot block an explicit
-      // Inject now message from the current tool response. Their own FIFO is unchanged.
+      // Current-turn message from the next tool response. Their own FIFO is unchanged.
       if ((entry.state === 'queued' && (entry.mode === 'finish' || entry.mode === 'auto')) || entry.state === 'tool') {
         let prepared: InputEntry;
         try { prepared = await prepare({ ...entry, conversationId }); }
@@ -808,11 +968,12 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
         const reminder = finishReminder || batch.reminder || (entry.mode === 'finish' ? 'Work on this user task now.' : '');
         const messageBytes = Buffer.byteLength(message) + (inputTaken ? 2 : 0);
         const reminderBytes = reminder ? Buffer.byteLength(reminder) + 2 : 0;
-        if (payloadBytes + messageBytes + reminderBytes > TOOL_INPUT_TEXT_BYTES || payloadImages + (entry.images?.length ?? 0) > 4) { payloadFull = true; return entry; }
+        const images = [...entry.images ?? [], ...(entry.projectedImages?.length ? await readToolImageProjections(entry.projectedImages) : [])];
+        if (payloadBytes + messageBytes + reminderBytes > MAX_TOOL_INPUT_TEXT_BYTES || payloadImages + images.length > MAX_PROJECTED_IMAGE_COUNT) { payloadFull = true; return entry; }
         payloadBytes += messageBytes;
-        payloadImages += entry.images?.length ?? 0;
+        payloadImages += images.length;
         inputTaken = true;
-        batch.messages.push({ text: message, images: entry.images ?? [] });
+        batch.messages.push({ text: message, images });
         batch.reminder = reminder;
         delivered.push(entry.id);
         return { ...prepared, state: 'tool', offeredAt: entry.offeredAt ?? Date.now(), owner: entry.state === 'tool' ? entry.owner : requestId, conversationId };
@@ -832,7 +993,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
   });
 }
 
-export function resetInputForTests(): void { entries = null; chain = Promise.resolve(); offered.clear(); decisionWaiters.clear(); }
+export function resetInputForTests(): void { entries = null; chain = Promise.resolve(); enqueueFlights.clear(); offered.clear(); decisionWaiters.clear(); }
 
 export async function pausedBrowserHelpers(): Promise<Array<{ id: string; sourceSessionId: string }>> {
   return (await listInputs()).filter(row => row.purpose === 'decision' && row.state === 'cancelled' && !row.conversationId && row.decisionSourceSessionId)
@@ -853,7 +1014,7 @@ export function authorizeBrowserHelperRetry(id: string, sourceSessionId: string)
 }
 
 /** Only a pre-send failure can be declared failed. An ambiguous click stays claimed. */
-export function failBrowserInput(id: string, owner: string, error: string): Promise<boolean> {
+export function failBrowserInput(id: string, owner: string, error: string, reason?: BrowserInputFailureReason): Promise<boolean> {
   return serial(async () => {
     const current = await load();
     const entry = current.find((row) => row.id === id && row.owner === owner && row.state === 'browser');
@@ -864,7 +1025,17 @@ export function failBrowserInput(id: string, owner: string, error: string): Prom
     if (entry.projectId && entry.sendAuthorizedAt !== undefined) {
       await abortProjectSend(entry.id, entry.projectAuthorityEra);
     }
-    await commit(current.map((row) => row === entry ? { ...row, state: 'failed', error: error.slice(0, 200) } : row));
+    const pickupWithdrawn = !!entry.followupPermit && reason === 'pickup_withdrawn_before_send';
+    // Losing a document before Send does not lose a still-valid refresh ticket.
+    // Real work revokes its source proof independently and must earn a new window.
+    const currentPermit = pickupWithdrawn
+      ? await validateFollowupPermit(entry, id => authorityHooks.recoveryAllowed?.(id) === true)
+      : null;
+    const preserveRecovery = entry.followupPermit?.kind === 'recovery' && currentPermit?.kind === 'recovery' &&
+      currentPermit.grant.proof.headSeq === entry.followupPermit.grant.proof.headSeq;
+    await commit(current.map((row) => row === entry ? (pickupWithdrawn
+      ? requeueWithoutSpentPermit(row, preserveRecovery)
+      : { ...row, state: 'failed', error: error.slice(0, 200) }) : row));
     decisionWaiters.get(id)?.reject(new Error('goal_browser_send_failed'));
     decisionWaiters.delete(id);
     return true;
@@ -911,7 +1082,7 @@ export async function requestBrowserDecision(text: string, signal: AbortSignal, 
       if (options.sourceSessionId && !options.conversationId && current.some(row => row.decisionSourceSessionId === options.sourceSessionId && row.state === 'cancelled' && !row.conversationId)) {
         throw new Error('goal_browser_send_unconfirmed');
       }
-      const entry = entrySchema.parse({ id, sessionId: null, text, mode: 'after-turn', dueAt: Date.now(),
+      const entry = inputEntrySchema.parse({ id, sessionId: null, text, mode: 'after-turn', dueAt: Date.now(),
         model: options.model ?? 'gpt-5.6-sol', reasoningEffort: options.reasoningEffort ?? 'high',
         decisionSourceSessionId: options.sourceSessionId, lifetime: options.lifetime, purpose: 'decision', state: 'queued', owner: null,
         createdAt: Date.now(), conversationId: options.conversationId ?? null });

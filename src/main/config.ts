@@ -167,6 +167,7 @@ const DEFAULT_MULTI_AGENT: MultiAgentSettings = {
   enabled: false,
   maxWorkers: 2,
   allowUnattributedCalls: false,
+  allowUnattributedComputerControl: false,
   // Off: Goal/Loop chats are always recovered, and reopening anything else — a worker, a prime,
   // a plain chat that once called a tool — is the user's choice to make.
   recoverAgentTabs: false
@@ -186,7 +187,10 @@ const ALL_FIRST_LAUNCH_CAPABILITIES: Capabilities = Object.fromEntries(
 const FIRST_LAUNCH_MULTI_AGENT: MultiAgentSettings = {
   ...DEFAULT_MULTI_AGENT,
   enabled: true,
-  allowUnattributedCalls: true
+  allowUnattributedCalls: true,
+  // Computer input was historically identity-gated even when unattributed file/shell work was
+  // permitted. Keep that stronger boundary until the user explicitly opts into the wider action.
+  allowUnattributedComputerControl: false
 };
 
 const rootSchema = z.object({
@@ -355,6 +359,7 @@ const configSchema = z.object({
     defaultReasoning: z.enum(['', ...REASONING_EFFORTS]).optional(),
       maxWorkers: z.number().int().min(1).max(8).optional().default(DEFAULT_MULTI_AGENT.maxWorkers),
       allowUnattributedCalls: z.boolean().optional().default(DEFAULT_MULTI_AGENT.allowUnattributedCalls),
+      allowUnattributedComputerControl: z.boolean().optional().default(DEFAULT_MULTI_AGENT.allowUnattributedComputerControl),
       recoverAgentTabs: z.boolean().optional().default(DEFAULT_MULTI_AGENT.recoverAgentTabs)
     })
     .optional()

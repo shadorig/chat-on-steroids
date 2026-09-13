@@ -12,13 +12,19 @@ export interface UsageModelTokens {
   reasoningEffort: string | null;
   /** Legacy rows with no recorded model use GPT-5.6 High, visibly marked as assumed. */
   assumed: boolean;
-  tokens: number;
+  /** Historical local context estimate, unaffected by today's comparison policy. */
+  rawEstimatedTokens: number;
+  /** Context after the current comparison cap, before the editable divisor projection. */
+  comparisonTokens: number;
 }
 export interface UsageOverview {
+  /** Account-wide comparison heuristic selected from the current observed model catalog. */
+  comparisonContextCap: number;
   limits: ModelUsage[];
-  days: Array<{ date: string; tokens: number; models: UsageModelTokens[] }>;
+  days: Array<{ date: string; rawEstimatedTokens: number; comparisonTokens: number; models: UsageModelTokens[] }>;
   models: UsageModelTokens[];
-  tokens: number;
+  rawEstimatedTokens: number;
+  comparisonTokens: number;
   sessions: number;
 }
 export interface UsageFormula {
@@ -26,7 +32,9 @@ export interface UsageFormula {
   multiplier: number;
   rates: Record<string, number | null>;
 }
-// Standard short-context cached-input comparison rates verified 2026-09-07.
+/** Provenance for the editable official comparison baselines below. */
+export const DEFAULT_USAGE_RATES_VERIFIED_AT = '2026-09-07';
+// Standard short-context cached-input comparison rates verified on the date above.
 // GPT-6 Pro is ChatGPT's Astra label; Astra cached input is $1 per million tokens.
 // Sources are linked next to the editable formula and in usage-model-attribution.md.
 export const DEFAULT_USAGE_FORMULA: UsageFormula = {
@@ -62,14 +70,14 @@ export function usageModelKey(row: Pick<UsageModelTokens, 'model' | 'reasoningEf
   return JSON.stringify([row.model, row.reasoningEffort, row.assumed]);
 }
 /** Cache stores the baseline /2 estimate; formula edits are a cheap projection, never a transcript reread. */
-export function usageEstimate(rows: readonly UsageModelTokens[], formula: UsageFormula): { tokens: number; cost: number; unpricedTokens: number } {
-  let tokens = 0, cost = 0, unpricedTokens = 0;
+export function usageEstimate(rows: readonly UsageModelTokens[], formula: UsageFormula): { comparisonTokens: number; cost: number; unpricedTokens: number } {
+  let comparisonTokens = 0, cost = 0, unpricedTokens = 0;
   for (const row of rows) {
-    const amount = row.tokens * 2 / formula.divisor;
-    tokens += amount;
+    const amount = row.comparisonTokens * 2 / formula.divisor;
+    comparisonTokens += amount;
     const rate = usageRate(row.model, formula);
     if (typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) cost += amount / 1e6 * rate * formula.multiplier;
     else unpricedTokens += amount;
   }
-  return { tokens, cost, unpricedTokens };
+  return { comparisonTokens, cost, unpricedTokens };
 }

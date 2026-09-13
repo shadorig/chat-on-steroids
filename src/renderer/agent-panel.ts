@@ -12,12 +12,12 @@ export function createAgentPanel(options: {
   working: (summary: SessionSummary) => boolean;
 }) {
   const pane = el('aside', 'agent-panel'); pane.hidden = true;
-  ui(pane, 'aria-label', () => t("Sub-agents"));
+  ui(pane, 'aria-label', () => t("Workers"));
   const head = el('div', 'agent-panel-header');
-  const back = el('button', 'btn', '←'); ui(back, 'title', () => t("Back to sub-agents")); back.setAttribute('type', 'button');
+  const back = el('button', 'btn', '←'); ui(back, 'title', () => t("Back to workers")); back.setAttribute('type', 'button');
   back.setAttribute('aria-label', back.title);
-  const title = el('strong', '', () => t("Sub-agents"));
-  const close = el('button', 'btn', '×'); close.setAttribute('type', 'button'); ui(close, 'aria-label', () => t("Close sub-agents"));
+  const title = el('strong', '', () => t("Workers"));
+  const close = el('button', 'btn', '×'); close.setAttribute('type', 'button'); ui(close, 'aria-label', () => t("Close workers"));
   const body = el('div', 'agent-panel-body');
   head.append(back, title, close); pane.append(head, body); options.host.append(pane);
   let parent: string | null = null, workers: SessionSummary[] = [], selected: string | null = null;
@@ -30,11 +30,11 @@ export function createAgentPanel(options: {
     pane.hidden = false; options.host.classList.add('has-agent-panel'); options.toggle.setAttribute('aria-expanded', 'true');
   }
   function list(): void {
-    generation++; selected = null; back.hidden = true; ui(title, 'textContent', () => t("Sub-agents")); body.replaceChildren();
+    generation++; selected = null; back.hidden = true; ui(title, 'textContent', () => t("Workers")); body.replaceChildren();
     for (const active of [true, false]) {
       const group = workers.filter(worker => options.working(worker) === active);
       body.append(el('h3', '', () => `${active ? t("Active") : t("History")} · ${group.length}`));
-      if (!group.length) { body.append(el('p', 'meta', () => active ? t("No active sub-agents") : t("No recorded sub-agents"))); continue; }
+      if (!group.length) { body.append(el('p', 'meta', () => active ? t("No active workers") : t("No recorded workers"))); continue; }
       for (const worker of group) {
         const row = el('button', 'agent-panel-row'); row.setAttribute('type', 'button');
         row.append(el('span', 'agent-avatar', worker.origin?.agentId?.replace(/^worker-/, '') ?? '•'), el('span', '', worker.title));
@@ -73,7 +73,7 @@ export function createAgentPanel(options: {
       if (parent !== id) { hide(); parent = id; }
       const previous = workers.find(worker => worker.id === selected);
       workers = next; options.toggle.hidden = id === null;
-      ui(options.toggle, 'title', () => t("Sub-agents · {0} recorded", [workers.length]));
+      ui(options.toggle, 'title', () => t("Workers · {0} recorded", [workers.length]));
       if (pane.hidden) return;
       const latest = workers.find(worker => worker.id === selected);
       if (!selected || !latest) list();

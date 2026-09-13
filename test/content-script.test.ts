@@ -85,6 +85,12 @@ interface Hook {
   readDescriptor(raw: unknown): Descriptor | null;
   controlState(input: Record<string, unknown>): { mode: string; label: string; hint: string; action: string };
   stageView(input: Record<string, unknown>): StagePanelView | null;
+  nextThinkingFailureWatch(
+    watch: { observedAt: number; phase: string } | null,
+    now: number,
+    changedAt: number,
+    toolCount: number
+  ): { observedAt: number; phase: string } | null;
   /** The goal loop's half of the same panel, testable without a job in the way. */
   goalStageView(goal: Record<string, unknown> | null): StagePanelView | null;
   settingsView(input: Record<string, unknown>): {
@@ -550,6 +556,48 @@ describe('desktop input delivery and helper ownership', () => {
   const chatB = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
   const text = 'Inspect the exact requested task';
   const claimed = (extra: Record<string, unknown> = {}) => ({ id: inputId, owner: 'input-owner', text, model: null, reasoningEffort: null, purpose: 'user', images: [], ...extra });
+  it('reports native Stop for a recovery continuation without claiming or interrupting the turn', async () => {
+    live = await harness();
+    startGenerating(live.document); live.hook.observe(); await settle();
+    const id = emitted(live.sent, 'turn_start').at(-1)!.event.turnId;
+    const stops = vi.fn(); live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stops);
+    const sends = watchSend(live.document);
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, recoveryTurnId: id })).toEqual({ ok: false });
+    expect(live.sent.filter(row => row.type === 'desktop_input')).toEqual([
+      expect.objectContaining({ recoveryBusyTurnId: id })
+    ]);
+    expect(stops).not.toHaveBeenCalled(); expect(sends()).toBe(0);
+  });
+  it.each(['accepted', 'interim', 'refused'])('keeps a recovery continuation revocable through native Send (%s)', async change => {
+    let recoveryTurnId: string;
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: async message => {
+        if (message.authorize) {
+          if (change === 'interim') {
+            live!.reply.set('activity', () => ({ ok: true, data: { stream: [{ kind: 'assistant_message', seq: 91,
+              turnId: recoveryTurnId, messageId: 'fresh-interim', text: 'Still working', state: 'streaming' }], entries: [], pendingTools: 0 } }));
+            await live!.hook.pullActivity();
+          }
+          return { ok: true, data: { ok: change !== 'refused' } };
+        }
+        if (message.ack || message.fail) return { ok: true, data: { ok: true } };
+        return { ok: true, data: { input: claimed({ followupPermit: { kind: 'recovery', grant: { proof: { turnId: recoveryTurnId } } } }) } };
+      }
+    });
+    startGenerating(live.document); live.hook.observe(); await settle();
+    recoveryTurnId = emitted(live.sent, 'turn_start').at(-1)!.event.turnId as string;
+    stopGenerating(live.document); // The local projection still holds its uncertain turn.
+    const sends = watchSend(live.document);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      userTurn(live!.document, 'silence-next-user', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, recoveryTurnId })).toEqual({ ok: change === 'accepted' });
+    expect(sends()).toBe(change === 'accepted' ? 1 : 0);
+    if (change !== 'accepted') expect(live.sent.filter(row => row.fail)).toContainEqual(expect.objectContaining({
+      reason: 'pickup_withdrawn_before_send', error: 'After-turn pickup was withdrawn before Send.'
+    }));
+  });
   it.each(['accepted', 'refused', 'new-question', 'draft'])('direct delivery stops only the claimed source turn before normal Send (%s)', async change => {
     let directTurn: { id: string; startedAt: number };
     live = await nonProHarness(`https://chatgpt.com/c/${chatA}`, {
@@ -1404,7 +1452,7 @@ describe('desktop input delivery and helper ownership', () => {
         if (message.response) return new Promise(resolve => { release = resolve; responseStarted(); });
         return { ok: true, data: message.authorize ? { ok: true } : message.ack ? { ok: true } : { input: claimed({ purpose: 'decision' }) } };
       },
-      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null, goal: { enabled: true, hasKey: true, model: 'example', objective: '', blocked: '' } } }),
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null, goal: { effectiveEnabled: true, hasKey: true, model: 'example', objective: '', blocked: '' } } }),
       focus_tab: () => ({ ok: true })
     });
     live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
@@ -7599,6 +7647,175 @@ describe('how a turn is recorded as having ended', () => {
     });
   });
 
+  // Native Chrome shape captured 2026-09-12, with private conversation content omitted.
+  function thinkingFailed(section: HTMLElement): HTMLButtonElement {
+    const button = live!.document.createElement('button');
+    button.type = 'button'; button.setAttribute('aria-expanded', 'false');
+    button.textContent = 'Thinking failed';
+    section.append(button);
+    return button;
+  }
+  async function failedThinkingTurn() {
+    live = await harness();
+    // The generic harness advances time for incidental asynchronous waits. This
+    // boundary test owns its wall clock explicitly, down to the last millisecond.
+    let clock = live.window.Date.now();
+    live.window.Date.now = () => clock;
+    live.advance = ms => { clock += ms; };
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'failed-thinking-page-turn', []);
+    live.hook.observe(); await settle();
+    const id = emitted(live.sent, 'turn_start').at(-1)!.event.turnId as string;
+    const button = thinkingFailed(section);
+    stopGenerating(live.document);
+    live.hook.observe(); await settle();
+    return { section, button, id };
+  }
+  it('records Thinking failed promptly but requires 30 seconds silence and then five full minutes', async () => {
+    const { id } = await failedThinkingTurn();
+    expect(emitted(live!.sent, 'chat_error').map(row => row.event)).toContainEqual(
+      expect.objectContaining({ text: 'Thinking failed', turnId: id, recoverable: false }));
+    live!.advance(30_000); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(300_000 - 1); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(1); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: id, outcome: 'failed', reason: 'thinking_failed' })]);
+    live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toHaveLength(1);
+    expect(emitted(live!.sent, 'assistant_message').some(row => row.event.final)).toBe(false);
+  });
+  it('does not let a silence refresh ticket bypass the Thinking failed grace', async () => {
+    const { id } = await failedThinkingTurn();
+    expect(await live!.runtimeMessage({ type: 'clf-desktop-input', id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', recoveryTurnId: id })).toEqual({ ok: false });
+    expect(live!.sent.filter(row => row.type === 'desktop_input')).toEqual([]);
+  });
+  it.each(['tool_call', 'progress', 'assistant_message'])('returns Thinking failed to the ten-minute fallback on fresh %s, without counting replay', async kind => {
+    const { id } = await failedThinkingTurn();
+    live!.advance(240_000);
+    const entry = { seq: 51, time: Date.now(), kind, turnId: id, text: 'New model activity',
+      ...(kind === 'assistant_message' ? { messageId: 'interim', state: 'streaming' } : {}) };
+    live!.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [entry], pendingTools: 0, activeTurnId: id } }));
+    await live!.hook.pullActivity();
+    live!.advance(329_999);
+    await live!.hook.pullActivity(); // replay is not new model work
+    live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(1); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(270_001); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.outcome).toBe('stalled');
+  });
+  it('keeps Thinking failed open while a local tool runs and returns to the ten-minute fallback', async () => {
+    const { id } = await failedThinkingTurn();
+    let pendingTools = 1;
+    live!.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [], pendingTools, activeTurnId: id } }));
+    await live!.hook.pullActivity();
+    live!.advance(330_000); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    pendingTools = 0; await live!.hook.pullActivity();
+    live!.advance(329_999); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(1); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(270_001); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.outcome).toBe('stalled');
+  });
+  it.each(['tool_call', 'assistant_message'])('ignores delayed %s during the first fixed 30 seconds', async kind => {
+    const { id } = await failedThinkingTurn();
+    live!.advance(20_000);
+    const entry = { seq: 51, time: live!.window.Date.now(), kind, turnId: id, text: 'Delayed delivery',
+      ...(kind === 'assistant_message' ? { messageId: 'late-interim', state: 'streaming' } : {}) };
+    live!.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [entry], pendingTools: 0, activeTurnId: id } }));
+    await live!.hook.pullActivity();
+    live!.advance(309_999); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(1); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBe('thinking_failed');
+  });
+  it('restarts the failure grace after Stop returns, retaining a disappeared failure header', async () => {
+    const { button } = await failedThinkingTurn();
+    live!.advance(240_000); startGenerating(live!.document, { send: false });
+    live!.hook.observe(); await settle();
+    live!.advance(60_000); stopGenerating(live!.document);
+    live!.hook.observe(); await settle();
+    button.remove();
+    live!.advance(329_999); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    live!.advance(1); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBe('thinking_failed');
+  });
+  it('accepts a later exact native final during the failure grace as successful completion', async () => {
+    const { section } = await failedThinkingTurn();
+    live!.advance(60_000);
+    await bindFiberTurns([{ section, turn: { turnId: 'failed-thinking-page-turn', endMessageId: 'recovered-final',
+      messages: [{ messageId: 'recovered-final', rawMessageId: 'recovered-final', stable: true,
+        rawText: 'The answer completed.', renderedHtml: '<p>The answer completed.</p>' }] } }]);
+    await live!.hook.refreshFiber(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event).toMatchObject({ outcome: 'completed' });
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBeUndefined();
+  });
+  it('lets an explicit Thinking failed header outrank the provider interruption marker', async () => {
+    live = await harness();
+    let clock = live.window.Date.now(); live.window.Date.now = () => clock; live.advance = ms => { clock += ms; };
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'failed-and-interrupted-page-turn', []);
+    live.hook.observe(); await settle();
+    const id = emitted(live.sent, 'turn_start').at(-1)!.event.turnId as string;
+    thinkingFailed(section);
+    const marker = live.document.createElement('div'); marker.setAttribute('data-interrupted', 'true'); marker.textContent = 'Stopped'; section.append(marker);
+    stopGenerating(live.document); live.hook.observe(); await settle();
+    live.advance(330_000); live.hook.observe(); await settle();
+    expect(emitted(live.sent, 'turn_end').at(-1)?.event).toMatchObject({ turnId: id, outcome: 'failed', reason: 'thinking_failed' });
+  });
+  it('does not let the ten-minute watchdog preempt a late Thinking failed observation', async () => {
+    const { button } = await failedThinkingTurn();
+    // Return to an unknown quiet turn, then let the native failure appear after
+    // nine quiet minutes. It still receives the full 30s plus five-minute grace.
+    startGenerating(live!.document, { send: false });
+    button.remove(); live!.hook.observe(); await settle();
+    live!.advance(540_000);
+    const section = live!.document.querySelector('[data-turn-id="failed-thinking-page-turn"]') as HTMLElement;
+    thinkingFailed(section); stopGenerating(live!.document);
+    live!.hook.observe(); await settle();
+    live!.advance(329_999); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
+    expect(emitted(live!.sent, 'chat_error').some(row => row.event.recoverable === true)).toBe(false);
+    live!.advance(1); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBe('thinking_failed');
+  });
+  it('does not grant failure queue authority when a user replaces the turn before grace expires', async () => {
+    await failedThinkingTurn();
+    live!.advance(1000); startGenerating(live!.document);
+    assistantTurn(live!.document, 'next-response', []);
+    live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBeUndefined();
+    live!.advance(300_000); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toHaveLength(1);
+  });
+  it.each(['historical', 'quoted', 'hidden', 'user', 'own-ui'])('does not let a %s Thinking failed header fail the live turn', async location => {
+    live = await harness();
+    const old = assistantTurn(live.document, 'reused-page-id', []);
+    if (location === 'historical') thinkingFailed(old);
+    live.hook.observe(); await settle();
+    startGenerating(live.document);
+    const current = assistantTurn(live.document, 'reused-page-id', []);
+    if (location !== 'historical') {
+      const button = thinkingFailed(current);
+      if (location === 'quoted') { const md = live.document.createElement('div'); md.className = 'markdown'; current.append(md); md.append(button); }
+      if (location === 'hidden') button.hidden = true;
+      if (location === 'user') userTurn(live.document, 'quote', 'Quoted header', { sent: false }).append(button);
+      if (location === 'own-ui') { const own = live.document.createElement('div'); own.className = 'clf-stream'; current.append(own); own.append(button); }
+    }
+    live.hook.observe(); await settle();
+    stopGenerating(live.document); live.hook.observe(); await settle();
+    live.advance(300_000); live.hook.observe(); await settle();
+    expect(emitted(live.sent, 'turn_end')).toEqual([]);
+    if (location !== 'historical') expect(emitted(live.sent, 'chat_error')).toEqual([]);
+  });
+
   it('does not turn ordinary assistant prose into an error because it quotes transport-failure wording', async () => {
     live = await harness();
     startGenerating(live.document);
@@ -7651,10 +7868,9 @@ describe('how a turn is recorded as having ended', () => {
     live.hook.observe();
     await settle();
 
-    const [failure] = emitted(live.sent, 'chat_error').map((entry) => entry.event);
     const [started] = emitted(live.sent, 'turn_start').map((entry) => entry.event);
     expect(started.turnId).not.toBe('page-turn-from-history');
-    expect(failure.turnId).toBeUndefined();
+    expect(emitted(live.sent, 'chat_error')).toEqual([]);
   });
 
   it('does not let a reused page turn id make an old error belong to the current local generation', async () => {
@@ -9486,7 +9702,8 @@ describe('the Compact & resume control', () => {
           autoCompactReady: false,
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_333 },
           goal: {
-            enabled: false,
+            configuredEnabled: false,
+            effectiveEnabled: false,
             hasKey: true,
             model: 'deepseek/deepseek-v4-flash',
             objective: '',
@@ -9521,7 +9738,8 @@ describe('the Compact & resume control', () => {
     let stopClicks = 0;
     let compactCalls = 0;
     const workerGoal = {
-      enabled: false,
+      configuredEnabled: false,
+      effectiveEnabled: false,
       hasKey: true,
       model: 'test-model',
       objective: '',
@@ -9611,7 +9829,7 @@ describe('the Compact & resume control', () => {
       ok: true,
       data: {
         context: { auto: true, threshold: 300_000, warn: 300_000, limit: 400_000 },
-        goal: { enabled: false, hasKey: false, model: 'deepseek/deepseek-v4-flash' }
+        goal: { effectiveEnabled: false, hasKey: false, model: 'deepseek/deepseek-v4-flash' }
       }
     }));
     live.hook.injectControl();
@@ -9651,7 +9869,7 @@ describe('the Compact & resume control', () => {
           nextSince: 0,
           pendingTools: 0,
           job: null,
-          goal: { enabled, own: true, mode, hasKey: true, model: 'deepseek/deepseek-v4-flash', draft: null }
+          goal: { configuredEnabled: enabled, effectiveEnabled: enabled, own: true, mode, hasKey: true, model: 'deepseek/deepseek-v4-flash', draft: null }
         }
       })
     });
@@ -9669,7 +9887,7 @@ describe('the Compact & resume control', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 300_000, warn: 300_000, limit: 400_000 },
-          goal: { enabled, own: true, mode, hasKey: true, model: 'deepseek/deepseek-v4-flash' }
+          goal: { configuredEnabled: enabled, effectiveEnabled: enabled, own: true, mode, hasKey: true, model: 'deepseek/deepseek-v4-flash' }
         }
       };
     });
@@ -9718,7 +9936,7 @@ describe('the Compact & resume control', () => {
           nextSince: 0,
           pendingTools: 0,
           job: null,
-          goal: { enabled: true, hasKey: false, model: 'deepseek/deepseek-v4-flash', draft: null }
+          goal: { configuredEnabled: true, effectiveEnabled: true, hasKey: false, model: 'deepseek/deepseek-v4-flash', draft: null }
         }
       })
     });
@@ -10332,7 +10550,7 @@ describe('the Compact & resume control', () => {
           nextSince: 0,
           pendingTools: 0,
           job: null,
-          goal: { enabled: false, own: true, mode: 'goal', hasKey: true, model: 'deepseek/deepseek-v4-flash', objective: '', blocked }
+          goal: { effectiveEnabled: false, own: true, mode: 'goal', hasKey: true, model: 'deepseek/deepseek-v4-flash', objective: '', blocked }
         }
       })
     });
@@ -10806,6 +11024,18 @@ describe('truthful quiet operation status', () => {
     live = await harness();
     expect(live.hook.stageView({ now: 10000, changedAt: 0, generating: true })).toMatchObject({ stage: 'Still waiting for the current operation to complete' });
     expect(live.hook.stageView({ now: 10000, changedAt: 0, generating: false })).toBeNull();
+  });
+  it('models Thinking failed as one explicit grace transition and explains the wait', async () => {
+    live = await harness();
+    const observedAt = 1000;
+    const initial = { observedAt, phase: 'ignore-late' };
+    expect(live.hook.nextThinkingFailureWatch(initial, observedAt + 29_999, observedAt, 0)).toBe(initial);
+    const listening = live.hook.nextThinkingFailureWatch(initial, observedAt + 30_000, observedAt, 0);
+    expect(listening).toEqual({ observedAt, phase: 'listening' });
+    expect(live.hook.nextThinkingFailureWatch(listening, observedAt + 30_001, observedAt + 30_000, 0))
+      .toEqual({ observedAt, phase: 'resumed' });
+    expect(live.hook.stageView({ thinkingFailure: listening, now: observedAt + 30_001, changedAt: observedAt + 30_001 }))
+      .toMatchObject({ stage: 'ChatGPT reported Thinking failed', detail: 'This response may still resume.' });
   });
 });
 
@@ -13133,7 +13363,7 @@ describe('the goal loop', () => {
         nextSince: 0,
         pendingTools,
         job: null,
-        goal: { enabled: true, hasKey: true, model: MODEL, draft }
+        goal: { effectiveEnabled: true, hasKey: true, model: MODEL, draft }
       }
     });
   }
@@ -13231,7 +13461,8 @@ describe('the goal loop', () => {
           // The global switch may be off. A saved specific objective is still visible/usable,
           // but merely reopening an old chat must not synthesize a new Goal turn from history.
           goal: {
-            enabled: true,
+            configuredEnabled: true,
+            effectiveEnabled: true,
             hasKey: true,
             model: MODEL,
             objective: 'finish the overnight release',
@@ -13255,6 +13486,38 @@ describe('the goal loop', () => {
     expect(drafts(live)).toHaveLength(0);
   });
 
+  it('defers a Pro silence ticket on native Stop and picks up the same ticket after its listening window', async () => {
+    let offered = false;
+    const pending = { replyId: 'silence:pro', turnId: 'g-silence-pro', recovery: { proof: {
+      kind: 'recovered-silence', conversationId: CHAT, turnId: 'g-original', headSeq: 12, mcpCallSeq: 11, modelClass: 'pro'
+    }, notBefore: 0 }, acceptedAt: 1000, eventSeq: 12 };
+    const requested: any[] = [];
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      ...goalReplies(),
+      activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null,
+        goal: { effectiveEnabled: true, own: true, mode: 'loop', loopTrigger: 'after-turn', hasKey: true, model: MODEL,
+          pending: offered ? pending : null, draft: null } } }),
+      goal_draft: message => {
+        requested.push(message);
+        if (message.nativeBusy) {
+          pending.recovery.notBefore = live!.window.Date.now() + 300000;
+          return { ok: false, status: 409, data: { error: 'chat_still_working', retryable: true } };
+        }
+        return goalReplies().goal_draft();
+      }
+    });
+    const stop = live.document.createElement('button'); stop.setAttribute('data-testid', 'stop-button');
+    live.document.querySelector('[data-testid="composer-trailing-actions"]')!.append(stop);
+    offered = true; await live.hook.pullActivity(); await settle();
+    expect(requested).toHaveLength(1); expect(requested[0].nativeBusy).toBe(true);
+    stop.remove(); await live.hook.pullActivity(); await settle();
+    expect(requested).toHaveLength(1);
+    live.advance(300000); await live.hook.pullActivity(); await settle();
+    expect(requested).toHaveLength(2); expect(requested[1].nativeBusy).not.toBe(true);
+    expect(requested[1].turnId).toBe(pending.turnId);
+    expect(live.document.querySelector('#prompt-textarea')!.textContent).toBe('');
+  });
+
   it('resumes one durable stable-reply obligation after reload, only once ChatGPT is idle', async () => {
     let requested = 0;
     let offered = false;
@@ -13269,7 +13532,8 @@ describe('the goal loop', () => {
           pendingTools: 0,
           job: null,
           goal: {
-            enabled: true,
+            configuredEnabled: true,
+            effectiveEnabled: true,
             hasKey: true,
             model: MODEL,
             objective: 'finish the overnight release',
@@ -13306,7 +13570,8 @@ describe('the goal loop', () => {
           pendingTools: 0,
           job: null,
           goal: {
-            enabled: true,
+            configuredEnabled: true,
+            effectiveEnabled: true,
             hasKey: true,
             model: MODEL,
             objective: 'finish the overnight release',
@@ -13345,7 +13610,8 @@ describe('the goal loop', () => {
           pendingTools: 0,
           job: null,
           goal: {
-            enabled: true,
+            configuredEnabled: true,
+            effectiveEnabled: true,
             hasKey: true,
             model: MODEL,
             pending,
@@ -13399,7 +13665,7 @@ describe('the goal loop', () => {
     live = await harness(`https://chatgpt.com/c/${CHAT}`, {
       ...goalReplies(),
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0,
-        goal: { enabled, own: true, hasKey: true, model: MODEL, pending: enabled ? pending : null, draft: null } } }),
+        goal: { effectiveEnabled: enabled, own: true, hasKey: true, model: MODEL, pending: enabled ? pending : null, draft: null } } }),
       goal_draft: () => failure
     });
     const timer = live.window.setTimeout;
@@ -13461,7 +13727,7 @@ describe('the goal loop', () => {
             pendingTools: 0,
             job: null,
             bootstrap: 'resume',
-            goal: { enabled: true, hasKey: true, model: MODEL, objective, draft: null }
+            goal: { effectiveEnabled: true, hasKey: true, model: MODEL, objective, draft: null }
           }
         }),
         goal_draft: () => {
@@ -13589,7 +13855,7 @@ describe('the goal loop', () => {
                   pendingTools: 0,
                   job: null,
                   bootstrap: 'resume',
-                  goal: { enabled: true, hasKey: true, model: MODEL, objective, draft: null }
+                  goal: { effectiveEnabled: true, hasKey: true, model: MODEL, objective, draft: null }
                 }
               }
             : {
@@ -13721,7 +13987,8 @@ describe('the goal loop', () => {
                   job: null,
                   bootstrap: 'resume',
                   goal: {
-                    enabled: true,
+                    configuredEnabled: true,
+                    effectiveEnabled: true,
                     hasKey: true,
                     model: MODEL,
                     objective: 'finish the overnight release',
@@ -13835,8 +14102,8 @@ describe('the goal loop', () => {
   /** The switch is the app's, and the page reads it on every poll rather than remembering. */
   it('does nothing at all while the loop is off or has no key', async () => {
     for (const goal of [
-      { enabled: false, hasKey: true, model: MODEL, draft: null },
-      { enabled: true, hasKey: false, model: MODEL, draft: null }
+      { configuredEnabled: false, effectiveEnabled: false, hasKey: true, model: MODEL, draft: null },
+      { configuredEnabled: true, effectiveEnabled: true, hasKey: false, model: MODEL, draft: null }
     ]) {
       const page = await harness(`https://chatgpt.com/c/${CHAT}`, {
         activity: () => ({
@@ -13868,7 +14135,7 @@ describe('the goal loop', () => {
           nextSince: 0,
           pendingTools: 0,
           job: null,
-          goal: { enabled, hasKey: true, model: MODEL, draft }
+          goal: { effectiveEnabled: enabled, hasKey: true, model: MODEL, draft }
         }
       }),
       goal_ack: () => {
@@ -13901,7 +14168,7 @@ describe('the goal loop', () => {
       ...goalReplies(),
       activity: () => {
         const value = feed(draft)();
-        value.data.goal.enabled = enabled;
+        value.data.goal.effectiveEnabled = enabled;
         return value;
       }
     });
@@ -13930,7 +14197,7 @@ describe('the goal loop', () => {
       ...goalReplies(),
       activity: () => {
         const value = feed(draft)();
-        value.data.goal.enabled = enabled;
+        value.data.goal.effectiveEnabled = enabled;
         return value;
       },
       goal_ack: message => {
@@ -13988,9 +14255,12 @@ describe('the goal loop', () => {
     expect(acks(live)).toHaveLength(0);
   });
 
-  it('types the message, sends it, and acknowledges the draft once', async () => {
+  it.each([false, true])('types the message, sends it, and acknowledges the draft once (afterTurn=%s)', async afterTurn => {
     const source = liveFeed();
-    live = await harness(`https://chatgpt.com/c/${CHAT}`, source.replies);
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, { ...source.replies, activity: () => {
+      const reply = source.replies.activity();
+      return { ...reply, data: { ...reply.data, goal: { ...reply.data.goal, loopTrigger: afterTurn ? 'after-turn' : 'session-finish', mode: 'loop' } } };
+    } });
     const sends = watchSend(live.document);
 
     source.set(readyDraft('what about the tests'));
@@ -14061,7 +14331,8 @@ describe('the goal loop', () => {
           pendingTools: 0,
           job: null,
           goal: {
-            enabled: true,
+            configuredEnabled: true,
+            effectiveEnabled: true,
             hasKey: true,
             model: MODEL,
             pending: draft ? { replyId: `turn:${turnId}`, turnId, eventSeq: 0 } : null,
@@ -14345,7 +14616,7 @@ describe('the goal loop', () => {
           nextSince: 0,
           pendingTools: 0,
           job: null,
-          goal: { enabled, hasKey: true, model: MODEL, draft }
+          goal: { effectiveEnabled: enabled, hasKey: true, model: MODEL, draft }
         }
       }),
       goal_ack: () => {
@@ -15151,7 +15422,7 @@ describe('the goal loop', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
-          goal: { enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
+          goal: { effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
         }
       }),
       goal_open: () => heldGoal
@@ -15188,7 +15459,7 @@ describe('the goal loop', () => {
     live = await harness(fromExisting ? 'https://chatgpt.com/c/bbbbbbbb-cccc-dddd-eeee-ffffffffffff' : 'https://chatgpt.com/', {
       settings_get: () => ({ ok: true, data: {
         context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
-        goal: { enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
+        goal: { effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
       } }),
       goal_open: () => ({ ok: true, data: { reply: opening, model: MODEL } })
     }, undefined, false, true);
@@ -15236,7 +15507,7 @@ describe('the goal loop', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
-          goal: { enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
+          goal: { effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
         }
       }),
       goal_open: () => ({ ok: true, data: { reply: 'rewrite the parser in rust', model: MODEL } })
@@ -15291,7 +15562,7 @@ describe('the goal loop', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
-          goal: { enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
+          goal: { effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
         }
       }),
       goal_open: () => {
@@ -15352,7 +15623,7 @@ describe('the goal loop', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
-          goal: { enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
+          goal: { effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }
         }
       }),
       goal_open: () => {
@@ -15412,7 +15683,7 @@ describe('the goal loop', () => {
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
           // Exactly the configuration the lost run had: switched off, with `loop` remembered
           // as a preference that nothing reads while `enabled` is false.
-          goal: { enabled: false, mode: 'loop', hasKey: true, model: MODEL, objective: '', blocked: '' }
+          goal: { effectiveEnabled: false, mode: 'loop', hasKey: true, model: MODEL, objective: '', blocked: '' }
         }
       }),
       goal_open: () => ({ ok: true, data: { reply: 'build the voxel sandbox', model: MODEL } })
@@ -15473,7 +15744,7 @@ describe('the goal loop', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
-          goal: { enabled: false, own: false, mode: 'goal', hasKey: true, model: MODEL, objective: '', blocked: '' }
+          goal: { effectiveEnabled: false, own: false, mode: 'goal', hasKey: true, model: MODEL, objective: '', blocked: '' }
         }
       }),
       goal_open: () => ({ ok: true, data: { reply: 'one cycle stop', model: MODEL } })
@@ -15537,7 +15808,7 @@ describe('the goal loop', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_000 },
-          goal: { enabled: false, mode: 'loop', hasKey: true, model: MODEL, objective: '', blocked: '' }
+          goal: { effectiveEnabled: false, mode: 'loop', hasKey: true, model: MODEL, objective: '', blocked: '' }
         }
       })
     });
@@ -15582,7 +15853,7 @@ describe('the goal loop', () => {
           job: null,
           // A task already written down, so the editor's Clear is on the row as well: it is
           // an edit like the other two and has to answer to the slider the same way.
-          goal: { enabled, own: true, mode, hasKey: true, model: MODEL, objective: 'ship the port', blocked: '' }
+          goal: { configuredEnabled: enabled, effectiveEnabled: enabled, own: true, mode, hasKey: true, model: MODEL, objective: 'ship the port', blocked: '' }
         }
       })
     });
@@ -15600,7 +15871,7 @@ describe('the goal loop', () => {
         ok: true,
         data: {
           context: { auto: false, threshold: 300_000, warn: 300_000, limit: 400_000 },
-          goal: { enabled, own: true, mode, hasKey: true, model: MODEL }
+          goal: { configuredEnabled: enabled, effectiveEnabled: enabled, own: true, mode, hasKey: true, model: MODEL }
         }
       };
     });
@@ -15699,7 +15970,9 @@ describe('the goal loop', () => {
    * heard the typing, and a rebuild mid-sentence put the caret back at the end of it.
    */
   it('keeps a half-written goal, its caret and its Save button through a rebuild', async () => {
-    const goal: Record<string, unknown> = { enabled: true, hasKey: true, model: MODEL, draft: null };
+    const goal: Record<string, unknown> = {
+      configuredEnabled: true, effectiveEnabled: true, hasKey: true, model: MODEL, draft: null
+    };
     live = await harness(`https://chatgpt.com/c/${CHAT}`, {
       ...goalReplies(),
       activity: () => ({
@@ -15743,7 +16016,9 @@ describe('the goal loop', () => {
    * the box itself and must not get the last word on where it is looking.
    */
   it('keeps a long goal where its reader scrolled it, focused or not', async () => {
-    const goal: Record<string, unknown> = { enabled: true, hasKey: true, model: MODEL, draft: null };
+    const goal: Record<string, unknown> = {
+      configuredEnabled: true, effectiveEnabled: true, hasKey: true, model: MODEL, draft: null
+    };
     live = await harness(`https://chatgpt.com/c/${CHAT}`, {
       ...goalReplies(),
       activity: () => ({
@@ -15805,19 +16080,20 @@ describe('the goal loop', () => {
       await open();
       // A chat with nothing set is at Off, and Off has no task to write: the slider names the
       // mode now, so a task saved from here would have to invent one.
-      const empty = sheet({ enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' });
+      const empty = sheet({ configuredEnabled: false, effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' });
       expect(empty.objective).toMatchObject({ summary: '', available: true });
       expect(empty.mode!.value).toBe('off');
       expect(empty.objective.actions.map((action) => action.label)).toEqual(['add task']);
       expect(empty.objective.actions[0]!.disabled).toBe(true);
 
       // On Goal the same one link is live, and it saves into the mode the slider is at.
-      const armed = sheet({ enabled: true, mode: 'goal', hasKey: true, model: MODEL, objective: '', blocked: '' });
+      const armed = sheet({ configuredEnabled: true, effectiveEnabled: true, mode: 'goal', hasKey: true, model: MODEL, objective: '', blocked: '' });
       expect(armed.mode!.value).toBe('goal');
       expect(armed.objective.actions[0]).toMatchObject({ label: 'add task', mode: 'goal', disabled: false });
 
       const set = sheet({
-        enabled: false,
+        configuredEnabled: false,
+        effectiveEnabled: false,
         hasKey: true,
         model: MODEL,
         objective: 'port the module and make the suite green',
@@ -15846,7 +16122,8 @@ describe('the goal loop', () => {
     it('lets a chat that answered for itself sit at Off with its task still written down', async () => {
       await open();
       const carried = {
-        enabled: false,
+        configuredEnabled: false,
+        effectiveEnabled: false,
         hasKey: true,
         model: MODEL,
         objective: 'build the voxel sandbox',
@@ -15875,7 +16152,8 @@ describe('the goal loop', () => {
     it('names the mode a chat is being driven in, and edits the task without duplicating mode controls', async () => {
       await open();
       const carried = {
-        enabled: false,
+        configuredEnabled: false,
+        effectiveEnabled: false,
         hasKey: true,
         model: MODEL,
         objective: 'build the voxel sandbox',
@@ -15890,7 +16168,7 @@ describe('the goal loop', () => {
       // inheritance rule goalDrivingMode() enforces in the app.
       expect(sheet({ ...carried, mode: 'loop' }).objective.driving).toBe('goal');
 
-      const looping = sheet({ ...carried, enabled: true, mode: 'loop' });
+      const looping = sheet({ ...carried, configuredEnabled: true, effectiveEnabled: true, mode: 'loop' });
       expect(looping.objective.driving).toBe('loop');
       expect(looping.mode!.value).toBe('loop');
       // The same one task, read the other way: sliding between the two modes changes how it
@@ -15910,7 +16188,7 @@ describe('the goal loop', () => {
      */
     it('drops the mode slider above a New Chat and offers both modes as links instead', async () => {
       await open();
-      const fresh = sheet({ enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }, {
+      const fresh = sheet({ configuredEnabled: false, effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' }, {
         scope: 'new'
       });
       expect(fresh.rows.map((row) => row.key)).toEqual(['autoCompact']);
@@ -15923,7 +16201,7 @@ describe('the goal loop', () => {
       expect(fresh.tip).toContain('Add a goal or a loop to start this chat');
       // And in a chat the slider stays, because it is the only way to drive one that carries
       // no goal of its own — and the only way to switch a running loop back off.
-      const inChat = sheet({ enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' });
+      const inChat = sheet({ configuredEnabled: false, effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' });
       expect(inChat.rows.map((row) => row.key)).toEqual(['autoCompact']);
       expect(inChat.mode!.options.map((option) => option.value)).toEqual(['off', 'goal', 'loop']);
       expect(inChat.objective.actions).toHaveLength(1);
@@ -15932,7 +16210,7 @@ describe('the goal loop', () => {
     /** Above a New Chat the link that opened the editor is what Save does, so the view carries it. */
     it('carries the mode the editor was opened in above a New Chat', async () => {
       await open();
-      const goal = { enabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' };
+      const goal = { configuredEnabled: false, effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: '' };
       expect(sheet(goal, { editing: true, editingMode: 'loop', scope: 'new' }).objective).toMatchObject({
         editing: true,
         mode: 'loop',
@@ -15953,7 +16231,7 @@ describe('the goal loop', () => {
      */
     it('keeps an open editor pointed at the slider, and lets it save nothing at Off', async () => {
       await open();
-      const goal = { enabled: true, own: true, mode: 'goal', hasKey: true, model: MODEL, objective: '', blocked: '' };
+      const goal = { configuredEnabled: true, effectiveEnabled: true, own: true, mode: 'goal', hasKey: true, model: MODEL, objective: '', blocked: '' };
       // Opened from the one link, which was a goal link. Moving the handle re-points it.
       expect(sheet(goal, { editing: true, editingMode: 'goal' }).objective).toMatchObject({
         mode: 'goal',
@@ -15963,7 +16241,7 @@ describe('the goal loop', () => {
         mode: 'loop',
         savable: true
       });
-      expect(sheet({ ...goal, enabled: false }, { editing: true, editingMode: 'loop' }).objective.savable).toBe(false);
+      expect(sheet({ ...goal, configuredEnabled: false, effectiveEnabled: false }, { editing: true, editingMode: 'loop' }).objective.savable).toBe(false);
     });
 
     /**
@@ -15973,7 +16251,7 @@ describe('the goal loop', () => {
      */
     it('says why a worker chat cannot be given a goal', async () => {
       await open();
-      const view = sheet({ enabled: true, hasKey: true, model: MODEL, objective: '', blocked: 'worker' });
+      const view = sheet({ configuredEnabled: true, effectiveEnabled: false, hasKey: true, model: MODEL, objective: '', blocked: 'worker' });
       expect(view.mode).toMatchObject({ value: 'off', note: 'the prime writes here', warn: true, disabled: true });
       expect(view.tip).toContain('the prime writes this chat');
       expect(view.objective).toMatchObject({
@@ -15989,7 +16267,7 @@ describe('the goal loop', () => {
     it('takes every control away from a chat the user blocked in the app, and says so', async () => {
       await open();
       const view = sheet(
-        { enabled: false, own: true, mode: 'loop', hasKey: true, model: MODEL, objective: 'finish it', blocked: 'blocked' },
+        { configuredEnabled: false, effectiveEnabled: false, own: true, mode: 'loop', hasKey: true, model: MODEL, objective: 'finish it', blocked: 'blocked' },
         { context: { auto: true, threshold: 400_000, warn: 400_000, limit: 533_333 } }
       );
       expect(view.tip).toContain('blocked in the app');
@@ -16007,7 +16285,7 @@ describe('the goal loop', () => {
 
     it('keeps pointing at the missing credential the whole feature runs on', async () => {
       await open();
-      const view = sheet({ enabled: true, hasKey: false, model: MODEL, objective: '', blocked: '' });
+      const view = sheet({ configuredEnabled: true, effectiveEnabled: true, hasKey: false, model: MODEL, objective: '', blocked: '' });
       expect(view.mode).toMatchObject({ note: 'OpenRouter key required', warn: true });
       expect(view.objective).toMatchObject({
         available: false,
@@ -16019,7 +16297,7 @@ describe('the goal loop', () => {
     it('cuts a long goal to a line without breaking a word', async () => {
       await open();
       const long = `${'finish the migration '.repeat(20)}and ship`;
-      const view = sheet({ enabled: false, hasKey: true, model: MODEL, objective: long, blocked: '' });
+      const view = sheet({ configuredEnabled: false, effectiveEnabled: false, hasKey: true, model: MODEL, objective: long, blocked: '' });
       expect(view.objective.summary.length).toBeLessThanOrEqual(121);
       expect(view.objective.summary.endsWith('…')).toBe(true);
       expect(view.objective.summary).not.toMatch(/\s…$/);
@@ -16264,7 +16542,7 @@ describe('stable final eligibility during compaction custody', () => {
     live = await harness(undefined, {
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0,
         job: busy ? { sessionId: 's1', stage: 'asking', busy: true, token, sourceSend: { state: 'dispatched-unresolved' } } : null,
-        goal: { enabled: true, hasKey: true, mode: 'loop', draft: null }
+        goal: { effectiveEnabled: true, hasKey: true, mode: 'loop', draft: null }
       } }),
       compact: () => ({ ok: false, error: 'stale_document' })
     });

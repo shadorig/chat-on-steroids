@@ -14,7 +14,7 @@ import * as recorder from '../src/main/session/recorder.js';
 import * as input from '../src/main/session/input.js';
 import * as agents from '../src/main/agents.js';
 import * as ownership from '../src/main/codex/ownership.js';
-import * as bridge from '../src/main/bridge.js';
+import * as recoveryNotice from '../src/main/mcp/recovery-notice.js';
 
 const plugin = vi.hoisted(() => ({
   enabled: true,
@@ -107,7 +107,7 @@ it('redacts only delivery additions after the plugin boundary and records the ex
     offeredAt: Date.now(), offers: 1, offeredOnFinish: false, offeredViaRevival: false, ackedAt: null
   }] });
   vi.spyOn(ownership, 'backgroundExecRecoveryNotices').mockReturnValue(['credential-fixture recovery']);
-  vi.spyOn(bridge, 'unattributedRepairEta').mockReturnValue(10);
+  vi.spyOn(recoveryNotice, 'unattributedRepairEta').mockReturnValue(10);
   vi.spyOn(input, 'offerToolInput').mockResolvedValue({ messages: [{ text: 'credential-fixture user input', images: [{ name: 'fixture.webp', dataUrl: `data:image/webp;base64,${data}` }] }], reminder: 'credential-fixture batch reminder' });
   const record = vi.spyOn(recorder, 'recordToolCall').mockResolvedValue(null);
   const conversationId = randomUUID(), requestId = `wfr_${randomUUID().replaceAll('-', '')}`;

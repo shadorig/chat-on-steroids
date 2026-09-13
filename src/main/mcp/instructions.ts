@@ -12,7 +12,7 @@
 
 import { LAUNCHES_WINDOWS_POWERSHELL_5 } from '../codex/tool-specs.js';
 import { CODING_INSTRUCTIONS } from './coding-instructions.js';
-import { canAddCodeMode, CODE_MODE_INSTRUCTIONS } from './code-mode-tool.js';
+import { canAddCodeMode, CODE_MODE_INSTRUCTIONS } from './code-mode-contract.js';
 import { pluginManager } from '../plugins/manager.js';
 import { effectiveCapabilities, getConfig, MAX_MCP_INSTRUCTIONS_CHARS } from '../config.js';
 import { isGitRepository } from '../toolchain.js';

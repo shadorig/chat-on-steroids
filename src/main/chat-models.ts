@@ -21,7 +21,7 @@ let request: { nonce: string; expiresAt: number; allowOpen: boolean } | null = n
 let deadline: ReturnType<typeof setTimeout> | null = null;
 let launch: { nonce: string; allowOpen: boolean; work: Promise<void> } | null = null;
 let changed = (): void => {};
-let wake: ((nonce: string, allowOpen: boolean) => Promise<void>) | null = null;
+let wake: ((nonce: string, allowOpen: boolean, current: () => boolean) => Promise<void>) | null = null;
 export async function restoreChatModels(): Promise<void> {
   const saved = z.object({ observedAt: z.number().finite().positive(), models: observation.shape.models.unwrap() }).strict().safeParse(await readDurable('chat-models'));
   if (!saved.success || request || catalog.state !== 'unknown') return;
@@ -32,14 +32,21 @@ export async function restoreChatModels(): Promise<void> {
 function failed(error: string): void {
   catalog = { ...catalog, state: catalog.models.length ? 'ready' : 'unavailable', error };
 }
-export function configureChatModelDiscovery(options: { changed: () => void; wake: (nonce: string, allowOpen: boolean) => Promise<void> }): void { changed = options.changed; wake = options.wake; }
+export function configureChatModelDiscovery(options: { changed: () => void; wake: (nonce: string, allowOpen: boolean, current: () => boolean) => Promise<void> }): void { changed = options.changed; wake = options.wake; }
 function scheduleDeadline(at: number): void {
   if (deadline) clearTimeout(deadline);
   deadline = setTimeout(() => { deadline = null; expire(); changed(); wakeBrowserWork(); }, Math.max(0, at - Date.now()));
   deadline.unref?.();
 }
 function expire(): void {
-  if (request && Date.now() >= request.expiresAt) { logInfo(`model discovery expired id=${request.nonce}`); request = null; failed('Model discovery timed out. Check ChatGPT is signed in, then retry.'); }
+  if (request && Date.now() >= request.expiresAt) {
+    logInfo(`model discovery expired id=${request.nonce}`);
+    request = null;
+    // Revocation is semantic rather than a fake Promise cancellation. The browser startup owner
+    // receives the exact attempt predicate below and rechecks it at every pre-launch yield.
+    launch = null;
+    failed('Model discovery timed out. Check ChatGPT is signed in, then retry.');
+  }
 }
 export function getChatModels(): ChatModelCatalog {
   expire(); return structuredClone(catalog);
@@ -67,18 +74,23 @@ export async function startChatModelDiscovery(allowOpen = true): Promise<ChatMod
   requestChatModels(allowOpen);
   const nonce = request!.nonce;
   if (!launch || launch.nonce !== nonce || (request!.allowOpen && !launch.allowOpen)) {
-    const previous = launch?.work;
     const attempt = { nonce, allowOpen: request!.allowOpen, work: Promise.resolve() };
+    // Publish the attempt before calling wake so an immediately evaluated authority predicate
+    // sees this attempt as current. Promotion replaces `launch` first, revoking the passive one.
+    launch = attempt;
     const work = (async () => {
       try {
-        if (previous) await previous;
         if (request?.nonce !== nonce) return;
         if (!wake) throw new Error('Model discovery is not ready');
-        await wake(nonce, attempt.allowOpen);
+        const current = () => request?.nonce === nonce && launch === attempt && Date.now() < request.expiresAt;
+        await wake(nonce, attempt.allowOpen, current);
+        if (!current()) return;
         logInfo(`model discovery browser wake completed id=${nonce}`);
       }
       catch (error) {
-        if (request?.nonce !== nonce) return;
+        // A promoted same-nonce open attempt supersedes a passive wake. Its failure/success is
+        // authoritative; a late failure from the older dispatch must not cancel the request.
+        if (request?.nonce !== nonce || launch !== attempt) return;
         request = null;
         if (deadline) clearTimeout(deadline); deadline = null;
         failed(`${(error as Error).message}. Retry model discovery.`.slice(0, 240));
@@ -86,13 +98,10 @@ export async function startChatModelDiscovery(allowOpen = true): Promise<ChatMod
       }
     })();
     attempt.work = work;
-    launch = attempt;
+    void work.finally(() => { if (launch === attempt) launch = null; });
   }
-  const attempt = launch;
-  await attempt.work;
-  // A completed OS handoff is not browser lifetime. A later explicit opening
-  // must reach the shared startup owner again if Chrome exited in the meantime.
-  if (launch === attempt) launch = null;
+  // The request deadline and observation own completion. OS wake is only dispatch;
+  // an unresolved handoff must never hold the renderer's Refresh/Send promise.
   return getChatModels();
 }
 export function pendingChatModelRequest(): { nonce: string; expiresAt: number; allowOpen: boolean } | null {

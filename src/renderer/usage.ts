@@ -1,6 +1,6 @@
 import { ui, t } from './i18n.js';
 import { $, el, run } from './dom.js';
-import { DEFAULT_USAGE_FORMULA, usageEstimate, usageModelGroups, usageRate, type UsageFormula, type UsageOverview } from '../shared/usage.js';
+import { DEFAULT_USAGE_FORMULA, DEFAULT_USAGE_RATES_VERIFIED_AT, usageEstimate, usageModelGroups, usageRate, type UsageFormula, type UsageOverview } from '../shared/usage.js';
 let snapshot: UsageOverview | null = null;
 let loadGeneration = 0;
 const FORMULA_KEY = 'usage-formula-v1';
@@ -11,6 +11,8 @@ function saveFormula(): void {
 
 const count = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
 const money = new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+const verifiedRateDate = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeZone: 'UTC' })
+  .format(new Date(`${DEFAULT_USAGE_RATES_VERIFIED_AT}T00:00:00Z`));
 const featureLabels: Record<string, string> = { deep_research: "Deep research", file_upload: "File uploads", paste_text_to_file: "Pasted text files", image_gen: "Image generation" };
 function usageHint(node: HTMLElement, text: string | (() => string)): void {
   ui(node, 'data-usage-hint', typeof text === 'function' ? text : () => text);
@@ -34,15 +36,18 @@ export async function refreshUsage(): Promise<void> {
   const generation = ++loadGeneration;
   $('refreshUsage').setAttribute('disabled', '');
   const status = $('usageStatus');
-  ui(status, 'textContent', () => snapshot ? t("Updating…") : t("Calculating recorded tool usage…"));
+  ui(status, 'textContent', () => t("Updating usage…"));
   status.setAttribute('role', 'status');
+  const slowStatus = window.setTimeout(() => {
+    if (generation === loadGeneration) ui(status, 'textContent', () => t("Rebuilding recorded usage. You can keep using the app."));
+  }, 750);
   try {
     const [value, catalog] = await Promise.all([run(window.api.getUsage()), run(window.api.getChatModels())]);
     if (generation !== loadGeneration) return;
     if (!value) { ui(status, 'textContent', () => t("Usage could not be loaded. Try Refresh.")); return; }
     snapshot = value;
     const summary = $('usageSummary'); summary.replaceChildren();
-    for (const [label, number] of [['Processed tokens · est.', value.tokens], ['Peak daily tokens', Math.max(0, ...value.days.map((day) => day.tokens))], ['Conversations', value.sessions], ['Active days', value.days.filter((day) => day.tokens > 0).length]] as const) {
+    for (const [label, number] of [['Activity tokens · est.', value.rawEstimatedTokens], ['Peak daily activity', Math.max(0, ...value.days.map((day) => day.rawEstimatedTokens))], ['Conversations', value.sessions], ['Active days', value.days.filter((day) => day.rawEstimatedTokens > 0).length]] as const) {
       const item = el('div'); item.dataset.usageMetric = label; usageHint(item, () => `${Math.round(number).toLocaleString()} ${t(label).toLowerCase()}`); item.append(el('strong', '', count.format(number)), el('span', '', () => t(label))); summary.append(item);
     }
     const limits = $('modelUsage'); limits.replaceChildren();
@@ -70,14 +75,21 @@ export async function refreshUsage(): Promise<void> {
     paintRates();
     paintCost();
     ui(status, 'textContent', () => t("Recorded model attribution; missing history assumes GPT-5.6 High. Unchanged recordings reuse saved totals."));
-  } finally { if (generation === loadGeneration) $('refreshUsage').removeAttribute('disabled'); }
+  } catch {
+    if (generation === loadGeneration) ui(status, 'textContent', () => t("Usage could not be loaded. Try Refresh."));
+  } finally {
+    window.clearTimeout(slowStatus);
+    if (generation === loadGeneration) $('refreshUsage').removeAttribute('disabled');
+  }
 }
 function paintRates(): void {
   if (!snapshot) return;
   const host = $('usageRates'); host.replaceChildren();
   for (const model of [...new Set(snapshot.models.map(row => row.model))].sort()) {
     const label = el('label', 'setting'); const text = el('span', 'setting-text');
-    text.append(el('b', '', model), el('em', '', () => usageRate(model, DEFAULT_USAGE_FORMULA) !== undefined ? t("USD / 1M cached input · editable official baseline, checked 7 September 2026") : t("USD / 1M cached input · enter a verified comparison rate")));
+    text.append(el('b', '', model), el('em', '', () => usageRate(model, DEFAULT_USAGE_FORMULA) !== undefined
+      ? t("USD / 1M cached input · editable official baseline, verified {0}", [verifiedRateDate])
+      : t("USD / 1M cached input · enter a verified comparison rate")));
     const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.step = '0.01'; ui(input, 'placeholder', () => t("Unknown rate")); input.value = usageRate(model, formula)?.toString() ?? '';
     ui(input, 'aria-label', () => t("{0} cached-input USD per million tokens", [model]));
     input.addEventListener('input', () => {
@@ -96,34 +108,30 @@ function paintCost(): void {
   const costSummary = document.getElementById('usageTotalCost');
   if (costSummary) {
     ui(costSummary.querySelector('strong')!, 'textContent', () => costText(total));
-    ui(costSummary, 'data-usage-hint', () => t('{0} estimated tokens; {1} have no comparison rate. Cached-input equivalent, not a bill.', [Math.round(total.tokens).toLocaleString(), Math.round(total.unpricedTokens).toLocaleString()]));
+    ui(costSummary, 'data-usage-hint', () => t('{0} comparison tokens; {1} have no comparison rate. Cached-input equivalent, not a bill.', [Math.round(total.comparisonTokens).toLocaleString(), Math.round(total.unpricedTokens).toLocaleString()]));
   }
   const daily = snapshot.days.map(day => ({ ...day, ...usageEstimate(day.models, formula) }));
-  for (const [label, number] of [['Processed tokens · est.', total.tokens], ['Peak daily tokens', Math.max(0, ...daily.map(day => day.tokens))]] as const) {
-    const item = [...$('usageSummary').children].find(node => (node as HTMLElement).dataset.usageMetric === label) as HTMLElement | undefined;
-    if (item) { item.querySelector('strong')!.textContent = count.format(number); ui(item, 'data-usage-hint', () => `${Math.round(number).toLocaleString()} ${t(label).toLowerCase()}`); }
-  }
   const heat = $('usageHeatmap'); heat.replaceChildren();
-  const byDay = new Map(daily.map(day => [day.date, day.tokens])); const peak = Math.max(1, ...daily.map(day => day.tokens));
+  const byDay = new Map(daily.map(day => [day.date, day.rawEstimatedTokens])); const peak = Math.max(1, ...daily.map(day => day.rawEstimatedTokens));
   for (let ago = 363; ago >= 0; ago--) {
     const date = new Date(); date.setDate(date.getDate() - ago); const key = dateKey(date), tokens = byDay.get(key) ?? 0;
     const cell = el('span', 'heat-cell'); cell.dataset.level = String(tokens ? Math.max(1, Math.ceil(tokens / peak * 4)) : 0); const hint = () => t("{0}: {1} estimated tokens", [key, Math.round(tokens).toLocaleString()]); usageHint(cell, hint); ui(cell, 'aria-label', hint); heat.append(cell);
   }
-  ui($('usageFormula'), 'textContent', () => t("Final frontend context × unique tool calls ÷ {0} × each model’s cached-input rate ÷ 1M × {1}.", [formula.divisor, formula.multiplier]));
+  ui($('usageFormula'), 'textContent', () => t("Comparison cap: {2} tokens, based on currently observed model availability. Capped frontend context × unique tool calls ÷ {0} × each model’s cached-input rate ÷ 1M × {1}.", [formula.divisor, formula.multiplier, snapshot!.comparisonContextCap.toLocaleString()]));
   ui($('usageCost'), 'textContent', () => t("{0} estimated equivalent. {1}This is a comparison, not a bill.", [costText(total), total.unpricedTokens ? t("{0} tokens have no rate. ", [Math.round(total.unpricedTokens).toLocaleString()]) : '']));
   const modelTable = el('table', 'usage-table'); const modelHead = el('tr');
-  for (const title of ['Recorded model / effort', 'Estimated tokens', 'Estimated equivalent']) modelHead.append(el('th', '', () => t(title)));
+  for (const title of ['Recorded model / effort', 'Comparison tokens', 'Estimated equivalent']) modelHead.append(el('th', '', () => t(title)));
   modelTable.append(modelHead);
   for (const entry of usageModelGroups(snapshot.models)) {
     const estimate = usageEstimate(entry.sources, formula); const row = el('tr');
     const name = el('td', '', () => `${entry.model} · ${entry.reasoningEffort ?? t("effort unknown")}${entry.assumed ? t(" (assumed)") : ''}`);
     usageHint(name, () => t("Recorded IDs: {0}", [[...new Set(entry.sources.map(source => source.model))].join(', ')]));
-    row.append(name, el('td', '', Math.round(estimate.tokens).toLocaleString()), el('td', '', () => estimate.unpricedTokens > 0 && estimate.unpricedTokens === estimate.tokens ? t("Rate unknown") : costText(estimate))); modelTable.append(row);
+    row.append(name, el('td', '', Math.round(estimate.comparisonTokens).toLocaleString()), el('td', '', () => estimate.unpricedTokens > 0 && estimate.unpricedTokens === estimate.comparisonTokens ? t("Rate unknown") : costText(estimate))); modelTable.append(row);
   }
   const table = el('table', 'usage-table'); const head = el('tr');
-  head.append(el('th', '', () => t("Day")), el('th', '', () => t("Estimated tokens")), el('th', '', () => t("Cached × {0}", [formula.multiplier]))); table.append(head);
-  for (const day of [...daily].reverse()) { const row = el('tr'); row.append(el('td', '', day.date), el('td', '', Math.round(day.tokens).toLocaleString()), el('td', '', costText(day))); table.append(row); }
-  if (!snapshot.days.length) { const row = el('tr'); const cell = el('td', 'muted', () => t("No recorded tool calls yet.")); cell.setAttribute('colspan', '3'); row.append(cell); table.append(row); }
+  head.append(el('th', '', () => t("Day")), el('th', '', () => t("Activity tokens · est.")), el('th', '', () => t("Comparison tokens")), el('th', '', () => t("Cached × {0}", [formula.multiplier]))); table.append(head);
+  for (const day of [...daily].reverse()) { const row = el('tr'); row.append(el('td', '', day.date), el('td', '', Math.round(day.rawEstimatedTokens).toLocaleString()), el('td', '', Math.round(day.comparisonTokens).toLocaleString()), el('td', '', costText(day))); table.append(row); }
+  if (!snapshot.days.length) { const row = el('tr'); const cell = el('td', 'muted', () => t("No recorded tool calls yet.")); cell.setAttribute('colspan', '4'); row.append(cell); table.append(row); }
   $('usageDays').replaceChildren(modelTable, table);
 }
 export function initUsage(): void {

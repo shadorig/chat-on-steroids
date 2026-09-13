@@ -49,7 +49,7 @@ Context-pressure and cost/usage displays are local estimates unless a provider-s
 
 Session `contextTokens` is a local estimate of pressure in the **current provider frontend** and is reset when Compact & Resume durably rebinds the session. Lifetime work accounting is separate and continues across that rebind.
 
-The daily work/cost view in `src/main/session/usage.ts` is also derived locally from recorded tool work and frontend-context measurements. It deduplicates stable tool-call identities, segments work across compaction/model changes, applies the configured divisor/multiplier/rates, and caches derived session totals against durable revisions rather than rereading unchanged history on every paint. Historical rows without exact model proof remain explicitly assumed/estimated.
+The daily work/cost view in `src/main/session/usage.ts` is also derived locally from recorded tool work and frontend-context measurements. It deduplicates stable tool-call identities, segments work across compaction/model changes and caches **facts** (context segments plus call attribution) against durable revisions rather than caching today's pricing projection. The activity chart uses the raw local estimate. Cost comparison separately caps each frontend against the currently observed comparison ceiling and then applies the configured divisor/multiplier/rates. A model-catalog change can therefore change the comparison without rewriting historical activity. Historical rows without exact model proof remain explicitly assumed/estimated.
 
 Provider account-usage observations from `extension/usage.js` are a different data source. They are bounded snapshots used for the pools the provider actually reports; missing/expired values mean “not reported,” not zero or exhausted. Never merge these two measurement systems into one implied provider invoice.
 
@@ -73,7 +73,7 @@ Important semantics:
 
 - Active-turn correction authority belongs to the exact turn and can be revoked by a newer turn, navigation, occupied draft or tool activity before Send.
 - “After turn” entries spend verified completion boundaries in FIFO order; a replayed old completion must not drain the next entry.
-- Native file attachments always use browser upload/send. A file-bearing input cannot silently become an MCP file reference.
+- Native file attachments use browser upload/send. An explicitly eligible image-only draft may instead create a bounded normalized image projection for delivery with the next tool response; the staged original remains the authored attachment identity and never silently becomes an MCP file reference. The outbox stores only immutable projection references (id, size and hash), while the bytes live once in the existing attachment store and are materialized only at delivery/history boundaries.
 - A claim has no arbitrary age-based transport fallback after it may have acted. Lost receipts do not license switching to another delivery route.
 - For fresh Local Project sends, project narrowing must survive the no-conversation-id gap before request ownership can be published broadly.
 
@@ -81,7 +81,7 @@ Important semantics:
 
 `src/main/session/input-attachments.ts` owns immutable originals selected by the user. The renderer and browser use opaque attachment ids and bounded previews rather than source paths.
 
-Staging admission, quota, browser chunking and provider upload are separate boundaries. A locally staged file is not proof ChatGPT received it; a completed native upload is not yet proof the final message was submitted. Retention must preserve bytes still owned by the outbox.
+Staging admission, quota, optional image normalization, browser chunking and provider upload are separate boundaries. A locally staged file is not proof ChatGPT received it, a normalized tool-delivery projection is not proof the model consumed it, and a completed native upload is not yet proof the final message was submitted. Retention must preserve bytes still owned by the outbox, while tool injection freezes its normalized projection before the original can change or be pruned.
 
 ## Plans and finish checkpoints
 
@@ -156,6 +156,32 @@ Recovery reasons have separate evidence and budgets—missing owned tabs, live-t
 - old durable history alone does not grant a new recovery episode after process restart.
 
 Goal and compaction have their own bounded pickup schedules because they represent still-owed durable obligations. Those schedules are implementation policy; consult current `bridge.ts` rather than copying their numeric cadence into another authority.
+
+### Continuation authority
+
+Recovery can create a right to continue only from one exact durable source turn. `src/main/session/recovery-proof.ts` captures an immutable `RecoveryProof` from one serialized recorder snapshot: the source conversation/turn, durable work head, exact qualifying MCP call and the model class derived from that same call. `thinking_failed` is valid only while its failed `turn_end` remains the durable work head. Any later assistant revision, lifecycle event, page/tool work, user message or newer exact MCP activity invalidates that proof.
+
+Timing is not evidence. A `RecoveryGrant` may add `notBefore` to postpone use of an existing proof—for example while the provider is natively busy—but elapsed time can never mint the proof. Native busy therefore defers a continuation; it never creates one.
+
+Recovered continuation arbitration has one precedence rule:
+
+1. an explicit queued user instruction receives the checkpoint first;
+2. only when the outbox has no such instruction or active transport custody may synthesized Goal/Loop work receive it.
+
+The outbox and Goal ledger still own their own persistence. `recovery-arbitration.ts` owns only **who gets the checkpoint**. Explicit input commits first; retiring a duplicate synthetic Goal projection is convergence cleanup, not the authority boundary. A final Goal-spend fence re-runs precedence, so even a failed cleanup write cannot turn two projections into two spendable continuations. This keeps the following precedence stable across reloads and retries:
+
+- a native final supersedes a provisional provider failure;
+- fresh work revokes any unspent recovered continuation;
+- an authorized browser Send retains custody until its exact receipt or classified pre-send failure because the provider boundary may already have been crossed;
+- a lost receipt never authorizes switching transport or clicking Send again;
+- image projection is delivery material; the staged original remains the authored attachment identity;
+- recovery authority always comes from exact durable source-turn evidence, never from silence duration alone.
+
+Cleanup and authority are deliberately separate. Stop/new-work paths withdraw stale recovery rows best-effort so state converges quickly, but final claim/Send authorization always revalidates the proof and fails closed. A transient cleanup write failure must not turn an already-durable Stop or provider observation into a false primary-operation failure.
+
+Provider `Thinking failed` has its own explicit settlement state in the extension: a short `ignore-late` phase, then a `listening` phase, then either terminal failure after the full grace or `resumed` ordinary stall tracking if fresh work appears. The explicit native failure signal outranks ChatGPT's transient interruption marker; an exact later native final outranks the provisional failure. Error discovery on the hot path is scoped to the active assistant turn plus global provider notices rather than rescanning historical turn DOM.
+
+The long silence window for Pro-class work is intentionally conservative. Local timing audits showed that tool/progress gaps are not themselves terminal evidence, including gaps inside one request/turn; the implementation therefore treats the window as a recovery scheduling bound only. The proof rules above, not the measured duration, grant continuation authority.
 
 ## Model observation and browser opening
 

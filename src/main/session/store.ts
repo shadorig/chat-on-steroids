@@ -35,7 +35,7 @@ import type {
   SessionSummary,
   StoredText
 } from '../../shared/session.js';
-import { CONTINUATION_MARKER, eventTokens, normalizedToolOutcome } from '../../shared/session.js';
+import { CONTINUATION_MARKER, REASONING_EFFORTS, eventTokens, normalizedToolOutcome } from '../../shared/session.js';
 import { chronological } from '../../shared/chronology.js';
 import { automaticTitle, firstTitleMessage, legacyContextTitle, refreshUserTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
@@ -234,6 +234,13 @@ interface OpenSession {
   queue: Promise<void>;
   /** Canonical ChatGPT messages. A later streaming/final snapshot replaces by stable id. */
   messages: Map<string, MessageEvent>;
+  /** In-process invalidation revision/cache for exact recovered-turn evidence. Never persisted. */
+  recoveryRevision: number;
+  recoveryEvidence: Map<string, { revision: number; value: TurnRecoveryEvidence }>;
+  /** Compact durable journal facts used by recovery without rescanning diagnostic history. */
+  recoveryJournal: RecoveryJournalCheckpoint;
+  /** Current byte length of events.jsonl after the last serialized append/recovery. */
+  journalBytes: number;
   metaDirty: boolean;
   metaTimer: NodeJS.Timeout | null;
 }
@@ -252,6 +259,8 @@ const reconciling = new Map<string, Promise<DurableSessionSnapshot | null>>();
 const MAX_EVENT_TAIL = 4096;
 /** Hard ceiling for a bounded recent-history disk read. */
 const MAX_RECENT_READ_BYTES = 8 * 1024 * 1024;
+/** Keep restart catch-up bounded even when only diagnostic/non-authoritative rows are appended. */
+const MAX_RECOVERY_CHECKPOINT_GAP = 1024 * 1024;
 const MAX_CANONICAL_MESSAGE_BYTES = 1024 * 1024;
 export const MAX_ASSET_BYTES = 8 * 1024 * 1024;
 export const MAX_SESSION_ASSET_BYTES = 192 * 1024 * 1024;
@@ -262,6 +271,38 @@ let globalAssetUsage: number | null = null;
 let assetWriteQueue = Promise.resolve();
 
 type MessageEvent = Extract<SessionEvent, { kind: 'user_message' | 'assistant_message' }>;
+type RecoveryHead = { seq: number; kind: SessionEvent['kind']; turnId?: string };
+type RecoveryLifecycle =
+  | { seq: number; time: number; kind: 'turn_start'; turnId?: string }
+  | {
+      seq: number;
+      time: number;
+      kind: 'turn_end';
+      turnId?: string;
+      outcome: Extract<SessionEvent, { kind: 'turn_end' }>['outcome'];
+      reason?: 'thinking_failed';
+    };
+type RecoveryMcpCall = {
+  seq: number;
+  time: number;
+  turnId?: string;
+  call: {
+    conversationId: string;
+    attribution: 'request_id';
+    model?: string;
+    reasoningEffort?: ReasoningEffort;
+  };
+};
+interface RecoveryJournalCheckpoint {
+  version: 1;
+  /** False only for a pre-checkpoint session whose current turn began before this version. */
+  complete: boolean;
+  /** Exact newline boundary already folded into this projection. */
+  offset: number;
+  head: RecoveryHead | null;
+  lifecycle: RecoveryLifecycle | null;
+  exactMcpCall: RecoveryMcpCall | null;
+}
 type NewMessageEvent = MessageEvent extends infer Event
   ? Event extends MessageEvent
     ? Omit<Event, 'seq'>
@@ -477,6 +518,10 @@ export async function createSession(options: {
     activityHydrated: true,
     queue: Promise.resolve(),
     messages: new Map(),
+    recoveryRevision: 0,
+    recoveryEvidence: new Map(),
+    recoveryJournal: emptyRecoveryJournal(true, 0),
+    journalBytes: 0,
     metaDirty: false,
     metaTimer: null
   };
@@ -485,6 +530,7 @@ export async function createSession(options: {
     await fs.mkdir(sessionDir(id), { recursive: true });
     await fs.writeFile(path.join(sessionDir(id), 'events.jsonl'), '', { flag: 'a' });
     await fs.writeFile(path.join(sessionDir(id), 'messages.json'), '{}', { flag: 'a' });
+    await writeRecoveryCheckpoint(id, entry.recoveryJournal);
     await writeMeta(entry);
     publishAttachmentSummary(entry.summary);
   } catch (error) {
@@ -859,6 +905,15 @@ async function ensureOpen(id: string): Promise<OpenSession> {
     await sealTornTail(id);
     const snapshot = await readDurableSnapshot(id);
     if (!snapshot) throw new Error(`Session ${id} has no recoverable metadata or history`);
+    const journalBytes = (await fs.stat(path.join(sessionDir(id), 'events.jsonl')).catch(() => null))?.size ?? 0;
+    const storedRecovery = await readRecoveryCheckpoint(id);
+    let recoveryJournal = storedRecovery && storedRecovery.offset <= journalBytes
+      ? await catchUpRecoveryCheckpoint(id, storedRecovery, journalBytes)
+      : emptyRecoveryJournal(false, 0);
+    if (storedRecovery && recoveryJournal.offset !== storedRecovery.offset) {
+      await writeRecoveryCheckpoint(id, recoveryJournal).catch(error =>
+        logWarn(`session ${id}: caught-up recovery checkpoint could not be written: ${String(error)}`));
+    }
     const entry: OpenSession = {
       summary: snapshot.summary,
       nextSeq: snapshot.historySeq + 1,
@@ -868,6 +923,10 @@ async function ensureOpen(id: string): Promise<OpenSession> {
       activityHydrated: false,
       queue: Promise.resolve(),
       messages: snapshot.messages,
+      recoveryRevision: 0,
+      recoveryEvidence: new Map(),
+      recoveryJournal,
+      journalBytes,
       metaDirty: false,
       metaTimer: null
     };
@@ -963,6 +1022,186 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
   if (event.agent && !summary.agents.includes(event.agent)) summary.agents.push(event.agent);
 }
 
+const RECOVERY_WORK_KINDS = new Set<SessionEvent['kind']>([
+  'user_message', 'assistant_message', 'tool_call', 'page_tool', 'turn_start', 'turn_end'
+]);
+
+function emptyRecoveryJournal(complete: boolean, offset = 0): RecoveryJournalCheckpoint {
+  return { version: 1, complete, offset, head: null, lifecycle: null, exactMcpCall: null };
+}
+
+function compactRecoveryHead(event: SessionEvent): RecoveryHead {
+  return { seq: event.seq, kind: event.kind, ...(event.turnId ? { turnId: event.turnId } : {}) };
+}
+
+function compactRecoveryLifecycle(event: Extract<SessionEvent, { kind: 'turn_start' | 'turn_end' }>): RecoveryLifecycle {
+  if (event.kind === 'turn_end') {
+    return { seq: event.seq, time: event.time, kind: 'turn_end', ...(event.turnId ? { turnId: event.turnId } : {}),
+      outcome: event.outcome, ...(event.reason ? { reason: event.reason } : {}) };
+  }
+  return { seq: event.seq, time: event.time, kind: 'turn_start', ...(event.turnId ? { turnId: event.turnId } : {}) };
+}
+
+function compactRecoveryMcpCall(event: Extract<SessionEvent, { kind: 'tool_call' }>): RecoveryMcpCall | null {
+  if (event.source !== 'mcp' || event.call.attribution !== 'request_id' || !event.turnId || !event.call.conversationId) return null;
+  return {
+    seq: event.seq,
+    time: event.time,
+    turnId: event.turnId,
+    call: {
+      conversationId: event.call.conversationId,
+      attribution: 'request_id',
+      ...(event.call.model ? { model: event.call.model } : {}),
+      ...(event.call.reasoningEffort ? { reasoningEffort: event.call.reasoningEffort } : {})
+    }
+  };
+}
+
+function advanceRecoveryJournal(checkpoint: RecoveryJournalCheckpoint, event: SessionEvent): RecoveryJournalCheckpoint {
+  if (!RECOVERY_WORK_KINDS.has(event.kind)) return checkpoint;
+  let complete = checkpoint.complete;
+  let lifecycle = checkpoint.lifecycle;
+  let exactMcpCall = checkpoint.exactMcpCall;
+  if (event.kind === 'turn_start') {
+    lifecycle = compactRecoveryLifecycle(event);
+    // A fresh durable turn start supersedes every pre-checkpoint source turn. From this boundary
+    // forward the compact projection is complete even for a session created by an older version.
+    complete = true;
+    if (exactMcpCall?.turnId !== event.turnId) exactMcpCall = null;
+  } else if (event.kind === 'turn_end') {
+    lifecycle = compactRecoveryLifecycle(event);
+  } else if (event.kind === 'tool_call') {
+    exactMcpCall = compactRecoveryMcpCall(event) ?? exactMcpCall;
+  }
+  return { ...checkpoint, complete, head: compactRecoveryHead(event), lifecycle, exactMcpCall };
+}
+
+function recoveryCheckpointPath(id: string): string {
+  return path.join(sessionDir(id), 'recovery.json');
+}
+
+function parseRecoveryCheckpoint(raw: string): RecoveryJournalCheckpoint | null {
+  try {
+    const value = JSON.parse(raw) as Partial<RecoveryJournalCheckpoint>;
+    if (value.version !== 1 || typeof value.complete !== 'boolean' || !Number.isSafeInteger(value.offset) || value.offset! < 0) return null;
+    const head = value.head;
+    if (head && (!Number.isSafeInteger(head.seq) || head.seq < 0 || typeof head.kind !== 'string' ||
+        !RECOVERY_WORK_KINDS.has(head.kind as SessionEvent['kind']) ||
+        (head.turnId !== undefined && typeof head.turnId !== 'string'))) return null;
+    const lifecycle = value.lifecycle;
+    if (lifecycle && (!Number.isSafeInteger(lifecycle.seq) || lifecycle.seq < 0 || !Number.isFinite(lifecycle.time) ||
+        !['turn_start', 'turn_end'].includes(lifecycle.kind) || (lifecycle.turnId !== undefined && typeof lifecycle.turnId !== 'string') ||
+        (lifecycle.kind === 'turn_end' && (!['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown'].includes(lifecycle.outcome) ||
+          (lifecycle.reason !== undefined && lifecycle.reason !== 'thinking_failed'))) ||
+        (lifecycle.kind === 'turn_start' && ('outcome' in lifecycle || 'reason' in lifecycle)))) return null;
+    const exact = value.exactMcpCall;
+    if (exact && (!Number.isSafeInteger(exact.seq) || exact.seq < 0 || !Number.isFinite(exact.time) || typeof exact.turnId !== 'string' ||
+        exact.call?.attribution !== 'request_id' || typeof exact.call.conversationId !== 'string' ||
+        (exact.call.model !== undefined && typeof exact.call.model !== 'string') ||
+        (exact.call.reasoningEffort !== undefined && !REASONING_EFFORTS.includes(exact.call.reasoningEffort)))) return null;
+    return value as RecoveryJournalCheckpoint;
+  } catch {
+    return null;
+  }
+}
+
+async function readRecoveryCheckpoint(id: string): Promise<RecoveryJournalCheckpoint | null> {
+  try { return parseRecoveryCheckpoint(await fs.readFile(recoveryCheckpointPath(id), 'utf8')); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    logWarn(`session ${id}: recovery checkpoint could not be read: ${(error as Error).message}`);
+    return null;
+  }
+}
+
+async function writeRecoveryCheckpoint(id: string, checkpoint: RecoveryJournalCheckpoint): Promise<void> {
+  const target = recoveryCheckpointPath(id);
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify(checkpoint), 'utf8');
+    await fs.rename(tmp, target);
+  } finally {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+  }
+}
+
+async function catchUpRecoveryCheckpoint(
+  id: string,
+  checkpoint: RecoveryJournalCheckpoint,
+  journalBytes: number
+): Promise<RecoveryJournalCheckpoint> {
+  if (checkpoint.offset < 0 || checkpoint.offset > journalBytes) return emptyRecoveryJournal(false, 0);
+  if (checkpoint.offset === journalBytes) return checkpoint;
+  // A live process checkpoints at this cadence. A larger restart gap therefore means the
+  // projection repeatedly failed to persist (or the journal changed outside the serialized
+  // writer). Do not turn recovery into an unbounded lifetime scan; discard the stale projection
+  // and wait for a fresh turn to establish a complete boundary instead.
+  if (journalBytes - checkpoint.offset > MAX_RECOVERY_CHECKPOINT_GAP + MAX_LINE_BYTES) {
+    return emptyRecoveryJournal(false, journalBytes);
+  }
+  let current = checkpoint;
+  let carry = Buffer.alloc(0);
+  let damaged = false;
+  const handle = await fs.open(path.join(sessionDir(id), 'events.jsonl'), 'r').catch(() => null);
+  try {
+    if (!handle) return current;
+    const chunk = Buffer.alloc(64 * 1024);
+    let position = checkpoint.offset;
+    while (position < journalBytes) {
+      const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, journalBytes - position), position);
+      if (!bytesRead) break;
+      position += bytesRead;
+      const joined = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead);
+      let start = 0;
+      for (;;) {
+        const newline = joined.indexOf(0x0a, start);
+        if (newline < 0) break;
+        const line = joined.subarray(start, newline);
+        start = newline + 1;
+        if (!line.length) continue;
+        if (line.length > MAX_LINE_BYTES) { damaged = true; continue; }
+        try {
+          const event = JSON.parse(line.toString('utf8')) as SessionEvent;
+          if (event && Number.isSafeInteger(event.seq) && typeof event.kind === 'string') current = advanceRecoveryJournal(current, event);
+          else damaged = true;
+        } catch { damaged = true; }
+      }
+      carry = joined.subarray(start);
+      if (carry.length > MAX_LINE_BYTES) { damaged = true; carry = Buffer.alloc(0); }
+    }
+    // sealTornTail() ran before this read, so any malformed row is uncertainty about whether
+    // newer recovery-relevant work existed. Recovery execution must fail closed in that case.
+    if (carry.length > 0) damaged = true;
+    if (damaged) return emptyRecoveryJournal(false, journalBytes);
+    return { ...current, offset: journalBytes };
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function checkpointRecoveryJournal(entry: OpenSession, sessionId: string, event: SessionEvent): Promise<void> {
+  const before = entry.recoveryJournal;
+  const advanced = advanceRecoveryJournal(before, event);
+  entry.recoveryJournal = advanced;
+  const becameComplete = !before.complete && advanced.complete;
+  if (!advanced.complete || (!becameComplete && entry.journalBytes - advanced.offset < MAX_RECOVERY_CHECKPOINT_GAP)) return;
+  const checkpoint = { ...advanced, offset: entry.journalBytes };
+  try {
+    await writeRecoveryCheckpoint(sessionId, checkpoint);
+    entry.recoveryJournal = checkpoint;
+  } catch (error) {
+    // The journal remains authoritative. Keep the older offset so a later successful checkpoint
+    // or restart catch-up must traverse this event instead of trusting stale projected authority.
+    logWarn(`session ${sessionId}: recovery checkpoint could not be written: ${(error as Error).message}`);
+  }
+}
+
+function noteRecoveryWork(entry: OpenSession, event: SessionEvent): void {
+  if (!RECOVERY_WORK_KINDS.has(event.kind)) return;
+  entry.recoveryRevision += 1;
+  entry.recoveryEvidence.clear();
+}
+
 /**
  * Whether this chat is over its automatic-compaction line.
  *
@@ -1030,7 +1269,8 @@ export function appendEvent(sessionId: string, event: NewSessionEvent): Promise<
     const write = entry.queue.then(async () => {
       const full = { ...event, seq: entry.nextSeq } as SessionEvent;
       const line = `${JSON.stringify(full)}\n`;
-      if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      if (lineBytes > MAX_LINE_BYTES) {
         throw new Error('Session event is too large to store');
       }
       try {
@@ -1049,13 +1289,16 @@ export function appendEvent(sessionId: string, event: NewSessionEvent): Promise<
         logWarn(`session ${sessionId}: append reported an error after sequence ${full.seq} was already durable`);
       }
       entry.nextSeq += 1;
+      entry.journalBytes += lineBytes;
       entry.tail.push(full);
       if (entry.tail.length > MAX_EVENT_TAIL) {
         const removed = entry.tail.splice(0, entry.tail.length - MAX_EVENT_TAIL);
         entry.tailFrom = removed[removed.length - 1]!.seq + 1;
       }
       applyToSummary(entry.summary, full);
+      noteRecoveryWork(entry, full);
       entry.historySeq = full.seq;
+      await checkpointRecoveryJournal(entry, sessionId, full);
       scheduleMeta(entry);
       return full;
     });
@@ -1150,6 +1393,7 @@ export function upsertMessageEvent(
                 // App-owned originals/previews retain their outbox identity when the
                 // provider later observes different native attachment ids for that send.
                 attachments: previous.inputId ? previous.attachments ?? event.attachments : event.attachments ?? previous.attachments,
+                attachmentDelivery: previous.inputId ? previous.attachmentDelivery ?? event.attachmentDelivery : event.attachmentDelivery ?? previous.attachmentDelivery,
                 inputDelivery: previous.inputDelivery === 'confirmed' ? 'confirmed' : event.inputDelivery ?? previous.inputDelivery,
                 model: event.model ?? previous.model,
                 reasoningEffort: event.reasoningEffort ?? previous.reasoningEffort,
@@ -1188,7 +1432,7 @@ export function upsertMessageEvent(
             previous.goalEligible === nextEvent.goalEligible &&
             previous.providerMessageId === nextEvent.providerMessageId)) &&
         (nextEvent.kind !== 'user_message' || previous.kind !== 'user_message' ||
-          (nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.inputDelivery === previous.inputDelivery && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
+          (nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.attachmentDelivery === previous.attachmentDelivery && nextEvent.inputDelivery === previous.inputDelivery && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
         (previous.turnId ?? undefined) === settledTurnId &&
         (nextEvent.agent === undefined || previous.agent === nextEvent.agent) &&
         (!preferTime || previous.time === nextEvent.time)
@@ -1222,6 +1466,7 @@ export function upsertMessageEvent(
 
       entry.nextSeq += 1;
       entry.messages.set(key, full);
+      noteRecoveryWork(entry, full);
       if (full.kind === 'user_message') refreshUserTitle(entry.summary, entry.messages.values());
       if (!previous) {
         applyToSummary(entry.summary, full);
@@ -1367,6 +1612,157 @@ export async function readRecentEvents(
   return readRecentEventsFromDisk(sessionId, limit, options);
 }
 
+export interface TurnRecoveryEvidence {
+  /** Session projection from the same per-session serialization point as the journal evidence. */
+  session: SessionSummary;
+  /** Newest lifecycle row in that snapshot. */
+  lifecycle: RecoveryLifecycle | null;
+  /** Newest durable work row in that snapshot, canonical message revisions included. */
+  head: RecoveryHead | null;
+  /** Newest exact request-id-attributed MCP execution for the source turn. */
+  exactMcpCall: RecoveryMcpCall | null;
+}
+
+/**
+ * One coherent source-turn evidence snapshot.
+ *
+ * Recovery authority is a causal claim, so its lifecycle boundary, durable work head and
+ * qualifying MCP execution must never be assembled from independently advancing journal reads.
+ * The session queue is the writer serialization boundary; while this read owns it, the canonical
+ * message map and compact journal checkpoint describe one stable revision. Pre-checkpoint sessions
+ * use the bounded journal suffix until a fresh turn or one successful bounded read establishes the
+ * compact projection; old diagnostic volume therefore never becomes new authority.
+ */
+export async function readTurnRecoveryEvidence(
+  sessionId: string,
+  conversationId: string,
+  turnId: string
+): Promise<TurnRecoveryEvidence | null> {
+  assertSessionId(sessionId);
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'recovery evidence read', async () => {
+    if (entry.summary.conversationId !== conversationId) return null;
+    const cacheKey = `${conversationId}\u0000${turnId}`;
+    const cached = entry.recoveryEvidence.get(cacheKey);
+    if (cached?.revision === entry.recoveryRevision) return cached.value;
+    const canonicalKeys = new Set(entry.messages.keys());
+    let head: RecoveryHead | null = null;
+    for (const message of entry.messages.values()) {
+      if (RECOVERY_WORK_KINDS.has(message.kind) && (!head || message.seq > head.seq)) head = compactRecoveryHead(message);
+    }
+    let journalHead = entry.recoveryJournal.complete ? entry.recoveryJournal.head : null;
+    let lifecycle = entry.recoveryJournal.complete ? entry.recoveryJournal.lifecycle : null;
+    let checkpointMcpCall = entry.recoveryJournal.complete ? entry.recoveryJournal.exactMcpCall : null;
+    if (!entry.recoveryJournal.complete) {
+      const damaged = await scanRecentJournal(
+        sessionId,
+        MAX_RECENT_READ_BYTES,
+        (event) => {
+          if ((event.kind === 'user_message' || event.kind === 'assistant_message') &&
+              messageKey(event) && canonicalKeys.has(messageKey(event)!)) return;
+          if (!journalHead && RECOVERY_WORK_KINDS.has(event.kind)) journalHead = compactRecoveryHead(event);
+          if (!lifecycle && (event.kind === 'turn_start' || event.kind === 'turn_end')) lifecycle = compactRecoveryLifecycle(event);
+          if (!checkpointMcpCall && event.kind === 'tool_call') checkpointMcpCall = compactRecoveryMcpCall(event);
+        },
+        () => Boolean(journalHead && lifecycle && checkpointMcpCall)
+      );
+      if (damaged > 0) logWarn(`session ${sessionId}: skipped ${damaged} unreadable recovery evidence line(s)`);
+      if (damaged > 0) {
+        // A damaged row could have been newer causal work. Presentation history tolerates losing
+        // one line; authority cannot. Refuse recovery until a fresh turn establishes a new complete
+        // checkpoint rather than guessing across unreadable history.
+        journalHead = null;
+        lifecycle = null;
+        checkpointMcpCall = null;
+      }
+      // A complete bounded discovery is enough to upgrade a pre-checkpoint active turn. Persist
+      // exactly those already-proven journal facts at EOF; later diagnostic rows can no longer push
+      // them out of reach, while an incomplete scan remains fail-closed and unpersisted.
+      if (journalHead && lifecycle && checkpointMcpCall) {
+        const checkpoint: RecoveryJournalCheckpoint = {
+          version: 1,
+          complete: true,
+          offset: entry.journalBytes,
+          head: journalHead,
+          lifecycle,
+          exactMcpCall: checkpointMcpCall
+        };
+        try {
+          await writeRecoveryCheckpoint(sessionId, checkpoint);
+          entry.recoveryJournal = checkpoint;
+        } catch (error) {
+          logWarn(`session ${sessionId}: recovered evidence checkpoint could not be written: ${(error as Error).message}`);
+        }
+      }
+    }
+    if (journalHead && (!head || journalHead.seq > head.seq)) head = journalHead;
+    const exactMcpCall = checkpointMcpCall?.turnId === turnId && checkpointMcpCall.call.conversationId === conversationId
+      ? checkpointMcpCall
+      : null;
+    const value = { session: cloneSummaryForRead(entry.summary), lifecycle, head, exactMcpCall };
+    entry.recoveryEvidence.set(cacheKey, { revision: entry.recoveryRevision, value });
+    return value;
+  });
+}
+
+/** Parse a bounded JSONL suffix newest-first. Callers decide which facts end their scan. */
+async function scanRecentJournal(
+  sessionId: string,
+  readBudget: number,
+  visit: (event: SessionEvent) => void,
+  done: () => boolean
+): Promise<number> {
+  const file = path.join(sessionDir(sessionId), 'events.jsonl');
+  let damaged = 0;
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(file, 'r');
+    let cursor = (await handle.stat()).size;
+    let bytes = 0;
+    let carry = Buffer.alloc(0);
+    const accept = (line: Buffer): void => {
+      if (done() || line.length === 0) return;
+      if (line.length > MAX_LINE_BYTES) { damaged += 1; return; }
+      let parsed: SessionEvent;
+      try { parsed = JSON.parse(line.toString('utf8')) as SessionEvent; }
+      catch { damaged += 1; return; }
+      if (typeof parsed?.seq !== 'number' || typeof parsed?.kind !== 'string') { damaged += 1; return; }
+      visit(parsed);
+    };
+    while (cursor > 0 && !done() && bytes < readBudget) {
+      const wanted = Math.min(64 * 1024, cursor, readBudget - bytes);
+      if (wanted <= 0) break;
+      cursor -= wanted;
+      const buffer = Buffer.allocUnsafe(wanted);
+      const { bytesRead } = await handle.read(buffer, 0, wanted, cursor);
+      const joined = Buffer.concat([buffer.subarray(0, bytesRead), carry]);
+      bytes += bytesRead;
+      const firstNewline = joined.indexOf(0x0a);
+      if (firstNewline < 0) {
+        if (joined.length > MAX_LINE_BYTES + 1) damaged += 1;
+        carry = joined.subarray(0, Math.min(joined.length, MAX_LINE_BYTES + 1));
+        continue;
+      }
+      carry = joined.subarray(0, firstNewline);
+      const complete = joined.subarray(firstNewline + 1);
+      let endAt = complete.length;
+      for (let at = complete.length - 1; at >= 0 && !done(); at--) {
+        if (complete[at] !== 0x0a) continue;
+        const line = complete.subarray(at + 1, endAt);
+        if (line.length > 0) accept(line);
+        endAt = at;
+      }
+      if (!done() && endAt > 0) accept(complete.subarray(0, endAt));
+    }
+    if (cursor === 0 && !done() && carry.length > 0) accept(carry);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  return damaged;
+}
+
 async function readRecentEventsFromDisk(
   sessionId: string,
   limit: number,
@@ -1390,23 +1786,8 @@ async function readRecentEventsFromDisk(
   // in fixed chunks and retains only this page, never materializing the complete journal.
   const readBudget = options.before === undefined ? Math.max(64 * 1024, Math.min(MAX_RECENT_READ_BYTES, options.maxBytes ?? MAX_RECENT_READ_BYTES)) : Number.POSITIVE_INFINITY;
 
-  const accept = (line: Buffer): void => {
-    if (rawTail.length >= cap || line.length === 0) return;
-    if (line.length > MAX_LINE_BYTES) {
-      damaged += 1;
-      return;
-    }
-    let parsed: SessionEvent;
-    try {
-      parsed = JSON.parse(line.toString('utf8')) as SessionEvent;
-    } catch {
-      damaged += 1;
-      return;
-    }
-    if (typeof parsed?.seq !== 'number' || typeof parsed?.kind !== 'string') {
-      damaged += 1;
-      return;
-    }
+  const accept = (parsed: SessionEvent): void => {
+    if (rawTail.length >= cap) return;
     if (options.before !== undefined && parsed.seq >= options.before) return;
     if (options.kinds && !options.kinds.includes(parsed.kind)) return;
     if (options.agent && parsed.agent !== options.agent) return;
@@ -1419,47 +1800,7 @@ async function readRecentEventsFromDisk(
     }
     rawTail.push(parsed);
   };
-
-  const file = path.join(sessionDir(sessionId), 'events.jsonl');
-  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
-  try {
-    handle = await fs.open(file, 'r');
-    let cursor = (await handle.stat()).size;
-    let bytes = 0;
-    let carry = Buffer.alloc(0);
-    while (cursor > 0 && rawTail.length < cap && bytes < readBudget) {
-      const wanted = Math.min(64 * 1024, cursor, readBudget - bytes);
-      if (wanted <= 0) break;
-      cursor -= wanted;
-      const buffer = Buffer.allocUnsafe(wanted);
-      const { bytesRead } = await handle.read(buffer, 0, wanted, cursor);
-      const joined = Buffer.concat([buffer.subarray(0, bytesRead), carry]);
-      bytes += bytesRead;
-      const firstNewline = joined.indexOf(0x0a);
-      if (firstNewline < 0) {
-        // A corrupt/no-newline tail used to repeatedly copy the complete 8 MiB budget:
-        // 64 KiB + 128 KiB + ... . Retain only one maximum event while seeking a boundary.
-        if (joined.length > MAX_LINE_BYTES + 1) damaged += 1;
-        carry = joined.subarray(0, Math.min(joined.length, MAX_LINE_BYTES + 1));
-        continue;
-      }
-      carry = joined.subarray(0, firstNewline);
-      const complete = joined.subarray(firstNewline + 1);
-      let endAt = complete.length;
-      for (let at = complete.length - 1; at >= 0 && rawTail.length < cap; at--) {
-        if (complete[at] !== 0x0a) continue;
-        const line = complete.subarray(at + 1, endAt);
-        if (line.length > 0) accept(line);
-        endAt = at;
-      }
-      if (rawTail.length < cap && endAt > 0) accept(complete.subarray(0, endAt));
-    }
-    if (cursor === 0 && rawTail.length < cap && carry.length > 0) accept(carry);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  } finally {
-    await handle?.close().catch(() => undefined);
-  }
+  damaged += await scanRecentJournal(sessionId, readBudget, accept, () => rawTail.length >= cap);
 
   const candidates: SessionEvent[] = [...rawTail];
   for (const message of messages.values()) {
@@ -1585,7 +1926,8 @@ export async function rewriteUnattributedToolCalls(
 
     const target = path.join(sessionDir(sessionId), 'events.jsonl');
     const tmp = `${target}.repair-${process.pid}-${Date.now()}.tmp`;
-    await fs.writeFile(tmp, kept.map((event) => `${JSON.stringify(event)}\n`).join(''), 'utf8');
+    const journalText = kept.map((event) => `${JSON.stringify(event)}\n`).join('');
+    await fs.writeFile(tmp, journalText, 'utf8');
     await fs.rename(tmp, target);
 
     const staged: SessionSummary = {
@@ -1617,6 +1959,15 @@ export async function rewriteUnattributedToolCalls(
     Object.assign(entry.summary, staged);
     entry.nextSeq = kept.length + 1;
     entry.historySeq = rewrittenHistorySeq;
+    entry.journalBytes = Buffer.byteLength(journalText);
+    let recoveryJournal = emptyRecoveryJournal(true, 0);
+    for (const event of kept) recoveryJournal = advanceRecoveryJournal(recoveryJournal, event);
+    recoveryJournal = { ...recoveryJournal, offset: entry.journalBytes };
+    entry.recoveryJournal = recoveryJournal;
+    entry.recoveryRevision += 1;
+    entry.recoveryEvidence.clear();
+    await writeRecoveryCheckpoint(sessionId, recoveryJournal).catch(error =>
+      logWarn(`session ${sessionId}: unattributed rewrite recovery checkpoint could not be written: ${String(error)}`));
     entry.tail = kept.slice(-MAX_EVENT_TAIL);
     entry.tailFrom = entry.tail[0]?.seq ?? entry.nextSeq;
     entry.activityHydrated = true;

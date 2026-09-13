@@ -41,7 +41,7 @@
  * into somebody's conversation.
  */
 
-import { requestBrowserDecision, authorizeBrowserHelperRetry } from './session/input.js';
+import { requestBrowserDecision, authorizeBrowserHelperRetry, listInputs } from './session/input.js';
 import { userPromptText } from '../shared/user-prompt.js';
 import { planProgressText, type TaskProgressUpdate } from '../shared/task-progress.js';
 import { TaskRequestError } from './task-request.js';
@@ -54,15 +54,14 @@ import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
 import { getSession, readEvents, readHandoff, readRecentEvents } from './session/store.js';
 import { foldProgress } from '../shared/session.js';
-import { isAstraModel } from '../shared/chat-models.js';
-
-/** Astra continuation belongs to session_finish, never to a new browser turn. */
-export async function astraFinishOnly(sessionId: string, conversationId: string): Promise<boolean> {
-  const session = await getSession(sessionId);
-  const selection = session?.selectedModel;
-  return session?.conversationId === conversationId && selection?.conversationId === conversationId &&
-    isAstraModel(selection.model, selection.reasoningEffort);
-}
+import { isAstraModel, isProModel, supportsAfterTurnLoop } from '../shared/chat-models.js';
+import {
+  recoveryGrantSchema,
+  deferRecoveryGrant,
+  recoveryProofSchema,
+  validateRecoveryProof,
+  type RecoveryGrant
+} from './session/recovery-proof.js';
 import { resumeBootstrapMatches, resumeBootstrapText } from './session/handoff.js';
 import {
   GOAL_LOOP_STOP_REFUSED,
@@ -72,7 +71,33 @@ import {
   GOAL_SYSTEM_TRAILER,
   goalObjectiveMessage
 } from '../shared/goal.js';
-import type { GoalMode, GoalProviderKind, GoalReasoning } from '../shared/types.js';
+import type { GoalMode, GoalProviderKind, GoalReasoning, LoopTrigger } from '../shared/types.js';
+
+/** Durable preference only. It grants no browser continuation without current model proof. */
+export function loopTriggerPreferenceFor(conversationId: string): LoopTrigger {
+  return goalSwitchFor(conversationId).loopTrigger;
+}
+
+/** Browser continuation is an exact-current-model capability, never a stale chat preference. */
+export async function effectiveLoopAfterTurnFor(sessionId: string, conversationId: string): Promise<boolean> {
+  const session = await getSession(sessionId);
+  const selection = session?.selectedModel;
+  const control = goalSwitchFor(conversationId);
+  return session?.conversationId === conversationId && selection?.conversationId === conversationId &&
+    control.enabled && control.mode === 'loop' && control.loopTrigger === 'after-turn' &&
+    supportsAfterTurnLoop(selection.model, selection.reasoningEffort);
+}
+
+/** Astra is always finish-only. Other Pro models default there unless exact opt-in is effective. */
+export async function requiresFinishOnlyContinuation(sessionId: string, conversationId: string): Promise<boolean> {
+  const session = await getSession(sessionId);
+  const selection = session?.selectedModel;
+  if (session?.conversationId !== conversationId || selection?.conversationId !== conversationId) return false;
+  if (isAstraModel(selection.model, selection.reasoningEffort)) return true;
+  const control = goalSwitchFor(conversationId);
+  return control.mode === 'loop' && isProModel(selection.model, selection.reasoningEffort) &&
+    !(control.enabled && control.loopTrigger === 'after-turn' && supportsAfterTurnLoop(selection.model, selection.reasoningEffort));
+}
 
 /** Where OpenRouter lives. One host, both routes. */
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
@@ -391,8 +416,8 @@ function notifyGoalChange(): void { for (const listener of goalListeners) listen
  * only an explicit later activation may turn that exact tombstone into a fresh pickup.
  */
 interface GoalReplyObligation {
-  /** Non-Pro identity was captured with this source turn, before its silence grant retired. */
-  silenceSourceTurnId?: string;
+  /** Recovery-derived continuation authority. Normal final replies need no recovery proof. */
+  recovery?: RecoveryGrant;
   conversationId: string;
   sessionId: string;
   replyId: string;
@@ -438,24 +463,51 @@ function boundGoalReplies(now: number): void {
 export const GOAL_REPLIES_STATE = 'goal-replies';
 
 export interface GoalRepliesSnapshot {
-  version: 1;
+  version: 2;
   savedAt: number;
   replies: GoalReplyObligation[];
 }
+export type StoredGoalRepliesSnapshot = GoalRepliesSnapshot | {
+  version: 1;
+  savedAt: number;
+  replies: GoalReplyObligation[];
+};
 
 export function snapshotGoalReplies(): GoalRepliesSnapshot {
   boundGoalReplies(Date.now());
   return {
-    version: 1,
+    version: 2,
     savedAt: Date.now(),
-    replies: [...goalReplies.values()].map((reply) => ({ ...reply }))
+    replies: [...goalReplies.values()].map((reply) => ({ ...reply,
+      ...(reply.recovery ? { recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } } : {}) }))
   };
 }
 
-export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
+function migrateRecoveryGrant(raw: unknown): RecoveryGrant | undefined {
+  const canonical = recoveryGrantSchema.safeParse(raw);
+  if (canonical.success) return canonical.data;
+  if (!raw || typeof raw !== 'object') return undefined;
+  const legacy = raw as { kind?: unknown; conversationId?: unknown; turnId?: unknown; workSeq?: unknown;
+    mcpCallSeq?: unknown; model?: unknown; deferUntil?: unknown };
+  const proof = recoveryProofSchema.safeParse({
+    kind: legacy.kind,
+    conversationId: legacy.conversationId,
+    turnId: legacy.turnId,
+    headSeq: legacy.workSeq,
+    mcpCallSeq: legacy.mcpCallSeq,
+    modelClass: legacy.model
+  });
+  if (!proof.success) return undefined;
+  return { proof: proof.data,
+    ...(typeof legacy.deferUntil === 'number' && Number.isFinite(legacy.deferUntil) && legacy.deferUntil >= 0
+      ? { notBefore: legacy.deferUntil } : {}) };
+}
+
+export function restoreGoalReplies(snapshot: StoredGoalRepliesSnapshot | null): void {
   goalReplies.clear();
-  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.replies)) return;
+  if (!snapshot || (snapshot.version !== 1 && snapshot.version !== 2) || !Array.isArray(snapshot.replies)) return;
   for (const raw of snapshot.replies) {
+    const legacy = raw as GoalReplyObligation & { continuationBoundary?: unknown; silenceSourceTurnId?: string; silencePro?: boolean; listenUntil?: number };
     if (
       !raw ||
       !/^[0-9a-z-]{8,256}$/i.test(raw.conversationId) ||
@@ -468,13 +520,24 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
       raw.acceptedAt <= 0 ||
       (raw.state !== 'pending' && raw.state !== 'handled')
     ) continue;
+    const migratedRecovery = migrateRecoveryGrant(raw.recovery ?? legacy.continuationBoundary);
+    const shippedRecovery: RecoveryGrant | undefined = !migratedRecovery && legacy.silenceSourceTurnId ? {
+      proof: {
+        kind: legacy.replyId.startsWith('silence:failed:') ? 'thinking-failed' : 'recovered-silence',
+        conversationId: legacy.conversationId,
+        turnId: legacy.silenceSourceTurnId.slice(0, 256),
+        headSeq: raw.eventSeq,
+        mcpCallSeq: 0,
+        modelClass: 'unknown'
+      },
+      ...(Number.isSafeInteger(legacy.listenUntil) && legacy.listenUntil! > 0 ? { notBefore: legacy.listenUntil } : {})
+    } : undefined;
     goalReplies.set(raw.conversationId, {
       conversationId: raw.conversationId,
       sessionId: String(raw.sessionId).slice(0, 200),
       replyId: String(raw.replyId).slice(0, 200),
       turnId: String(raw.turnId).slice(0, 200),
-      ...(typeof raw.silenceSourceTurnId === 'string' && raw.silenceSourceTurnId ?
-        { silenceSourceTurnId: raw.silenceSourceTurnId.slice(0, 200) } : {}),
+      ...((migratedRecovery ?? shippedRecovery) ? { recovery: migratedRecovery ?? shippedRecovery } : {}),
       eventSeq: raw.eventSeq,
       acceptedAt: raw.acceptedAt,
       state: raw.state
@@ -507,7 +570,7 @@ export function goalDraftBusy(conversationId: string): boolean {
 
 export function goalPendingReplyFor(
   conversationId: string
-): Pick<GoalReplyObligation, 'replyId' | 'turnId' | 'eventSeq' | 'acceptedAt' | 'silenceSourceTurnId'> | null {
+): Pick<GoalReplyObligation, 'replyId' | 'turnId' | 'eventSeq' | 'acceptedAt' | 'recovery'> | null {
   const reply = goalReplies.get(conversationId);
   // Expiry is read here as well as pruned on write, because the ledger is only pruned when
   // something writes to it. A chat reopened after the window must not be offered work the
@@ -515,7 +578,7 @@ export function goalPendingReplyFor(
   if (reply && Date.now() - reply.acceptedAt >= GOAL_REPLY_TTL_MS) return null;
   return reply?.state === 'pending'
     ? { replyId: reply.replyId, turnId: reply.turnId, eventSeq: reply.eventSeq, acceptedAt: reply.acceptedAt,
-      ...(reply.silenceSourceTurnId ? { silenceSourceTurnId: reply.silenceSourceTurnId } : {}) }
+      ...(reply.recovery ? { recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } } : {}) }
     : null;
 }
 
@@ -545,17 +608,20 @@ export function pendingGoalReplies(
 
 /** Freezes Goal eligibility at the durable recorder boundary. */
 export async function acceptGoalReplyNow(input: {
-  silenceSourceTurnId?: string;
+  recovery?: RecoveryGrant;
   conversationId: string;
   sessionId: string;
   replyId: string;
   turnId: string;
   eventSeq: number;
   blocked: boolean;
-}): Promise<void> {
-  if (await astraFinishOnly(input.sessionId, input.conversationId)) return;
+  current?: () => boolean;
+}): Promise<boolean> {
+  if (await requiresFinishOnlyContinuation(input.sessionId, input.conversationId)) return false;
+  if (input.recovery && !await validateRecoveryProof(input.sessionId, input.recovery.proof)) return false;
   const current = goalReplies.get(input.conversationId);
-  if (current?.replyId === input.replyId || (current && current.eventSeq > input.eventSeq)) return;
+  if (current?.replyId === input.replyId) return true;
+  if (current && current.eventSeq > input.eventSeq) return false;
   const provisionalUpgrade = Boolean(
     current &&
       current.eventSeq === 0 &&
@@ -569,12 +635,14 @@ export async function acceptGoalReplyNow(input: {
     getConfig().sessions.record &&
     goalArmedFor(input.conversationId) &&
     await goalKeyPresent(goalSwitchFor(input.conversationId).mode);
+  if (input.current && !input.current()) return false;
+  if (input.recovery && !await validateRecoveryProof(input.sessionId, input.recovery.proof)) return false;
   goalReplies.set(input.conversationId, {
     conversationId: input.conversationId,
     sessionId: input.sessionId,
     replyId: input.replyId.slice(0, 200),
     turnId: input.turnId.slice(0, 200),
-    ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
+    ...(input.recovery ? { recovery: { ...input.recovery, proof: { ...input.recovery.proof } } } : {}),
     eventSeq: input.eventSeq,
     // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
     // stable assistant id. The later id strengthens that same row; it must not re-evaluate
@@ -595,6 +663,7 @@ export async function acceptGoalReplyNow(input: {
     persistGoalRepliesSoon();
     throw error;
   }
+  return true;
 }
 
 function handleGoalReply(conversationId: string, turnId?: string): void {
@@ -756,7 +825,7 @@ export interface GoalSwitchesSnapshot {
  * old conversation is retired: turning Goal off where it pops up writes `enabled: false` for
  * that chat alone, and no later app-wide change can revive it.
  */
-type GoalSwitchRow = { enabled: boolean; mode: GoalMode; at: number; role?: 'decision'; sourceSessionId?: string;
+type GoalSwitchRow = { enabled?: boolean; mode?: GoalMode; loopTrigger?: 'after-turn'; at: number; role?: 'decision'; sourceSessionId?: string;
   context?: { count: number; hash: string; instructions: string } };
 const goalSwitches = new Map<string, GoalSwitchRow>();
 let goalSwitchWrites: Promise<unknown> = Promise.resolve();
@@ -798,13 +867,17 @@ export function restoreGoalSwitches(snapshot: GoalSwitchesSnapshot | null): void
   if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.switches)) return;
   for (const raw of snapshot.switches) {
     if (!raw || typeof raw.conversationId !== 'string' || !/^[0-9a-z-]{8,256}$/i.test(raw.conversationId)) continue;
-    if (typeof raw.enabled !== 'boolean' || (raw.mode !== 'goal' && raw.mode !== 'loop')) continue;
+    const automation = typeof raw.enabled === 'boolean' && (raw.mode === 'goal' || raw.mode === 'loop');
+    const afterTurn = raw.loopTrigger === 'after-turn';
+    if (raw.role === 'decision' ? !automation : !automation && !afterTurn) continue;
     const at = Number.isSafeInteger(raw.at) && raw.at > 0 ? raw.at : Date.now();
     const sourceSessionId = raw.role === 'decision' && typeof raw.sourceSessionId === 'string' && /^[\w-]{8,64}$/.test(raw.sourceSessionId)
       && ![...goalSwitches.values()].some(row => row.sourceSessionId === raw.sourceSessionId) ? raw.sourceSessionId : undefined;
     const context = sourceSessionId && raw.context && Number.isSafeInteger(raw.context.count) && raw.context.count >= 0
       && /^[a-f0-9]{64}$/.test(raw.context.hash) && /^[a-f0-9]{64}$/.test(raw.context.instructions) ? raw.context : undefined;
-    goalSwitches.set(raw.conversationId, { enabled: raw.role === 'decision' ? false : raw.enabled, mode: raw.mode, at,
+    goalSwitches.set(raw.conversationId, { at,
+      ...(automation ? { enabled: raw.role === 'decision' ? false : raw.enabled, mode: raw.mode } : {}),
+      ...(afterTurn && raw.role !== 'decision' ? { loopTrigger: 'after-turn' as const } : {}),
       ...(raw.role === 'decision' ? { role: 'decision' as const, sourceSessionId, context } : {}) });
   }
   boundGoalSwitches();
@@ -815,11 +888,17 @@ function persistGoalSwitches(): void {
 }
 
 /** This chat's switch: its own override when it has one, otherwise the app-wide setting. */
-export function goalSwitchFor(conversationId: string): { enabled: boolean; mode: GoalMode; own: boolean } {
-  const own = goalSwitches.get(conversationId);
-  if (own) return { enabled: own.role !== 'decision' && own.enabled, mode: own.mode, own: true };
+export function goalSwitchFor(conversationId: string): { enabled: boolean; mode: GoalMode; own: boolean; loopTrigger: LoopTrigger } {
+  const row = goalSwitches.get(conversationId);
   const goal = getConfig().goal;
-  return { enabled: goal.enabled, mode: goal.mode, own: false };
+  if (row?.role === 'decision') return { enabled: false, mode: row.mode ?? goal.mode, own: true, loopTrigger: 'session-finish' };
+  const ownsAutomation = typeof row?.enabled === 'boolean' && (row.mode === 'goal' || row.mode === 'loop');
+  return {
+    enabled: ownsAutomation ? row!.enabled! : goal.enabled,
+    mode: ownsAutomation ? row!.mode! : goal.mode,
+    own: ownsAutomation,
+    loopTrigger: row?.loopTrigger ?? 'session-finish'
+  };
 }
 
 /** One authority for finish generation and the lifetime of its queued instruction. */
@@ -845,7 +924,7 @@ export function registerGoalDecisionChat(conversationId: string, sourceSessionId
       throw new Error('goal_helper_capacity');
     }
     const previous = new Map(goalSwitches);
-    const row: GoalSwitchRow = { enabled: false, mode: before?.mode ?? 'goal', at: Date.now(), role: 'decision', sourceSessionId };
+    const row: GoalSwitchRow = { enabled: false, mode: goalSwitchFor(conversationId).mode, at: Date.now(), role: 'decision', sourceSessionId };
     goalSwitches.set(conversationId, row);
     const snapshot = snapshotGoalSwitches();
     const staged = new Map(goalSwitches);
@@ -899,18 +978,42 @@ export async function setGoalSwitchNow(
 ): Promise<{ enabled: boolean; mode: GoalMode }> {
   return serialGoalSwitch(async () => {
     const before = goalSwitches.get(conversationId);
-    if (before?.role === 'decision') return { enabled: false, mode: before.mode };
+    if (before?.role === 'decision') return { enabled: false, mode: before.mode ?? goalSwitchFor(conversationId).mode };
     if (!before && [...goalSwitches.values()].filter(row => row.role === 'decision').length >= MAX_GOAL_SWITCHES) {
       throw new Error('goal_switch_capacity');
     }
     const next = applyGoalSwitch(goalSwitchFor(conversationId), which, on);
-    goalSwitches.set(conversationId, { enabled: next.enabled, mode: next.mode, at: Date.now() });
+    goalSwitches.set(conversationId, { enabled: next.enabled, mode: next.mode,
+      ...(before?.loopTrigger ? { loopTrigger: before.loopTrigger } : {}), at: Date.now() });
     try {
       await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
       return { enabled: next.enabled, mode: next.mode };
     } catch (error) {
       goalSwitches.delete(conversationId);
       if (before) goalSwitches.set(conversationId, before);
+      writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
+      throw error;
+    }
+  });
+}
+
+/** Changes only the Loop trigger; it can never enable or change automation mode. */
+export async function setGoalLoopTriggerNow(conversationId: string, trigger: LoopTrigger): Promise<void> {
+  await serialGoalSwitch(async () => {
+    const before = goalSwitches.get(conversationId);
+    if (before?.role === 'decision') throw new Error('goal_worker_chat');
+    const control = goalSwitchFor(conversationId);
+    if (!control.enabled || control.mode !== 'loop') throw new Error('loop_not_active');
+    const next: GoalSwitchRow | null = trigger === 'after-turn'
+      ? { ...(before ?? { at: Date.now() }), loopTrigger: 'after-turn', at: Date.now() }
+      : before && (typeof before.enabled === 'boolean' || before.role)
+        ? { ...before, loopTrigger: undefined, at: Date.now() }
+        : null;
+    if (next) goalSwitches.set(conversationId, next);
+    else goalSwitches.delete(conversationId);
+    try { await writeDurableNow(GOAL_SWITCHES_STATE, snapshotGoalSwitches()); }
+    catch (error) {
+      if (before) goalSwitches.set(conversationId, before); else goalSwitches.delete(conversationId);
       writeDurableSoon(GOAL_SWITCHES_STATE, snapshotGoalSwitches());
       throw error;
     }
@@ -1156,10 +1259,10 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   if (!before) return Boolean(draft);
 
   const previous = { ...before };
-  before.state = active ? 'pending' : 'handled';
+  before.state = active && !before.recovery ? 'pending' : 'handled';
   // A deliberate On is a new pickup episode for the same stable final reply. It gets the
   // recovery schedule from now, not from when that answer happened under an Off switch.
-  if (active) before.acceptedAt = Math.max(Date.now(), previous.acceptedAt + 1);
+  if (active && !before.recovery) before.acceptedAt = Math.max(Date.now(), previous.acceptedAt + 1);
   try {
     await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
   } catch (error) {
@@ -1170,22 +1273,28 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
   return true;
 }
 
-/** A fabricated silence reply is not a final answer that a later On may re-arm. */
-export async function withdrawSilenceGoalReplyNow(conversationId: string, replyId: string): Promise<void> {
+/** A recovery continuation is a tombstone after revocation; a later On may never re-arm it. */
+export async function withdrawRecoveryGoalReplyNow(conversationId: string, replyId: string): Promise<void> {
   const reply = goalReplies.get(conversationId);
-  if (!reply || reply.replyId !== replyId ||
-      !(reply.replyId.startsWith('silence:') || reply.turnId.startsWith('g-silence-'))) return;
+  if (!reply || reply.replyId !== replyId || !reply.recovery) return;
   await setGoalReplyActiveNow(conversationId, false);
-  if (goalReplies.get(conversationId) !== reply) return;
-  goalReplies.delete(conversationId);
-  try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-  } catch (error) {
-    // This is revocation of fabricated authority, not a retryable final obligation.
-    // Keep it absent in memory; a restart also rejects legacy rows without source proof.
+}
+
+/** Native busy after refresh defers this exact ticket; it never earns another ticket. */
+export async function deferRecoveryGoalReplyNow(conversationId: string, turnId: string): Promise<boolean> {
+  const reply = goalReplies.get(conversationId);
+  if (!reply || reply.state !== 'pending' || reply.turnId !== turnId || !reply.recovery) return false;
+  if ((reply.recovery.notBefore ?? 0) > Date.now()) return true;
+  const previous = { ...reply, recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } };
+  const next = { ...reply, recovery: deferRecoveryGrant(reply.recovery) };
+  goalReplies.set(conversationId, next);
+  try { await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies()); }
+  catch (error) {
+    if (goalReplies.get(conversationId) === next) goalReplies.set(conversationId, previous);
     persistGoalRepliesSoon();
     throw error;
   }
+  return goalReplies.get(conversationId) === next;
 }
 
 export function resetGoalStateForTests(): void {
@@ -1492,7 +1601,7 @@ async function requestDrivingDecision(
 }
 
 async function run(draft: GoalDraft): Promise<void> {
-  if (await astraFinishOnly(draft.sessionId, draft.conversationId)) return settle(draft, 'no-reply');
+  if (await requiresFinishOnlyContinuation(draft.sessionId, draft.conversationId)) return settle(draft, 'no-reply');
   const { endpoint, reasoning } = draft;
   const key = draft.backend === 'api' ? await goalProviderKey(endpoint.kind) : null;
   if (draft.acknowledged || drafts.get(draft.conversationId) !== draft) return;
@@ -1552,7 +1661,7 @@ async function run(draft: GoalDraft): Promise<void> {
       }
     });
     if (draft.acknowledged || drafts.get(draft.conversationId) !== draft) return;
-    if (await astraFinishOnly(draft.sessionId, draft.conversationId)) return settle(draft, 'no-reply');
+    if (await requiresFinishOnlyContinuation(draft.sessionId, draft.conversationId)) return settle(draft, 'no-reply');
     // Logged like the exception path below. Ten rate limits in a row on 2026-09-02 left no
     // trace in app.log because a provider's refusal is an answer, not an exception.
     if (decision.action === 'http' || decision.action === 'invalid') {
@@ -1577,9 +1686,10 @@ async function run(draft: GoalDraft): Promise<void> {
       draft.reply = '';
       return settle(draft, 'no-reply');
     }
-    // Typed rather than written. See humanReply: the em dashes go, and a couple of the
-    // mistakes a person leaves behind go in. After the NO_REPLY test above, never before it.
-    draft.reply = draft.backend === 'templates' ? humanReply(decision.reply.slice(0, -GOAL_MARKER_INSTRUCTION.length)) + GOAL_MARKER_INSTRUCTION : humanReply(decision.reply);
+    // The provider/template decision is the authored instruction. Preserve it byte-for-byte:
+    // deliberately introducing punctuation changes or typos can change paths, commands and
+    // technical meaning, and creates a second text transformation with no authority value.
+    draft.reply = decision.reply;
     logInfo(`goal: drafted ${decision.reply.length} characters for ${draft.conversationId} with ${draft.model}`);
     settle(draft, 'ready');
   } catch (err) {
@@ -1628,7 +1738,6 @@ export async function draftFastFollowup(sessionId: string, signal: AbortSignal =
   const session = await getSession(sessionId);
   if (!session?.conversationId) throw new Error('This session has no current conversation');
   const objective = goalObjectiveFor(session.conversationId);
-  const { listInputs } = await import('./session/input.js');
   const inputs = await listInputs();
   const appInput = inputs.filter(entry => entry.sessionId === sessionId && entry.purpose !== 'decision' && !entry.finishOwner &&
     ['tool', 'sent'].includes(entry.state)).slice(-5).map(entry => entry.text);
@@ -1728,7 +1837,7 @@ export async function draftOpeningMessage(
     // that never started with nothing on screen to say why.
     if (decision.action === 'stop') return { error: 'nothing_to_open_with' };
     logInfo(`goal: drafted an opening message of ${decision.reply.length} characters with ${model}`);
-    return { reply: humanReply(decision.reply), model };
+    return { reply: decision.reply, model };
   } catch (err) {
     const detail = (err as Error).message;
     const error = abort.signal.aborted ? 'timeout_or_cancelled' : `request_failed: ${detail}`;
@@ -2248,172 +2357,6 @@ export async function conversationMessages(sessionId: string, deliveredInput: re
   return [...anchors, ...selected]
     .sort((left, right) => left.at - right.at)
     .map((entry) => entry.message);
-}
-
-/*
- * ---------------------------------------------------------------------------------------
- * Typing it, rather than writing it
- * ---------------------------------------------------------------------------------------
- *
- * Two things give away a chat message a model composed, and neither of them survives being
- * asked nicely in a system prompt.
- *
- * The first is the em dash. It is not on a keyboard, nobody reaches for it halfway through
- * firing off a follow-up, and one of them in a lowercase two-sentence message is the whole
- * tell on its own.
- *
- * The second is that the message is *clean*. Real messages in a conversation like this one
- * have a dropped apostrophe or a transposed pair in them, because the person typing them did
- * not go back to fix it. A model asked to write casually still writes correctly.
- *
- * Both are applied to the finished reply, after `NO_REPLY` has been ruled out: the stopping
- * condition is matched against what the model actually said, never against a string this
- * file has been editing.
- *
- * ## Why none of it is random
- *
- * One finished turn is one message. A retried POST, a second observer and a reloaded tab all
- * ask for the same draft again, and the idempotency that keeps two messages out of somebody's
- * conversation only holds if asking twice returns the identical string. Anything drawn from a
- * clock or `Math.random` would quietly turn one draft into several different messages
- * depending on who asked and when. So the seed is the draft itself.
- */
-
-/** FNV-1a over the draft, so every choice below is the draft's own and never a clock's. */
-function seedOf(text: string): number {
-  let hash = 0x811c9dc5;
-  for (let at = 0; at < text.length; at++) {
-    hash ^= text.charCodeAt(at);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  return hash >>> 0 || 1;
-}
-
-/** xorshift32. Small, and the only thing it decides is which words carry the mistakes. */
-function stepped(seed: number): () => number {
-  let state = seed >>> 0 || 1;
-  return () => {
-    state ^= state << 13;
-    state >>>= 0;
-    state ^= state >>> 17;
-    state ^= state << 5;
-    state >>>= 0;
-    return state;
-  };
-}
-
-/**
- * The em dash, and the spaced en dash that is the same move by another character.
- *
- * A comma is what that sentence looks like when it is typed instead, so that is the default.
- * The exceptions are the shapes where a comma would be wrong or doubled: a dash opening or
- * closing a line is a bullet or a trailing thought and simply goes, a dash already sitting
- * against punctuation leaves a space behind, and a dash between two digits is a range and
- * becomes the hyphen somebody would actually have reached for.
- *
- * The whitespace class is horizontal only. A plain `\s*` would have swallowed the newlines
- * around a dash at the start of a line and welded a list into one paragraph.
- */
-function undash(text: string): string {
-  return text.replace(/[^\S\r\n]*[—–][^\S\r\n]*/g, (match, at: number, whole: string) => {
-    const before = at > 0 ? whole[at - 1] : '';
-    const after = whole[at + match.length] ?? '';
-    if (!before || before === '\n') return '';
-    if (!after || after === '\n') return '';
-    if (/[0-9]/.test(before) && /[0-9]/.test(after)) return '-';
-    if (/[,;:]/.test(before) || /[,;:.!?]/.test(after)) return ' ';
-    return ', ';
-  });
-}
-
-/**
- * Text a mistake must never be put into.
- *
- * A typo is only harmless in prose. Inside a path, a command, a URL or a file name it is a
- * different instruction, and the whole point of this message is that ChatGPT acts on it.
- */
-const PROTECTED = /```[\s\S]*?```|`[^`\n]*`|https?:\/\/\S+|\S+[\\/@]\S+|[\w-]+\.[\w-]+/g;
-
-/** One plain lowercase word: no capitals, so an acronym or a model id is never a candidate. */
-const CANDIDATE = /(?<![\w'’-])[a-z][a-z'’]{2,}[a-z](?![\w'’-])/g;
-
-/**
- * The mistake this word would carry, or null when it has none available.
- *
- * In the order a real one happens. The dropped apostrophe is far and away the commonest and
- * the least jarring to read, so it is tried first; the collapsed double letter next; the
- * transposition last, because it is the most visible and a message full of them reads as
- * broken rather than as fast.
- */
-function mistyped(word: string): string | null {
-  if (/['’]/.test(word)) {
-    const dropped = word.replace(/['’]/g, '');
-    if (dropped.length >= 3 && dropped !== word) return dropped;
-  }
-  if (word.length >= 5) {
-    const doubled = /([a-z])\1/.exec(word);
-    if (doubled) return word.slice(0, doubled.index) + word.slice(doubled.index + 1);
-  }
-  if (word.length >= 5) {
-    // Never the first or last letter: those are the two a reader recognises a word by at a
-    // glance, and swapping either reads as a different word rather than as a slip.
-    for (let at = Math.floor((word.length - 1) / 2); at >= 1; at--) {
-      if (at + 1 <= word.length - 2 && word[at] !== word[at + 1]) {
-        return word.slice(0, at) + word[at + 1] + word[at] + word.slice(at + 2);
-      }
-    }
-  }
-  return null;
-}
-
-/** Every word that could carry a mistake, with where it is and what it becomes. */
-function typoSites(text: string): Array<{ at: number; word: string; typo: string }> {
-  const guarded: Array<[number, number]> = [];
-  PROTECTED.lastIndex = 0;
-  for (let found = PROTECTED.exec(text); found; found = PROTECTED.exec(text)) {
-    guarded.push([found.index, found.index + found[0].length]);
-  }
-  const out: Array<{ at: number; word: string; typo: string }> = [];
-  CANDIDATE.lastIndex = 0;
-  for (let found = CANDIDATE.exec(text); found; found = CANDIDATE.exec(text)) {
-    const at = found.index;
-    const word = found[0];
-    if (guarded.some(([from, to]) => at < to && at + word.length > from)) continue;
-    const typo = mistyped(word);
-    if (typo) out.push({ at, word, typo });
-  }
-  return out;
-}
-
-/**
- * The finished draft, as it would have been typed.
- *
- * `undash` always runs. The mistakes are deliberately few — one, and one more for every
- * couple of hundred characters after that, never more than three — because a message with a
- * slip in every sentence is a tell of its own in the other direction. They are spread by
- * dividing the candidate words into that many buckets and taking one from each, so two of
- * them never land in the same breath.
- */
-export function humanReply(reply: string): string {
-  const text = undash(reply);
-  const sites = typoSites(text);
-  if (sites.length === 0) return text;
-  const wanted = Math.min(3, 1 + Math.floor(text.length / 220));
-  const next = stepped(seedOf(text));
-  const chosen = new Set<number>();
-  const bucket = sites.length / wanted;
-  for (let index = 0; index < wanted; index++) {
-    const from = Math.floor(index * bucket);
-    const to = Math.max(from + 1, Math.min(sites.length, Math.floor((index + 1) * bucket)));
-    chosen.add(from + (next() % (to - from)));
-  }
-  let out = text;
-  // Back to front, so an edit never moves the offset of one still to come.
-  for (const index of [...chosen].sort((a, b) => b - a)) {
-    const site = sites[index]!;
-    out = out.slice(0, site.at) + site.typo + out.slice(site.at + site.word.length);
-  }
-  return out;
 }
 
 function clip(text: string): string {

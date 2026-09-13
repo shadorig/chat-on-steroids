@@ -188,6 +188,43 @@ it('keeps an explicit model denial unavailable even when the preset is visible',
   const f = fixture(); (f.props.modelSwitcherDenialsBySlug as any)['future-model'] = { reason: 'workspace_policy' };
   expect(await f.api.inspectModelSettings()).toEqual([{ id: 'gpt-5-6-thinking', label: 'GPT-5.6 Sol', efforts: ['medium', 'high'], aliases: ['gpt-5-6-thinking'] }]);
 });
+it('reads the September closed 6 Pro dropdown without opening or changing a working composer', async () => {
+  const f = fixture(), doc = page.window.document, trigger = doc.querySelector('button')!;
+  const pro = f.selections[0]![2]!;
+  pro.availability.status = 'available';
+  f.state.currentBucket = pro.bucket; f.state.currentSelection = pro;
+  trigger.innerHTML = '<span>6</span><span>Pro</span>';
+  (trigger as any).__reactFiber$test = { memoizedProps: { dropdownContent: { props: f.props } }, return: null };
+  doc.querySelector('#prompt-textarea')!.textContent = 'Unsent user draft';
+  doc.querySelector('[data-testid="send-button"]')!.setAttribute('data-testid', 'stop-button');
+  // This fixture exposes choices only for the selected version. Passive inspection must refuse
+  // to publish that partial view as the complete account catalogue while the page is working.
+  expect(await f.api.inspectPassiveModelSettings()).toBeNull();
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-pro', reasoningEffort: 'pro' });
+  expect(doc.querySelector('[data-testid="composer-intelligence-picker-content"]')).toBeNull();
+  expect(f.actions).not.toHaveBeenCalled();
+  expect(doc.querySelector('#prompt-textarea')!.textContent).toBe('Unsent user draft');
+  (f.props.modelSwitcherDenialsBySlug as any)['gpt-6-pro'] = { reason: 'workspace_policy' };
+  expect(await f.api.inspectPassiveModelSettings()).toBeNull();
+  expect(f.api.visibleModelSelection()).toBeNull();
+});
+it('prefers a richer retained dropdown snapshot over a valid partial owner snapshot', async () => {
+  const f = fixture(), trigger = page.window.document.querySelector('button')!;
+  for (const choice of f.selections[0]!) (choice.category as any).modelVersion = 'latest';
+  for (const choice of f.selections[1]!) (choice.category as any).modelVersion = 'future';
+  // Model the retained closed-menu state carrying account-evaluated lanes for both versions.
+  f.props.composerIntelligencePickerState.bucketSelections = [...f.selections[0]!, ...f.selections[1]!];
+  const partialProps = structuredClone(f.props);
+  partialProps.modelsData.versions = [partialProps.modelsData.versions[0]!];
+  partialProps.composerIntelligencePickerState.bucketSelections = partialProps.composerIntelligencePickerState.bucketSelections.slice(0, 2);
+  partialProps.composerIntelligencePickerState.currentBucket = partialProps.composerIntelligencePickerState.bucketSelections[0]!.bucket;
+  partialProps.composerIntelligencePickerState.currentSelection = partialProps.composerIntelligencePickerState.bucketSelections[0]!;
+  (trigger as any).__reactFiber$test = { memoizedProps: { ...partialProps, dropdownContent: { props: f.props } }, return: null };
+  expect(await f.api.inspectPassiveModelSettings()).toEqual([
+    { id: 'latest', label: 'Aktuell', efforts: ['medium', 'high'], aliases: ['gpt-5-6-thinking'] },
+    { id: 'future', label: 'Neues Modell', efforts: ['low', 'ultra'], aliases: ['future-model'] }
+  ]);
+});
 it('recognizes the provider min effort as Low without invalidating the account catalog', async () => {
   const f = fixture(); f.selections[0]![0]!.thinkingEffort = 'min';
   expect(await f.api.inspectModelSettings()).toContainEqual({ id: 'gpt-5-6-thinking', label: 'GPT-5.6 Sol', efforts: ['low', 'high'], aliases: ['gpt-5-6-thinking'] });

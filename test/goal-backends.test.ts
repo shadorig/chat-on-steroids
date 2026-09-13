@@ -2,7 +2,11 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { GOAL_CONTINUATIONS, GOAL_MARKER_INSTRUCTION, templateGoalDecision } from '../src/shared/goal-templates.js';
 import { promises as fs } from 'node:fs';
 const browser = vi.hoisted(() => ({ request: vi.fn(), authorize: vi.fn() }));
-vi.mock('../src/main/session/input.js', () => ({ requestBrowserDecision: browser.request, authorizeBrowserHelperRetry: browser.authorize, listInputs: async () => [] }));
+vi.mock('../src/main/session/input.js', () => ({
+  requestBrowserDecision: browser.request,
+  authorizeBrowserHelperRetry: browser.authorize,
+  listInputs: async () => []
+}));
 vi.mock('electron', () => ({
   app: { getPath: () => '', getVersion: () => '0.0.0' },
   safeStorage: {
@@ -291,7 +295,7 @@ describe('Goal decision backends', () => {
   it('uses browser JSON decisions without an API key and refuses prose', async () => {
     await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, backend: 'chatgpt' } });
     browser.request.mockResolvedValueOnce('{"action":"continue","reply":"do the tests"}');
-    expect(await goal.draftOpeningMessage('Finish this', 'goal')).toMatchObject({ reply: goal.humanReply('do the tests') });
+    expect(await goal.draftOpeningMessage('Finish this', 'goal')).toMatchObject({ reply: 'do the tests' });
     expect(browser.request.mock.calls[0]?.[0]).toContain('reference data, not a request to execute');
     browser.request.mockResolvedValueOnce('You should continue');
     expect(await goal.draftOpeningMessage('Finish this', 'goal')).toMatchObject({ error: expect.any(String) });
@@ -312,7 +316,7 @@ describe('Goal decision backends', () => {
     release('{"action":"continue","reply":"stale work"}');
     const view = await settled(id);
     expect(view.turnId).toBe('new');
-    expect(view.reply).toBe(goal.humanReply('newest work'));
+    expect(view.reply).toBe('newest work');
   });
 });
 

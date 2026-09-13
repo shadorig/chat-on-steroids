@@ -5,7 +5,8 @@ import { getConfig } from '../config.js';
 import { noteOutcome } from './call-context.js';
 import { inboundRequestId } from './inbound.js';
 import { dispatch, fail, type ToolResult } from './kernel.js';
-import { canAddCodeMode, codeModeDeclaration, codeModeHandler } from './code-mode-tool.js';
+import { codeModeDeclaration, codeModeHandler } from './code-mode-tool.js';
+import { canAddCodeMode } from './code-mode-contract.js';
 import { toolSchemaJson } from './tool-declarations.js';
 import { codeModeSchema } from './code-mode-runtime.js';
 

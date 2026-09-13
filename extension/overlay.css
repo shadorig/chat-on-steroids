@@ -1409,6 +1409,32 @@
   opacity: 0.4;
 }
 
+.clf-menu-choice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border-top: 1px solid var(--clf-menu-line);
+  font-size: 13px;
+}
+
+.clf-menu-choice select {
+  min-width: 0;
+  max-width: 190px;
+  border: 1px solid var(--clf-menu-line);
+  border-radius: 7px;
+  padding: 4px 7px;
+  background: var(--clf-menu-bg);
+  color: inherit;
+  font: inherit;
+}
+
+.clf-menu-choice select:focus-visible {
+  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
+  outline-offset: 1px;
+}
+
 /* The goal loop in the field above the composer. The message being written for the user is
    ordinary prose — it is about to be one of their own messages — so it is not set apart the
    way the model's reasoning is; only the two terminal states carry a colour. */

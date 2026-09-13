@@ -1368,12 +1368,9 @@
     }
     return model ? { id: model, effort } : null;
   }
-  function readPickerSnapshot(node) {
-    let fiber = node && fiberOf(node);
-    for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
-      const props = fiber.memoizedProps;
+  function parsePickerSnapshot(props) {
       const state = props?.composerIntelligencePickerState, data = props?.modelsData;
-      if (!state || !Array.isArray(data?.versions)) continue;
+      if (!state || !Array.isArray(data?.versions)) return null;
       if (data.versions.length > 20 || !Array.isArray(state.bucketSelections) || state.bucketSelections.length > 12) return null;
       const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
       const label = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 80 ? value.trim() : null;
@@ -1398,6 +1395,25 @@
       const chosen = choices.find(c => c.bucket === currentBucket);
       if (selected?.modelSlug !== chosen.id || effortOf(selected) !== chosen.effort) return null;
       return { version, currentBucket, versions, choices };
+  }
+  function readPickerSnapshot(node) {
+    let fiber = node && fiberOf(node);
+    for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
+      // The September composer retains the unmounted menu as dropdownContent. Both the owner
+      // and retained child can look valid while carrying different catalog breadth, so parse
+      // both and select the strongest complete native snapshot instead of accepting the first.
+      const owner = fiber.memoizedProps;
+      const snapshots = [owner, owner?.dropdownContent?.props]
+        .map(parsePickerSnapshot)
+        .filter(Boolean);
+      if (!snapshots.length) continue;
+      const representedVersionCount = snapshot => {
+        const represented = new Set(snapshot.choices.filter(choice => choice.available).map(choice => choice.familyId));
+        return snapshot.versions.filter(version => represented.has(version.id)).length;
+      };
+      snapshots.sort((left, right) => representedVersionCount(right) - representedVersionCount(left) ||
+        right.choices.length - left.choices.length);
+      return snapshots[0];
     }
     return null;
   }

@@ -274,6 +274,17 @@ var CLF_DOM = (() => {
     return /^(?:message delivery timed out(?:\. please try again\.?)?|connection interrupted\.? waiting for the complete answer\.?|unknown error occurred\.?|there was an error generating (?:a|the) response\.?|error in message stream\.?|network error\.?|something went wrong\.?|something went wrong while generating the response(?:\. if this issue persists please contact us through our help center at help\.openai\.com\.?)?\.?)(?: retry)?$/i.test(line);
   }
 
+  /** Provider-owned native failure label. Text is fallback evidence, never recovery authority. */
+  function thinkingFailedControl(button) {
+    return safe(() => {
+      if (!button?.matches?.('button[aria-expanded]')) return false;
+      const testId = button.getAttribute('data-testid') || '';
+      if (/thinking.*fail|fail.*thinking/i.test(testId)) return true;
+      const label = (button.getAttribute('aria-label') || button.textContent || '').replace(/\s+/g, ' ').trim();
+      return label === 'Thinking failed';
+    }, false);
+  }
+
   /**
    * A visible transport-failure card whose wrapper carries no alert role.
    *
@@ -1308,7 +1319,7 @@ var CLF_DOM = (() => {
    * recording "Chat On Steroids Desktop is now connected" as a ChatGPT failure.
    */
   const acknowledgedAccessNotices = new WeakSet();
-  function errors() {
+  function errors(turnFilter = null) {
     return safe(() => {
       const out = [];
       const texts = new Set();
@@ -1357,9 +1368,28 @@ var CLF_DOM = (() => {
         texts.add(failure.text);
         out.push({ ...failure, turnId: null, recoverable: true });
       }
-      for (const turn of turns()) {
+      // Hot turn observation asks for one exact assistant turn. Global provider dialogs /
+      // alerts above still participate because they can fail a request before a section is
+      // mounted, but historical assistant DOM is not rescanned on every mutation.
+      for (const turn of turnFilter ? [turnFilter] : turns()) {
         if (turn.role !== 'assistant') continue;
         for (const section of turnNodes(turn)) {
+          // Native Pro failure header observed in Chrome, 2026-09-12: an
+          // expandable button outside authored markdown, not an alert/Retry card.
+          // Keep every occurrence's node identity; old failed turns remain rendered.
+          for (const button of section.querySelectorAll('button[aria-expanded]')) {
+            if (button.closest(`${OWN_SURFACES}, .markdown, [data-message-author-role="user"], [hidden], [inert], [aria-hidden="true"]`) ||
+                button.closest(TURN) !== section || !displayed(button) ||
+                !thinkingFailedControl(button)) continue;
+            let hidden = false;
+            for (let parent = button; parent; parent = parent.parentElement) {
+              const style = getComputedStyle(parent);
+              if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') { hidden = true; break; }
+            }
+            if (hidden) continue;
+            out.push({ text: 'Thinking failed', node: button, turnId: turn.id, turn,
+              reason: 'thinking_failed', recoverable: false });
+          }
           for (const markdown of section.querySelectorAll('.markdown')) {
             const value = text(markdown, 500).replace(/\s+/g, ' ').trim();
             if (!value || !transportFailure(value) || texts.has(value)) continue;
@@ -2064,6 +2094,29 @@ var CLF_DOM = (() => {
       before.chat.click(); check();
     });
   }
+  function collectModelChoices(result, state) {
+    for (const choice of state.choices.filter(c => c.available)) {
+      const entry = result.get(choice.familyId) || { id: choice.familyId, label: choice.familyLabel, efforts: [], aliases: [] };
+      if (!entry.efforts.includes(choice.effort)) entry.efforts.push(choice.effort);
+      if (!entry.aliases.includes(choice.id)) entry.aliases.push(choice.id);
+      result.set(choice.familyId, entry);
+    }
+  }
+  /** Complete account-evaluated catalogue already retained by the closed native picker. */
+  async function inspectPassiveModelSettings(stillCurrent = () => true) {
+    if (!stillCurrent() || !modelPickerTrigger()) return null;
+    const state = await readPickerState();
+    if (!stillCurrent() || !state) return null;
+    const represented = new Set(state.choices.filter(choice => choice.available).map(choice => choice.familyId));
+    // A retained picker often contains choices only for its selected version. Publishing that as
+    // the account catalogue would silently delete every other family. Passive state is authoritative
+    // only when it represents every enabled version; otherwise the idle interactive path does the
+    // existing one-version-at-a-time inspection.
+    if (state.versions.some(version => !represented.has(version.id))) return null;
+    const result = new Map();
+    collectModelChoices(result, state);
+    return result.size ? [...result.values()] : null;
+  }
   async function inspectModelSettings(stillCurrent = () => true, failure = () => {}) {
     const ui = modelPickerAccess(stillCurrent), original = await ui.open();
     if (!original) { ui.close(); failure('picker_unavailable'); return null; }
@@ -2075,14 +2128,7 @@ var CLF_DOM = (() => {
       for (const version of original.versions) {
         const state = await ui.version(version.id);
         if (!state) throw new Error('model_unconfirmed');
-        for (const choice of state.choices.filter(c => c.available)) {
-          // A provider family owns its execution lanes. Instant/Thinking/Pro slugs
-          // are selectable pairs within that family, not separate model rows.
-          const entry = result.get(choice.familyId) || { id: choice.familyId, label: choice.familyLabel, efforts: [], aliases: [] };
-          if (!entry.efforts.includes(choice.effort)) entry.efforts.push(choice.effort);
-          if (!entry.aliases.includes(choice.id)) entry.aliases.push(choice.id);
-          result.set(choice.familyId, entry);
-        }
+        collectModelChoices(result, state);
       }
     } catch { failure('model_unconfirmed'); result.clear(); }
     finally {
@@ -2212,6 +2258,7 @@ var CLF_DOM = (() => {
     projectHomeId,
     enterProject,
     visibleModelSelection,
+    inspectPassiveModelSettings,
     inspectModelSettings,
     uploadImages,
     captureComposerDraft,
@@ -2266,6 +2313,7 @@ var CLF_DOM = (() => {
     fiberRef,
     toolLabel,
     errors,
+    errorsForTurn: turn => errors(turn),
     composer,
     composerSubmitReady,
     composerBox,

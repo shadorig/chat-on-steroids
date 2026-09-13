@@ -240,18 +240,34 @@ function validatePng(data: Buffer): void {
 }
 
 function validateJpeg(data: Buffer): void {
-  if (data.length < 8 || data[data.length - 2] !== 0xff || data[data.length - 1] !== 0xd9) {
-    invalidImage('JPEG', 'end marker is missing');
-  }
+  if (data.length < 8 || data[0] !== 0xff || data[1] !== 0xd8) invalidImage('JPEG', 'start marker is missing');
   let offset = 2;
   let sawFrame = false;
+  let sawEoi = false;
+  let inScan = false;
   const frameMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
-  while (offset < data.length - 2) {
-    while (offset < data.length && data[offset] === 0xff) offset++;
-    if (offset >= data.length) break;
-    const marker = data[offset++]!;
-    if (marker === 0xd9) break;
-    if (marker === 0xda) break; // scan data continues until the already-validated EOI marker
+  while (offset < data.length && !sawEoi) {
+    let marker: number;
+    if (inScan) {
+      // Entropy-coded scan data can contain arbitrary bytes. FF 00 is a stuffed literal FF and
+      // restart markers stay inside the scan; the first other marker resumes JPEG structure.
+      const prefix = data.indexOf(0xff, offset);
+      if (prefix < 0) break;
+      offset = prefix + 1;
+      while (offset < data.length && data[offset] === 0xff) offset++;
+      if (offset >= data.length) break;
+      marker = data[offset++]!;
+      if (marker === 0x00 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (marker === 0xd9) { sawEoi = true; break; }
+      inScan = false;
+    } else {
+      if (data[offset] !== 0xff) invalidImage('JPEG', 'unexpected bytes between segments');
+      while (offset < data.length && data[offset] === 0xff) offset++;
+      if (offset >= data.length) break;
+      marker = data[offset++]!;
+      if (marker === 0xd9) { sawEoi = true; break; }
+    }
+    if (marker === 0x00 || marker === 0xd8) invalidImage('JPEG', 'unexpected marker');
     if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
     if (offset + 2 > data.length) invalidImage('JPEG', 'segment length is truncated');
     const length = data.readUInt16BE(offset);
@@ -264,8 +280,10 @@ function validateJpeg(data: Buffer): void {
       sawFrame = true;
     }
     offset += length;
+    if (marker === 0xda) inScan = true;
   }
   if (!sawFrame) invalidImage('JPEG', 'frame header is missing');
+  if (!sawEoi) invalidImage('JPEG', 'end marker is missing');
 }
 
 function validateGif(data: Buffer): void {

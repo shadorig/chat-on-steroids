@@ -44,6 +44,7 @@ import {
   pruneSessions,
   readAsset,
   readEvents,
+  readTurnRecoveryEvidence,
   readRecentEvents,
   readHandoff,
   rebindSession,
@@ -134,6 +135,10 @@ describe('session store', () => {
     // is enqueued. It used to be silently discarded when the old snapshot replaced events.jsonl.
     await appendEvent(summary.id, call('keep-concurrent-new', 3));
     await rewriteUnattributedToolCalls(summary.id, keptFromSnapshot, scannedThroughSeq);
+
+    const rewrittenJournal = await fs.stat(path.join(sessionsRoot(), summary.id, 'events.jsonl'));
+    const rewrittenRecovery = JSON.parse(await fs.readFile(path.join(sessionsRoot(), summary.id, 'recovery.json'), 'utf8')) as { offset: number };
+    expect(rewrittenRecovery.offset).toBe(rewrittenJournal.size);
 
     const callIds = (await readEvents(summary.id))
       .filter((event): event is Extract<SessionEvent, { kind: 'tool_call' }> => event.kind === 'tool_call')
@@ -934,6 +939,38 @@ describe('session store', () => {
     expect(ends.map((event) => event.kind === 'turn_end' && event.outcome)).toEqual(['completed']);
   });
 
+  it.each(['completed', 'stopped'] as const)('does not restore an abandoned older turn after the latest turn %s', async (outcome) => {
+    const conversationId = 'c-restore-latest-terminal';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: 10, turnId: 'g-abandoned' },
+      { kind: 'turn_start', time: 20, turnId: 'g-latest' },
+      { kind: 'turn_end', time: 30, turnId: 'g-latest', outcome }
+    ]);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await closeConversation(conversationId);
+      await sessionForConversation(conversationId);
+      expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
+        generating: false, activeTurnId: null
+      });
+    }
+    // The older incomplete history is preserved without inventing a terminal for it.
+    expect((await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).map(event => event.turnId)).toEqual(['g-latest']);
+  });
+
+  it('restores the latest committed start without promoting an older orphan by timestamp', async () => {
+    const conversationId = 'c-restore-latest-start';
+    await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: 100, turnId: 'g-orphan-clock-ahead' },
+      { kind: 'turn_start', time: 20, turnId: 'g-current' },
+      { kind: 'turn_end', time: 110, turnId: 'g-orphan-clock-ahead', outcome: 'completed' }
+    ]);
+    await closeConversation(conversationId);
+    await sessionForConversation(conversationId);
+    expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
+      generating: true, activeTurnId: 'g-current'
+    });
+  });
+
   it('offers a stable final reply to Goal after reload lost an uncertain turn identity', async () => {
     const conversationId = 'c-goal-final-after-reload';
     await recordChatObservations(conversationId, [
@@ -1263,6 +1300,108 @@ describe('session store', () => {
       events: 3,
       userMessages: 1,
       lastHandoffId: handoffId
+    });
+  });
+
+  it('uses the compact recovery checkpoint without rereading the journal as durable work advances', async () => {
+    const conversationId = 'recovery-evidence-cache';
+    const summary = await createSession({ title: 'Recovery cache', conversationId });
+    await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'cache-turn' });
+    const openFile = vi.spyOn(fs, 'open');
+    try {
+      const beforeFirst = openFile.mock.calls.length;
+      const first = await readTurnRecoveryEvidence(summary.id, conversationId, 'cache-turn');
+      expect(first?.head).toMatchObject({ kind: 'turn_start', turnId: 'cache-turn' });
+      const afterFirst = openFile.mock.calls.length;
+      expect(afterFirst).toBe(beforeFirst);
+      expect(await readTurnRecoveryEvidence(summary.id, conversationId, 'cache-turn')).toEqual(first);
+      expect(openFile).toHaveBeenCalledTimes(afterFirst);
+      await appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_end', turnId: 'cache-turn', outcome: 'failed' });
+      expect((await readTurnRecoveryEvidence(summary.id, conversationId, 'cache-turn'))?.head).toMatchObject({ kind: 'turn_end' });
+      expect(openFile).toHaveBeenCalledTimes(afterFirst);
+    } finally {
+      openFile.mockRestore();
+    }
+  });
+
+  it('treats malformed recovery checkpoint fields as non-authoritative after restart', async () => {
+    const conversationId = 'recovery-checkpoint-corruption';
+    const summary = await createSession({ title: 'Recovery checkpoint corruption', conversationId });
+    const journalBytes = (await fs.stat(path.join(sessionsRoot(), summary.id, 'events.jsonl'))).size;
+    await fs.writeFile(path.join(sessionsRoot(), summary.id, 'recovery.json'), JSON.stringify({
+      version: 1,
+      complete: true,
+      offset: journalBytes,
+      head: { seq: 1, kind: 'forged-recovery-work', turnId: 'forged-turn' },
+      lifecycle: { seq: 1, time: 1, kind: 'turn_end', turnId: 'forged-turn', outcome: 'failed', reason: 'thinking_failed' },
+      exactMcpCall: { seq: 1, time: 1, turnId: 'forged-turn', call: {
+        conversationId, attribution: 'request_id', model: 'gpt-5.6-pro', reasoningEffort: 'pro'
+      } }
+    }), 'utf8');
+    resetSessionStoreForTests();
+
+    expect(await readTurnRecoveryEvidence(summary.id, conversationId, 'forged-turn')).toMatchObject({
+      head: null,
+      lifecycle: null,
+      exactMcpCall: null
+    });
+  });
+
+  it('keeps causal recovery evidence discoverable across restart after more than one suffix budget of diagnostic rows', async () => {
+    const conversationId = 'recovery-evidence-diagnostic-volume';
+    const turnId = 'recovery-volume-turn';
+    const summary = await createSession({ title: 'Recovery evidence volume', conversationId });
+    await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId });
+    await appendEvent(summary.id, {
+      time: 2,
+      source: 'mcp',
+      kind: 'tool_call',
+      turnId,
+      call: {
+        callId: 'recovery-volume-call',
+        tool: 'read',
+        attribution: 'request_id',
+        requestId: 'wfr-recovery-volume',
+        conversationId,
+        attributionMethod: 'request_id',
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'high',
+        args: { text: '{}', truncated: false, chars: 2 },
+        result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok',
+        durationMs: 1,
+        summary: { title: 'Read', tone: 'neutral', kind: 'read' }
+      }
+    });
+    await appendEvent(summary.id, {
+      time: 3,
+      source: 'extension',
+      kind: 'turn_end',
+      turnId,
+      outcome: 'failed',
+      reason: 'thinking_failed'
+    });
+    const before = await readTurnRecoveryEvidence(summary.id, conversationId, turnId);
+    expect(before).toMatchObject({
+      head: { kind: 'turn_end', turnId },
+      lifecycle: { kind: 'turn_end', turnId, outcome: 'failed', reason: 'thinking_failed' },
+      exactMcpCall: { turnId, call: { conversationId, attribution: 'request_id', model: 'gpt-5.6-sol' } }
+    });
+
+    // 72 × 120k text bytes is larger than MAX_RECENT_READ_BYTES. Notes are deliberately not
+    // recovery work, so byte volume alone must neither revoke nor make the proof undiscoverable.
+    const diagnostic = 'n'.repeat(120_000);
+    for (let index = 0; index < 72; index += 1) {
+      await appendEvent(summary.id, { time: 10 + index, source: 'app', kind: 'note',
+        message: { text: diagnostic, truncated: false, chars: diagnostic.length } });
+    }
+    await flushSessions();
+    resetSessionStoreForTests();
+
+    expect(await readTurnRecoveryEvidence(summary.id, conversationId, turnId)).toMatchObject({
+      head: { kind: 'turn_end', turnId },
+      lifecycle: { kind: 'turn_end', turnId, outcome: 'failed', reason: 'thinking_failed' },
+      exactMcpCall: { turnId, call: { conversationId, attribution: 'request_id', model: 'gpt-5.6-sol' } }
     });
   });
 

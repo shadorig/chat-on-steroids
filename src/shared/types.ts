@@ -220,6 +220,9 @@ export type GoalReasoning = (typeof GOAL_REASONING_LEVELS)[number];
  */
 export const GOAL_MODES = ['goal', 'loop'] as const;
 export type GoalMode = (typeof GOAL_MODES)[number];
+export const LOOP_TRIGGERS = ['session-finish', 'after-turn'] as const;
+/** Persisted Loop trigger. Runtime still requires an exact compatible model selection. */
+export type LoopTrigger = (typeof LOOP_TRIGGERS)[number];
 
 export type GoalBackend = 'api' | 'chatgpt' | 'templates';
 /**
@@ -297,6 +300,8 @@ export interface MultiAgentSettings {
   maxWorkers: number;
   /** Permit self-contained calls when browser evidence cannot identify their conversation. */
   allowUnattributedCalls: boolean;
+  /** Permit mouse/keyboard/window mutation during one process-scoped unattributed invocation. */
+  allowUnattributedComputerControl: boolean;
   /**
    * Reopen/reload chats that are not Goal/Loop driven — workers, primes, plain chats that have
    * called tools — once when their tab disappears or goes silent. Goal/Loop chats are always

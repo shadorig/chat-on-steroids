@@ -1,15 +1,27 @@
 /** One browser startup owner for explicit work and durable recovery. */
-import { bridgeStatus, browserWakeConnected } from './bridge.js';
 import { isPreferredBrowserRunning, openInPreferredBrowser } from './browser.js';
 import { getConfig } from './config.js';
+
+type BrowserStartupPresence = {
+  snapshot(): { lastSeenAt: number | null };
+  wakeConnected(): boolean;
+};
+
+// Browser startup is lower-level than the HTTP bridge. Keep only the two observations it needs
+// and fail closed until the bridge composition root installs them.
+let presence: BrowserStartupPresence = {
+  snapshot: () => ({ lastSeenAt: null }),
+  wakeConnected: () => false
+};
+export function installBrowserStartupPresence(next: BrowserStartupPresence): void { presence = next; }
 
 let waking: { lastSeenAt: number | null; selected: string; work: Promise<void>; failed: boolean; finished: boolean } | null = null;
 /** One browser startup per absence episode, shared by authored sends, discovery and owed recovery. */
 export async function wakeBrowserUrl(url: string, retry = false, backgroundStartup = false,
   authority?: { current(): boolean }): Promise<void> {
   if (authority && !authority.current()) return;
-  const browser = await bridgeStatus();
-  if (browserWakeConnected()) { waking = null; return; }
+  const browser = presence.snapshot();
+  if (presence.wakeConnected()) { waking = null; return; }
   const selected = getConfig().ui.chatBrowser ?? 'chrome';
   // The companion can be missing because its protocol is incompatible or MV3 is
   // suspended. Only process absence permits an OS launch; forwarding a URL to
@@ -21,7 +33,7 @@ export async function wakeBrowserUrl(url: string, retry = false, backgroundStart
   // The process query yields. Off, a collected reply or a new navigation can revoke
   // the exact recovery meanwhile; a missing socket alone never proves Chrome exited.
   if (authority && !authority.current()) return;
-  if (browserWakeConnected()) { waking = null; return; }
+  if (presence.wakeConnected()) { waking = null; return; }
   if (!absent) return;
   if (retry && waking === prior && (waking?.failed || waking?.finished)) waking = null;
   // Until the extension registers, another explicit send belongs to the same startup.
@@ -34,4 +46,7 @@ export async function wakeBrowserUrl(url: string, retry = false, backgroundStart
   waking = attempt;
   try { await work; } catch (error) { attempt.failed = true; throw error; } finally { attempt.finished = true; }
 }
-export function resetBrowserStartupForTests(): void { waking = null; }
+export function resetBrowserStartupForTests(): void {
+  waking = null;
+  presence = { snapshot: () => ({ lastSeenAt: null }), wakeConnected: () => false };
+}

@@ -2,19 +2,23 @@ import { conversationProgress } from './session/progress.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
 import { prepareSessionPrompt } from './session/prompt.js';
 import { pendingChatModelRequest, observeChatModels, requestChatModels } from './chat-models.js';
-import { isProModel } from '../shared/chat-models.js';
+import { isProModel, supportsAfterTurnLoop } from '../shared/chat-models.js';
 import type { SessionSummary } from '../shared/session.js';
 import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, type InputActivity } from './session/input.js';
 import { pluginRefreshPublications, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
-import { wakeBrowserUrl } from './browser-startup.js';
+import { installBrowserStartupPresence, wakeBrowserUrl } from './browser-startup.js';
 let browserWake: ReturnType<typeof attachBrowserWake> | null = null;
 import { browserWindowBounds, currentBrowserWorkArea } from './browser-window-layout.js';
 export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, hasQueuedAfterTurnInput, deferRecoveryInput, revokeRecoveryInputs } from './session/input.js';
+import { readInputAttachmentChunk } from './session/input-attachments.js';
+import { captureRecoveryProof, validateRecoveryProof, type RecoveryGrant } from './session/recovery-proof.js';
+import { assignRecoveredContinuation, recoveredGoalPrecedenceClear, type RecoveryAssignment } from './session/recovery-arbitration.js';
+import { installUnattributedRepairEta } from './mcp/recovery-notice.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -48,7 +52,9 @@ import { getConfig, updateConfig } from './config.js';
 import { getSecret, secureStorageStatus, setSecret } from './secrets.js';
 import {
   acceptGoalReplyNow,
-  astraFinishOnly,
+  effectiveLoopAfterTurnFor,
+  requiresFinishOnlyContinuation,
+  deferRecoveryGoalReplyNow,
   ackGoalDraftNow,
   applyGoalSwitch,
   beginGoalDraft,
@@ -68,7 +74,8 @@ import {
   retireGoalDrafts,
   retireGoalDraftsFor,
   setGoalReplyActiveNow,
-  withdrawSilenceGoalReplyNow,
+  setGoalLoopTriggerNow,
+  withdrawRecoveryGoalReplyNow,
   setGoalObjectiveNow,
   setGoalSwitchNow,
   startGoalDraft
@@ -576,6 +583,12 @@ export function browserPresent(): boolean {
 /** Recent HTTP presence cannot prove that an explicit desktop send can wake Chrome now. */
 export function browserWakeConnected(): boolean { return browserWake?.connected() === true; }
 
+/** Explicit main-process composition for browser-derived runtime dependencies. */
+export function installBridgeRuntimeDependencies(): void {
+  installBrowserStartupPresence({ snapshot: () => ({ lastSeenAt }), wakeConnected: browserWakeConnected });
+  installUnattributedRepairEta(unattributedRepairEta);
+}
+
 /**
  * Records one authenticated browser sighting and schedules the inverse state transition.
  *
@@ -899,6 +912,9 @@ function parseObservations(input: unknown): ChatObservation[] {
     if (typeof item['outcome'] === 'string' && OUTCOMES.has(item['outcome'])) {
       observation.outcome = item['outcome'] as ChatObservation['outcome'];
     }
+    if (kind === 'turn_end' && observation.outcome === 'failed' && item['reason'] === 'thinking_failed') {
+      observation.reason = 'thinking_failed';
+    }
     if (
       item['goalEligible'] === true &&
       kind === 'assistant_message' &&
@@ -1033,6 +1049,8 @@ export type SessionControlsView = {
   plan: import('../shared/agent-plan.js').AgentPlan | null;
   conversationId: string;
   automation: 'off' | 'goal' | 'loop';
+  loopTrigger: import('../shared/types.js').LoopTrigger;
+  loopTriggerAvailable: boolean;
   objective: string;
   activeTurnId: string | null;
   finishHeld: boolean;
@@ -1082,6 +1100,9 @@ export async function sessionControlsFor(sessionId: string): Promise<SessionCont
     goalDraft: draft ? { stage: draft.stage, model: draft.model, text: draft.text.slice(-8000), error: draft.error } : null,
     stopPending: commands.some(c => c.spec.type === 'stop' && c.spec.sessionId === sessionId && c.spec.turnId === activeTurnId),
     objective: goalObjectiveFor(id),
+    loopTrigger: control.loopTrigger,
+    loopTriggerAvailable: session.selectedModel?.conversationId === id &&
+      supportsAfterTurnLoop(session.selectedModel.model, session.selectedModel.reasoningEffort),
     automation: goalArmedFor(id) && !blocked ? control.enabled ? control.mode : 'goal' : 'off',
     blocked, job: resumeJobFor(sessionId) };
 }
@@ -1126,6 +1147,7 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
     await assertCurrent();
   } catch (error) { retire(command, 'stop request could not be saved or its turn changed'); throw error; }
   armDeadline(command);
+  invalidateRecoveryContinuationsBestEffort(sessionId, id);
   endActivity(id);
   repairsInFlight.delete(id);
   wakeBrowserWork();
@@ -1150,6 +1172,10 @@ async function stopCommandCurrent(spec: Extract<CommandSpec, { type: 'stop' }>):
 function stopRequestedFor(conversationId: string, turnId = liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId): boolean {
   return commands.some(command => command.spec.type === 'stop' && command.spec.conversationId === conversationId &&
     (!turnId || command.spec.turnId === turnId) && Date.now() - command.createdAt < STOP_COMMAND_TIMEOUT_MS);
+}
+/** Durable browser Stop independently revokes recovered Send authority if cleanup is delayed. */
+export function recoveryInputAllowed(conversationId: string): boolean {
+  return !stopRequestedFor(conversationId);
 }
 async function pendingStopCommands(): Promise<Array<{ id: string; conversationId: string; turnId: string; expiresAt: number }>> {
   const pending = [];
@@ -1187,7 +1213,15 @@ async function saveConversationObjective(id: string, text: string, named: 'goal'
     forgetGoalWatch(id);
   } catch { throw new Error('goal_ticket_not_durable'); }
   changed();
-  return { objective, ...(chatSwitch ? { enabled: chatSwitch.enabled, own: true, mode: chatSwitch.mode } : {}) };
+  return {
+    objective,
+    ...(chatSwitch ? {
+      configuredEnabled: chatSwitch.enabled,
+      effectiveEnabled: goalEnabledFor(id),
+      own: true,
+      mode: chatSwitch.mode
+    } : {})
+  };
 }
 export async function setSessionObjective(sessionId: string, text: string, mode: 'goal' | 'loop'): Promise<SessionControlsView> {
   const id = await controlledConversation(sessionId);
@@ -1202,11 +1236,33 @@ export async function setSessionAutomation(sessionId: string, automation: Sessio
   const mode = automation === 'off' ? goalSwitchFor(id).mode : automation;
   // The existing reply setter retires drafts and durably closes the pickup for Off.
   const held = await setGoalSwitchNow(id, mode, automation !== 'off');
+  if (automation !== 'loop' && goalPendingReplyFor(id)?.recovery?.proof.modelClass === 'pro') {
+    void revokeGoalRecovery(id).catch(error => logWarn(`goal: could not retire obsolete recovery after automation change: ${String(error)}`));
+  }
   const keyPresent = held.enabled && await goalKeyPresent(mode);
   if (await controlledConversation(sessionId) !== id) throw new Error('conversation_changed');
   const live = goalSwitchFor(id);
   await setGoalReplyActiveNow(id, held.enabled && live.enabled && live.mode === held.mode && !goalBlockReason(id)
     && getConfig().sessions.record && keyPresent);
+  forgetGoalWatch(id);
+  changed();
+  return sessionControlsFor(sessionId);
+}
+export async function setSessionLoopTrigger(sessionId: string, trigger: import('../shared/types.js').LoopTrigger): Promise<SessionControlsView> {
+  const id = await controlledConversation(sessionId);
+  const session = await getSession(sessionId);
+  const selection = session?.selectedModel;
+  const control = goalSwitchFor(id);
+  if (session?.conversationId !== id || selection?.conversationId !== id) throw new Error('conversation_changed');
+  if (goalBlockReason(id)) throw new Error(goalWorkerChat(id) ? 'worker_goal_disabled' : 'chat_blocked');
+  if (!control.enabled || control.mode !== 'loop') throw new Error('loop_not_active');
+  if (!supportsAfterTurnLoop(selection.model, selection.reasoningEffort)) {
+    throw new Error('loop_trigger_unavailable');
+  }
+  await setGoalLoopTriggerNow(id, trigger);
+  if (trigger !== 'after-turn' && goalPendingReplyFor(id)?.recovery?.proof.modelClass === 'pro') {
+    void revokeGoalRecovery(id).catch(error => logWarn(`goal: could not retire obsolete recovery after Loop trigger change: ${String(error)}`));
+  }
   forgetGoalWatch(id);
   changed();
   return sessionControlsFor(sessionId);
@@ -1254,10 +1310,11 @@ function goalEnabledFor(id: string): boolean {
 /**
  * Which of the two standing modes this chat's switch is in.
  *
- * Sent beside `enabled` rather than as a second boolean, because that is what makes the pair
- * mutually exclusive everywhere they are drawn: one field with one value, so no page and no
- * poll can ever paint both switches on. A chat where the loop may not act reports the mode it
- * *would* run, which the page never draws — `enabled: false` already answered the question.
+ * Sent beside the configured/effective switch state rather than as a second mode boolean,
+ * because that is what makes the pair mutually exclusive everywhere they are drawn: one mode
+ * field with one value, so no page and no poll can ever paint both switches on. A chat where
+ * the loop may not act reports the mode it *would* run, while `effectiveEnabled: false` keeps
+ * that mode from being drawn as active.
  */
 function goalModeFor(id?: string): 'goal' | 'loop' {
   return id ? goalSwitchFor(id).mode : getConfig().goal.mode;
@@ -1524,11 +1581,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const entry = (await listInputs()).find(row => row.id === body.id && row.owner === body.owner && row.state === 'browser' && row.sendAuthorizedAt === undefined);
       const attachment = entry?.attachments?.find(file => file.id === body.attachmentId);
       if (!attachment || entry?.conversationId !== body.conversationId || typeof body.offset !== 'number') return json(res, 409, { error: 'attachment_not_owned' }, origin);
-      const { readInputAttachmentChunk } = await import('./session/input-attachments.js');
       return json(res, 200, { chunk: await readInputAttachmentChunk(attachment, body.offset) }, origin);
     }
     if (route === '/input/fail') {
-      const ok = await failBrowserInput(body.id, body.owner, typeof body.error === 'string' ? body.error : 'Unable to prepare ChatGPT');
+      const reason = body.reason === 'pickup_withdrawn_before_send' ? body.reason : undefined;
+      const ok = await failBrowserInput(body.id, body.owner,
+        typeof body.error === 'string' ? body.error : 'Unable to prepare ChatGPT', reason);
       // A rejected picker choice invalidates cached availability. Reobserve existing
       // browser documents through the catalog owner; failure grants no new-tab authority.
       if (ok && body.error === 'Requested model or reasoning could not be confirmed') requestChatModels(false);
@@ -1572,6 +1630,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const target = body.conversationId === null ? null : conversationId(body.conversationId);
     if (body.conversationId !== null && !target) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (typeof body.recoveryBusyTurnId === 'string') return json(res, 200,
+      { ok: !!target && await deferRecoveryInput(body.id, target, body.recoveryBusyTurnId) }, origin);
     if (body.authorize === true) return json(res, 200, { ok: await authorizeBrowserInput(body.id, body.owner, target) }, origin);
     if (target && runningToolCalls(target) > 0) return json(res, 200, { input: null }, origin);
     const input = await claimBrowserInput(body.id, body.owner, target, body.requiresAuthorization === true);
@@ -1860,13 +1920,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
      * own sheet, until the recorder happened to attach. One view, both branches: a chat is
      * never told that what is driving it is unknown.
      */
-    const astraSession = await findSessionByConversation(id, { requireUnique: true });
-    const finishOnly = !!astraSession && await astraFinishOnly(astraSession.id, id);
-    const silenceSuppressed = finishOnly || await suppressProSilence(id);
+    const recordedSession = await findSessionByConversation(id, { requireUnique: true });
+    const finishOnly = !!recordedSession && await requiresFinishOnlyContinuation(recordedSession.id, id);
+    const loopAfterTurn = !!recordedSession && await effectiveLoopAfterTurnFor(recordedSession.id, id);
+    const recoverySuppressed = finishOnly || await suppressInvalidGoalRecovery(id);
     const goalView = async () => {
-      const draft = superseded || silenceSuppressed ? null : goalViewFor(id, goalClient);
+      const configuredEnabled = goalSwitchFor(id).enabled;
+      let draft = superseded || recoverySuppressed ? null : goalViewFor(id, goalClient);
+      if (draft && loopAfterTurn && recordedSession &&
+          (await hasQueuedAfterTurnInput(recordedSession.id) || await chatStillWorking(id, draft.turnId, recordedSession.id))) draft = null;
       return ({
-      enabled: !superseded && !finishOnly && goalEnabledFor(id),
+      effectiveEnabled: !superseded && !finishOnly && goalEnabledFor(id),
+      configuredEnabled,
+      loopTrigger: goalSwitchFor(id).loopTrigger,
+      afterTurnCapable: recordedSession?.selectedModel?.conversationId === id &&
+        supportsAfterTurnLoop(recordedSession.selectedModel.model, recordedSession.selectedModel.reasoningEffort),
       // Has this chat answered for itself? The page reads the switch and the saved goal as
       // one state — see goalArmedFor() — and cannot tell an Off somebody chose here from an
       // Off merely inherited from the app-wide setting without being told which it is.
@@ -1876,7 +1944,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       hasKey: await goalKeyPresent(goalModeFor(id)),
       // This chat's own goal, and never a worker's: the loop is off there whatever is
       // stored, and reporting one would let the page offer to drive a chat the prime owns.
-      objective: superseded || finishOnly || goalWorkerChat(id) ? '' : goalObjectiveFor(id),
+      objective: superseded || goalWorkerChat(id) ? '' : goalObjectiveFor(id),
       // Why the switch is drawn off when the user did not turn it off. Without this the
       // menu says "Goal off" in a worker chat and looks like a setting that failed to save.
       // 'blocked' is the user's own block from the app, which suspends the loop with the
@@ -1886,7 +1954,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // script resumes this instead of manufacturing a turn from the rendered transcript.
       // A blocked chat's owed decision is withheld too, so the page cannot pick it up and
       // draft into a chat whose tools are refused.
-      pending: superseded || goalFencedChat(id) || silenceSuppressed ? null : goalPendingReplyFor(id),
+      pending: superseded || goalFencedChat(id) || recoverySuppressed ? null : goalPendingReplyFor(id),
       draft
     });
     };
@@ -2680,12 +2748,28 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const clientId = typeof body['clientId'] === 'string' ? body['clientId'].slice(0, 100) : '';
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     if (!turnId) return json(res, 400, { error: 'bad_turn_id' }, origin);
-    const astraSession = await findSessionByConversation(id, { requireUnique: true });
-    if (astraSession && await astraFinishOnly(astraSession.id, id)) return json(res, 409, { error: 'astra_finish_only', retryable: false }, origin);
-    if (turnId.startsWith('g-silence-') && goalPendingReplyFor(id)?.turnId !== turnId) {
+    const recordedSession = await findSessionByConversation(id, { requireUnique: true });
+    if (recordedSession && await requiresFinishOnlyContinuation(recordedSession.id, id)) return json(res, 409, { error: 'finish_only', retryable: false }, origin);
+    if (body['nativeBusy'] === true && recordedSession && await effectiveLoopAfterTurnFor(recordedSession.id, id)) {
+      const deferred = await deferRecoveryGoalReplyNow(id, turnId);
+      return json(res, 409, { error: deferred ? 'chat_still_working' : 'goal_reply_not_pending', retryable: deferred }, origin);
+    }
+    const pendingReply = goalPendingReplyFor(id);
+    const recoveryRequest = pendingReply?.turnId === turnId ? pendingReply.recovery : undefined;
+    // Synthetic-looking ids are only a defensive legacy guard. They never grant recovery authority;
+    // the typed durable RecoveryGrant above is the sole positive source for that.
+    const looksLikeSyntheticRecoveryTurnId = turnId.startsWith('g-silence-') || turnId.startsWith('g-recovery-');
+    if (looksLikeSyntheticRecoveryTurnId && !recoveryRequest) {
       return json(res, 409, { error: 'goal_reply_not_pending', retryable: false }, origin);
     }
-    if ((turnId.startsWith('g-silence-') && await extendedSilenceWindowFor(id)) || await suppressProSilence(id)) {
+    if (recoveryRequest && recordedSession && !await recoveredGoalPrecedenceClear(recordedSession.id, id, pendingReply!.replyId)) {
+      return json(res, 409, { error: 'explicit_input_precedes_goal', retryable: true }, origin);
+    }
+    if (recoveryRequest && stopRequestedFor(id)) {
+      void revokeGoalRecovery(id).catch(error => logWarn(`goal: could not retire recovery after Stop: ${String(error)}`));
+      return json(res, 409, { error: 'goal_final_not_confirmed', retryable: false }, origin);
+    }
+    if ((recoveryRequest && !await recoveryContinuationAllowed(id)) || await suppressInvalidGoalRecovery(id)) {
       return json(res, 409, { error: 'goal_final_not_confirmed', retryable: false }, origin);
     }
     if (await conversationWasSuperseded(id)) {
@@ -2902,7 +2986,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       {
         context: contextView(),
         goal: {
-          enabled: getConfig().goal.enabled,
+          configuredEnabled: getConfig().goal.enabled,
+          effectiveEnabled: getConfig().goal.enabled,
           // The app-wide setting is nobody's own answer, by definition: it is what a chat that
           // has never said anything inherits.
           own: false,
@@ -2929,6 +3014,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const goal = typeof body['goal'] === 'boolean' ? (body['goal'] as boolean) : null;
     const loop = typeof body['loop'] === 'boolean' ? (body['loop'] as boolean) : null;
     const settingsConversation = conversationId(body['conversationId']);
+    const loopTrigger = body['loopTrigger'] === 'after-turn' || body['loopTrigger'] === 'session-finish'
+      ? body['loopTrigger'] : null;
+    if (loopTrigger !== null) {
+      if (!settingsConversation || auto !== null || goal !== null || loop !== null) return json(res, 400, { error: 'bad_loop_trigger' }, origin);
+      const session = await findSessionByConversation(settingsConversation, { requireUnique: true });
+      if (!session) return json(res, 409, { error: 'session_not_recorded' }, origin);
+      await setSessionLoopTrigger(session.id, loopTrigger);
+      return json(res, 200, { goal: { loopTrigger: goalSwitchFor(settingsConversation).loopTrigger } }, origin);
+    }
     // One switch per request. Goal and Loop are one setting drawn as two controls, so a body
     // carrying both is a page describing a state that does not exist rather than a change.
     if (goal !== null && loop !== null) return json(res, 400, { error: 'goal_and_loop_exclusive' }, origin);
@@ -3050,8 +3144,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       {
         context: contextView(),
         goal: {
-          // What this chat's switch now says, which is the only answer its composer can draw.
-          enabled: chatSwitch ? chatSwitch.enabled : next.goal.enabled,
+          // What this chat's switch now says, separately from whether role/block/session policy
+          // currently permits it to act.
+          configuredEnabled: chatSwitch ? chatSwitch.enabled : next.goal.enabled,
+          effectiveEnabled: chatSwitch && settingsConversation
+            ? goalEnabledFor(settingsConversation)
+            : next.goal.enabled,
           // A chat-scoped write is this chat answering for itself, and the sheet must draw that
           // on the same frame — the next poll is a second away and the Off it just chose would
           // read as an inherited one until then.
@@ -3708,7 +3806,7 @@ async function durableQuiescence(conversationId: string, now: number): Promise<D
 export async function sweepStaleSwarm(now = Date.now()): Promise<boolean> {
   const silent = await inspectSilentChats(now);
   // A Goal/Loop chat that is spent is not abandoned: the loop owes it the next message.
-  await fileSilenceGoalTickets(silent.spent, now);
+  await assignSilenceContinuations(silent.spent, now);
   // Beside the silence pass rather than inside it: they measure the same quiet from opposite
   // ends of a turn — one an answer that never arrived, one an answer that arrived and was never
   // picked up — and a chat can only ever be in one of those states.
@@ -4926,7 +5024,7 @@ interface ActivityGrant {
   evidenceAt: number;
   until: number;
   turnId: string | null;
-  model: 'pro' | 'other' | 'unknown';
+  model: 'pro' | 'non-pro' | 'unknown';
 }
 
 const activeUntil = new Map<string, ActivityGrant>();
@@ -4942,7 +5040,7 @@ function grantActivity(conversationId: string, sessionId: string, at = Date.now(
   const ownership = turn ?? (previous?.sessionId === sessionId ? previous : { turnId: null, model: 'unknown' as const });
   if (ownership.model === 'pro' && (isChatBlocked(conversationId) || stopRequestedFor(conversationId))) return;
   const evidenceAt = previous?.sessionId === sessionId && previous.turnId === ownership.turnId ? Math.max(previous.evidenceAt, at) : at;
-  activeUntil.set(conversationId, { sessionId, evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? PRO_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model });
+  activeUntil.set(conversationId, { sessionId, evidenceAt, until: evidenceAt + (ownership.model === 'pro' ? CONTINUATION_SILENCE_MS : window), turnId: ownership.turnId, model: ownership.model });
   awaitingReturn.delete(conversationId);
   armSilenceSweep();
   void considerAutomaticCompaction(conversationId, sessionId);
@@ -4978,7 +5076,8 @@ const lastAttributedCallAt = new Map<string, number>();
 export const GOAL_QUIET_MS = 60_000;
 /** Conservative unknown-model lifetime retained for compatibility; known Pro has its own policy. */
 export const PRO_SILENCE_RETIRE_MS = 5 * 60_000;
-export const PRO_SILENCE_MS = 10 * 60_000;
+/** Extended silence window shared by known-Pro work and an explicit queued continuation. */
+export const CONTINUATION_SILENCE_MS = 10 * 60_000;
 export const PRO_ACTIVITY_MS = 10 * 60_000;
 const activityLifetime = (grant: ActivityGrant): number => grant.model === 'pro' ? PRO_ACTIVITY_MS : PRO_SILENCE_RETIRE_MS;
 
@@ -5000,54 +5099,80 @@ export function sessionActivityExpiresAt(summary: SessionSummary): number | null
   // An abandoned open recorder turn is not fresh work, even if a later picker selection
   // differs from the model that owned the retired grant.
   if (!grant || grant.sessionId !== summary.id) return null;
-  return grant.model !== 'other' ? grant.evidenceAt + activityLifetime(grant) : undefined;
+  return grant.model !== 'non-pro' ? grant.evidenceAt + activityLifetime(grant) : undefined;
 }
 
 async function extendedSilenceWindowFor(conversationId: string, sessionId?: string): Promise<boolean> {
   const grant = activeUntil.get(conversationId);
-  return Boolean(grant && (!sessionId || grant.sessionId === sessionId) && grant.model !== 'other');
+  return Boolean(grant && (!sessionId || grant.sessionId === sessionId) && grant.model !== 'non-pro');
 }
 
-/** Silence can continue only a positively observed non-Pro selection for this exact turn. */
-async function silenceContinuationAllowed(conversationId: string, sessionId?: string): Promise<boolean> {
+/** Resolves the one exact recovery lease this chat may continue from right now. */
+async function currentRecoveryGrant(conversationId: string, sessionId?: string): Promise<RecoveryGrant | null> {
   const session = sessionId ? await getSession(sessionId) : await findSessionByConversation(conversationId, { requireUnique: true });
-  if (!session || session.conversationId !== conversationId) return false;
+  if (!session || session.conversationId !== conversationId) return null;
+  const loopAfterTurn = await effectiveLoopAfterTurnFor(session.id, conversationId);
   const grant = activeUntil.get(conversationId);
   const pending = goalPendingReplyFor(conversationId);
-  const sourceTurnId = pending ? pending.silenceSourceTurnId :
-    grant?.sessionId === session.id && grant.model === 'other' ? grant.turnId : null;
-  if (!sourceTurnId) return false;
-  const starts = await readRecentEvents(session.id, 1, { kinds: ['turn_start'] });
-  const start = starts[0];
-  return Boolean(start && start.turnId === sourceTurnId);
+  if (pending?.recovery) {
+    if (pending.recovery.proof.modelClass === 'pro' && !loopAfterTurn) return null;
+    return await validateRecoveryProof(session.id, pending.recovery.proof) ? pending.recovery : null;
+  }
+  if (!grant?.turnId || grant.sessionId !== session.id ||
+      (grant.model !== 'non-pro' && !(grant.model === 'pro' && loopAfterTurn))) return null;
+  const proof = await captureRecoveryProof({
+    sessionId: session.id,
+    conversationId,
+    turnId: grant.turnId,
+    kind: 'recovered-silence',
+    current: () => activeUntil.get(conversationId) === grant && !stopRequestedFor(conversationId)
+  });
+  return proof ? { proof } : null;
+}
+
+async function recoveryContinuationAllowed(conversationId: string, sessionId?: string): Promise<boolean> {
+  return Boolean(await currentRecoveryGrant(conversationId, sessionId));
 }
 
 /** Withdraw obsolete synthetic obligations through the Goal owner, including any running draft. */
-async function suppressProSilence(conversationId: string): Promise<boolean> {
+async function suppressInvalidGoalRecovery(conversationId: string): Promise<boolean> {
   const pending = goalPendingReplyFor(conversationId);
+  if (!pending?.recovery) return false;
   const draft = goalViewFor(conversationId);
-  if (!(pending?.turnId.startsWith('g-silence-') || pending?.replyId.startsWith('silence:') ||
-      draft?.turnId.startsWith('g-silence-'))) return false;
-  if (await silenceContinuationAllowed(conversationId)) return false;
+  if (await recoveryContinuationAllowed(conversationId)) return false;
   // Do not retire a real final that replaced the synthetic obligation during the disk read.
   const latest = goalPendingReplyFor(conversationId);
   const currentDraft = goalViewFor(conversationId);
   if (latest?.replyId !== pending?.replyId || currentDraft?.token !== draft?.token) return false;
-  if (latest) await withdrawSilenceGoalReplyNow(conversationId, latest.replyId);
+  if (latest) await withdrawRecoveryGoalReplyNow(conversationId, latest.replyId);
   else await setGoalReplyActiveNow(conversationId, false);
   return true;
 }
 
+async function revokeGoalRecovery(conversationId: string): Promise<void> {
+  const pending = goalPendingReplyFor(conversationId);
+  if (pending?.recovery) await withdrawRecoveryGoalReplyNow(conversationId, pending.replyId);
+}
+
+/** Cleanup accelerates convergence; proof validation remains the fail-closed authority boundary. */
+function invalidateRecoveryContinuationsBestEffort(sessionId: string, conversationId: string): void {
+  void revokeRecoveryInputs(sessionId).catch(error => logWarn(`input: could not withdraw recovery pickup: ${String(error)}`));
+  void revokeGoalRecovery(conversationId).catch(error => logWarn(`goal: could not withdraw recovery pickup: ${String(error)}`));
+}
+
 async function chatStillWorking(conversationId: string, turnId: string, sessionId: string, now = Date.now()): Promise<boolean> {
   if (runningToolCalls(conversationId) > 0) return true;
-  if (!turnId.startsWith('g-silence-') && chatIsWorking(conversationId)) return true;
+  const pending = goalPendingReplyFor(conversationId);
+  const recovery = pending?.turnId === turnId ? pending.recovery : undefined;
+  if (!recovery && chatIsWorking(conversationId)) return true;
   const last = lastAttributedCallAt.get(conversationId);
   const pro = await extendedSilenceWindowFor(conversationId, sessionId);
-  if (pro && turnId.startsWith('g-silence-')) return true;
+  if ((recovery?.notBefore ?? 0) > now) return true;
+  if (pro && recovery && !await effectiveLoopAfterTurnFor(sessionId, conversationId)) return true;
   const grant = activeUntil.get(conversationId);
-  const knownNonPro = grant?.sessionId === sessionId && grant.model === 'other';
+  const knownNonPro = grant?.sessionId === sessionId && grant.model === 'non-pro';
   if (!pro && knownNonPro && (last === undefined || now < last || now - last >= GOAL_QUIET_MS)) return false;
-  if (turnId.startsWith('g-silence-') && await silenceContinuationAllowed(conversationId, sessionId)) return false;
+  if (recovery && await recoveryContinuationAllowed(conversationId, sessionId)) return false;
   // A lifecycle end alone can be a transport failure. The canonical final answer for this
   // exact turn is stronger: old tool activity must not delay a visibly finished answer.
   const recent = await readRecentEvents(sessionId, 256, { kinds: ['turn_start', 'assistant_message'] });
@@ -5121,9 +5246,8 @@ export const GOAL_SILENCE_LISTEN_MS = 60_000;
  * pressed never gets here: it ends the chat's activity, and a chat without activity is never
  * silent.
  */
-async function fileSilenceGoalTickets(spent: readonly string[], now: number): Promise<void> {
+async function assignSilenceContinuations(spent: readonly string[], now: number): Promise<void> {
   for (const conversationId of spent) {
-    if (!goalActiveFor(conversationId) || goalWorkerChat(conversationId) || isChatBlocked(conversationId)) continue;
     // Only after a silence reload that was carried out and answered by nothing. A grant spent
     // for any other reason — not a chat the user wants brought back, say — earned no reload
     // and gets no ticket.
@@ -5132,27 +5256,56 @@ async function fileSilenceGoalTickets(spent: readonly string[], now: number): Pr
     const grant = activeUntil.get(conversationId);
     const session = await getSession(held.sessionId);
     if (!session || session.conversationId !== conversationId) continue;
-    if (!await silenceContinuationAllowed(conversationId, session.id)) continue;
-    if (!grant || activeUntil.get(conversationId) !== grant || grant.model !== 'other') continue;
-    if (continuationForSession(session.id)) continue;
-    const turnId = `g-silence-${now}`;
+    if (!grant?.turnId || grant.sessionId !== session.id || activeUntil.get(conversationId) !== grant) continue;
+    const current = () => activeUntil.get(conversationId) === grant && repairsInFlight.get(conversationId) === held &&
+      !stopRequestedFor(conversationId) && !isChatBlocked(conversationId) && !continuationForSession(session.id) &&
+      runningToolCalls(conversationId) === 0 && observationWritesInFlight === 0;
+    const goalTurnId = `g-silence-${now}`;
     try {
-      await acceptGoalReplyNow({
-        conversationId,
+      const disposition = await assignRecoveredContinuation({
         sessionId: session.id,
-        silenceSourceTurnId: grant.turnId ?? undefined,
-        replyId: `silence:${now}`,
-        turnId,
-        eventSeq: session.events,
-        blocked: false
+        conversationId,
+        turnId: grant.turnId,
+        kind: 'recovered-silence',
+        current,
+        goal: { replyId: `silence:${now}`, turnId: goalTurnId, allowed: () => goalActiveFor(conversationId) }
       });
-      logInfo(
-        `bridge: ${conversationId} stayed silent after its reload — filing a Goal ticket so the loop writes the next message`
-      );
+      if (activeUntil.get(conversationId) !== grant || runningToolCalls(conversationId) > 0) {
+        const pending = goalPendingReplyFor(conversationId);
+        if (pending?.turnId === goalTurnId) await withdrawRecoveryGoalReplyNow(conversationId, pending.replyId);
+      }
+      if (disposition.kind === 'goal-loop') logInfo(`bridge: ${conversationId} stayed silent after its reload — filed a Goal continuation for the exact source turn`);
     } catch (err) {
-      logWarn(`bridge: could not file the Goal ticket for ${conversationId} — ${err instanceof Error ? err.message : String(err)}`);
+      logWarn(`bridge: could not assign the recovered continuation for ${conversationId} — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+}
+
+/**
+ * A confirmed silence reload may reserve an existing user instruction immediately, while its
+ * lease keeps Send asleep until the ten-minute work clock expires. Pro Loop uses the same
+ * reservation mechanism. Non-Pro synthesized Goal work still waits for the post-reload listen
+ * window and is assigned by `assignSilenceContinuations`.
+ */
+async function reserveConfirmedSilenceContinuation(conversationId: string, now: number): Promise<RecoveryAssignment> {
+  const grant = activeUntil.get(conversationId);
+  const repair = repairsInFlight.get(conversationId);
+  if (!grant?.turnId || repair?.reason !== 'silence' || repair.state !== 'done' || repair.sessionId !== grant.sessionId) return { kind: 'none' };
+  const hasQueuedInput = await hasQueuedAfterTurnInput(grant.sessionId);
+  const loopAfterTurn = await effectiveLoopAfterTurnFor(grant.sessionId, conversationId);
+  if (!hasQueuedInput && !loopAfterTurn) return { kind: 'none' };
+  const current = () => activeUntil.get(conversationId) === grant && repairsInFlight.get(conversationId) === repair &&
+    !stopRequestedFor(conversationId) && !isChatBlocked(conversationId) &&
+    !continuationForSession(grant.sessionId) && runningToolCalls(conversationId) === 0 && observationWritesInFlight === 0;
+  return assignRecoveredContinuation({
+    sessionId: grant.sessionId,
+    conversationId,
+    turnId: grant.turnId,
+    kind: 'recovered-silence',
+    current,
+    notBefore: grant.evidenceAt + CONTINUATION_SILENCE_MS,
+    ...(loopAfterTurn ? { goal: { replyId: `silence:${now}`, turnId: `g-silence-${now}`, allowed: () => goalActiveFor(conversationId) } } : {})
+  });
 }
 
 /**
@@ -5594,6 +5747,7 @@ async function noteRecoveryObservations(
       { turnId: unresolved.turnId, model: provenModel });
   }
   if (sessionId && !activity.terminal && activity.toolStartedAt !== undefined) {
+    invalidateRecoveryContinuationsBestEffort(sessionId, conversationId);
     const previous = activeUntil.get(conversationId);
     const session = !previous ? await getSession(sessionId) : null;
     const selection = session?.selectedModel;
@@ -5604,20 +5758,29 @@ async function noteRecoveryObservations(
     }
   }
   if (activity.meaningful) {
-    noteRecoveryActivity(conversationId);
+    if (sessionId && activity.working && !activity.terminal) {
+      invalidateRecoveryContinuationsBestEffort(sessionId, conversationId);
+    }
+    if (!activity.terminal || !observations.some(item => item.kind === 'turn_end' && item.outcome === 'stalled'))
+      noteRecoveryActivity(conversationId);
     noteGoalWatchActivity(conversationId);
     // A current-turn interim can push an existing deadline; historical transcript/page rows
     // never enter this verdict and therefore cannot keep a confirmed reload alive.
     if (sessionId && !activity.terminal && (activity.working || activeUntil.has(conversationId))) {
       const liveTurn = liveConversations().find(entry => entry.conversationId === conversationId && entry.sessionId === sessionId)?.activeTurnId;
       const previous = activeUntil.get(conversationId);
+      const [sourceBoundary] = !previous && !liveTurn && activity.working
+        ? await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] }) : [];
+      const workingTurn = liveTurn ?? (sourceBoundary?.kind === 'turn_end' &&
+        ['stalled', 'failed', 'unknown'].includes(sourceBoundary.outcome) ? sourceBoundary.turnId : null);
       let selection: ChatObservation | undefined;
-      let turn: Pick<ActivityGrant, 'turnId' | 'model'> | undefined;
+      let turn: Pick<ActivityGrant, 'turnId' | 'model'> | undefined = !previous && workingTurn
+        ? { turnId: workingTurn, model: provenModel } : undefined;
       for (const item of observations) {
         if (item.kind === 'model_selection') selection = item;
         if (item.kind === 'turn_start' && item.turnId === liveTurn && previous?.turnId !== item.turnId) {
           turn = { turnId: item.turnId ?? null, model: selection?.kind === 'model_selection' && selection.model ?
-            isProModel(selection.model, selection.reasoningEffort) ? 'pro' : 'other' : provenModel };
+            isProModel(selection.model, selection.reasoningEffort) ? 'pro' : 'non-pro' : provenModel };
         }
         // A batched journal can contain multiple turns; one picker observation proves only
         // the next start, never a later turn whose own picker was unavailable.
@@ -5633,17 +5796,39 @@ async function noteRecoveryObservations(
   // 2026-09-02 prime sat dead for twenty minutes: its failure had been refused the immediate
   // reload, its turn end took it off the silence clock, and nothing was left to ask.
   let lastEnd: string | null = null;
+  let settledThinkingFailure = false;
   for (const item of observations) {
-    if (item.kind === 'turn_end') lastEnd = item.outcome ?? 'unknown';
+    if (item.kind === 'turn_end') {
+      lastEnd = item.outcome ?? 'unknown';
+      settledThinkingFailure = item.outcome === 'failed' && item.reason === 'thinking_failed';
+    }
   }
   const terminalGrant = activeUntil.get(conversationId);
+  if (settledThinkingFailure && sessionId && activity.terminal && provenModel === 'pro') {
+    const ended = observations.findLast(item => item.kind === 'turn_end' && item.reason === 'thinking_failed');
+    if (ended?.turnId) {
+      const current = () => activeUntil.get(conversationId) === terminalGrant && !stopRequestedFor(conversationId) &&
+        runningToolCalls(conversationId) === 0;
+      await assignRecoveredContinuation({
+        sessionId,
+        conversationId,
+        turnId: ended.turnId,
+        kind: 'thinking-failed',
+        current,
+        goal: { replyId: `recovery:thinking-failed:${ended.turnId}`, turnId: `g-recovery-${ended.turnId}`, allowed: () => goalActiveFor(conversationId) }
+      });
+    }
+  }
   const proTerminal = terminalGrant?.model === 'pro' && (activity.endedTurnId === terminalGrant.turnId ||
     (activity.terminal && !observations.some(item => item.kind === 'turn_end')));
-  if (proTerminal || (activity.terminal && terminalGrant?.model !== 'pro')) {
+  const awaitingSilenceRefresh = !settledThinkingFailure && !!lastEnd &&
+    ['stalled', 'failed', 'unknown', 'interrupted', 'error'].includes(lastEnd) &&
+    !!sessionId && (await effectiveLoopAfterTurnFor(sessionId, conversationId) || await hasQueuedAfterTurnInput(sessionId));
+  if (!awaitingSilenceRefresh && (proTerminal || (activity.terminal && terminalGrant?.model !== 'pro'))) {
     if (proTerminal) endActivity(conversationId);
     else if (lastEnd === 'unknown' && sessionId && await extendedSilenceWindowFor(conversationId, sessionId)) {
       // Loss of browser completion evidence does not change the last meaningful-work clock.
-    } else if (lastEnd === 'failed' && sessionId) grantActivity(conversationId, sessionId, Math.min(Date.now(), activity.at ?? Date.now()));
+    } else if (lastEnd === 'failed' && !settledThinkingFailure && sessionId) grantActivity(conversationId, sessionId, Math.min(Date.now(), activity.at ?? Date.now()));
     else endActivity(conversationId);
   }
 
@@ -5866,7 +6051,13 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     if (compacting.has(conversationId)) continue;
     if (grant.until > now) continue;
     const pro = await extendedSilenceWindowFor(conversationId, grant.sessionId);
+    const afterTurn = await effectiveLoopAfterTurnFor(grant.sessionId, conversationId) || await hasQueuedAfterTurnInput(grant.sessionId);
     if (activeUntil.get(conversationId) !== grant) continue;
+    if (afterTurn && runningToolCalls(conversationId) > 0) {
+      grant.until = now + GOAL_QUIET_MS;
+      deferred = true;
+      continue;
+    }
     // A blocked chat never gets the reload, so it can never get the confirmation this pass
     // otherwise waits for, and it would sit measured-silent in the ledger — and in the live set
     // the UI paints — for the rest of the process. Its silence is spent the moment it is
@@ -5876,9 +6067,16 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
       spent.push(conversationId);
       continue;
     }
+    // Queued user instructions use the existing ten-minute work clock, including
+    // non-Pro chats. No second listener or independent reload schedule is needed.
+    if (afterTurn && now < grant.evidenceAt + CONTINUATION_SILENCE_MS) {
+      grant.until = grant.evidenceAt + CONTINUATION_SILENCE_MS;
+      deferred = true;
+      continue;
+    }
     // Not a chat the user wants brought back: its silence is spent the same way, without the
     // reload that would otherwise be its one chance.
-    if (!tabRecoveryWanted(conversationId)) {
+    if (!tabRecoveryWanted(conversationId) && !afterTurn) {
       if (pro && now < grant.evidenceAt + activityLifetime(grant)) {
         grant.until = grant.evidenceAt + activityLifetime(grant);
         deferred = true;
@@ -6079,7 +6277,7 @@ async function inspectOwedGoals(now: number): Promise<boolean> {
   for (const [conversationId, reply] of owed) {
     // Legacy normal Goal replies and model switches cannot restore browser-turn
     // continuation authority to Astra. The cleanup below also retires its repair.
-    if (await astraFinishOnly(reply.sessionId, conversationId) || await suppressProSilence(conversationId)) owed.delete(conversationId);
+    if (await requiresFinishOnlyContinuation(reply.sessionId, conversationId) || await suppressInvalidGoalRecovery(conversationId)) owed.delete(conversationId);
   }
   // A schedule outlives neither its obligation nor its reply. Discharged, expired or superseded
   // are the same fact here — this chat is no longer owed the decision this row was armed for —
@@ -6118,7 +6316,8 @@ async function inspectOwedGoals(now: number): Promise<boolean> {
       };
       goalWatch.set(reply.conversationId, watch);
     }
-    if (watch.attempts >= GOAL_WATCH_BACKOFF_MS.length || now < watch.dueAt) continue;
+    if (watch.attempts >= GOAL_WATCH_BACKOFF_MS.length || now < watch.dueAt ||
+        now < (goalPendingReplyFor(reply.conversationId)?.recovery?.notBefore ?? 0)) continue;
     // A draft already being written is the pickup happening. Treat it as the activity it is.
     if (goalDraftBusy(reply.conversationId)) {
       noteGoalWatchActivity(reply.conversationId);
@@ -6457,8 +6656,11 @@ function noteCallAttribution(
         (!filedSession?.activeTurnId && filedSession?.lastTurnEndAt != null && startedAt <= filedSession.lastTurnEndAt))) return;
     // The exact call is stronger than browser lifecycle state: the model is still working even
     // when Chrome, the tab or a reload destroyed the page's local turn projection.
+    const sourceTurnId = filedSession?.activeTurnId ?? previous?.turnId ??
+      goalPendingReplyFor(conversationId)?.recovery?.proof.turnId ?? filedSession?.finishTurn?.turnId ?? null;
+    invalidateRecoveryContinuationsBestEffort(sessionId, conversationId);
     grantActivity(conversationId, sessionId, pro ? Math.min(Date.now(), startedAt) : Date.now(), CHAT_SILENCE_MS,
-      pro ? { turnId: filedSession?.activeTurnId ?? filedSession?.finishTurn?.turnId ?? null, model: 'pro' } : undefined);
+      pro ? { turnId: sourceTurnId, model: 'pro' } : undefined);
     noteRecoveryActivity(conversationId);
     noteGoalWatchActivity(conversationId);
     // Scoped to the repair this fact is evidence about. An attributed call proves the request-id
@@ -6702,6 +6904,9 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
       lastBrowserRecoveryAt.set(conversationId, Date.now());
       awaitingReturn.add(conversationId);
       if (repair.reason === 'silence') {
+        // Persist the next existing instruction as soon as this exact refresh is
+        // acknowledged. Native readiness and the normal Send receipt still gate delivery.
+        const disposition = await reserveConfirmedSilenceContinuation(conversationId, Date.now());
         // The reload is the chat's chance, so the verdict on it waits — not the next maintenance
         // pass. A model writing a long answer makes no durable progress until the answer lands;
         // judging the reload on the pass right after it is how worker-2 was slept 27 seconds
@@ -6714,9 +6919,10 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
         // reload itself is not new work.
         const grant = activeUntil.get(conversationId);
         const pro = await extendedSilenceWindowFor(conversationId, repair.sessionId);
-        if (pro) {
+        if (pro || disposition.kind !== 'none') {
           if (grant && activeUntil.get(conversationId) === grant) {
-            grant.until = Math.max(Date.now(), grant.evidenceAt + activityLifetime(grant));
+            grant.until = Math.max(Date.now(), grant.evidenceAt +
+              (disposition.kind === 'queued-input' ? CONTINUATION_SILENCE_MS : activityLifetime(grant)));
             armSilenceSweep();
           }
         } else grantActivity(

@@ -365,6 +365,7 @@ describe('shipped defaults', () => {
     }
     expect(loaded.multiAgent.enabled).toBe(true);
     expect(loaded.multiAgent.allowUnattributedCalls).toBe(true);
+    expect(loaded.multiAgent.allowUnattributedComputerControl).toBe(false);
     expect(loaded.multiAgent.recoverAgentTabs).toBe(false);
   });
 
@@ -379,6 +380,7 @@ describe('shipped defaults', () => {
       expect(config.multiAgent.enabled).toBe(true);
       expect(config.multiAgent.maxWorkers).toBe(2);
       expect(config.multiAgent.allowUnattributedCalls).toBe(true);
+      expect(config.multiAgent.allowUnattributedComputerControl).toBe(false);
       expect(config.multiAgent.recoverAgentTabs).toBe(false);
     }
   );
@@ -397,6 +399,7 @@ describe('shipped defaults', () => {
     expect(loaded.capabilities.control).toBe(false);
     expect(loaded.multiAgent.enabled).toBe(false);
     expect(loaded.multiAgent.allowUnattributedCalls).toBe(false);
+    expect(loaded.multiAgent.allowUnattributedComputerControl).toBe(false);
     expect(loaded.multiAgent.recoverAgentTabs).toBe(false);
     expect(loaded.readOnly).toBe(true);
   });
