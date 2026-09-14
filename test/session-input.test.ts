@@ -8,10 +8,12 @@ import { flushDurable, initDurableStore, readDurable, resetDurableForTests, writ
 import {
   inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput,
   failBrowserInput, listInputs, offerToolInput as offerToolInputBatch, acknowledgeToolInput, pendingBrowserInputs, requestBrowserDecision, resetInputForTests, configureInputDelivery,
-  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy, installInputAuthority
+  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy, installInputAuthority,
+  bindRecoveryToQueuedInput
 } from '../src/main/session/input.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import { encodeInputState } from '../src/main/session/input-state.js';
+import { captureRecoveryProof } from '../src/main/session/recovery-proof.js';
 import { noteChatOrigin } from '../src/main/session/recorder.js';
 import { listUsageSessions } from '../src/main/session/store.js';
 import { trackInFlight, emptyEvidence, type CallContext } from '../src/main/mcp/call-context.js';
@@ -54,6 +56,17 @@ const deliveryHooks = () => ({
 const sessionId = 'session-one';
 function input(overrides: Partial<InputArgs> = {}): InputArgs {
   return { id: randomUUID(), sessionId, text: 'Please inspect this', mode: 'auto', dueAt: 0, model: null, reasoningEffort: null, ...overrides };
+}
+async function bindThinkingFailedRecovery(turnId: string, time = now + 1): Promise<void> {
+  binding.end = { kind: 'turn_end', outcome: 'failed', reason: 'thinking_failed', turnId, time };
+  const proof = await captureRecoveryProof({ sessionId, conversationId: binding.conversationId, turnId, kind: 'thinking-failed' });
+  expect(proof).not.toBeNull();
+  expect(await bindRecoveryToQueuedInput({
+    sessionId,
+    conversationId: binding.conversationId,
+    grant: { proof: proof! },
+    current: () => true
+  })).toMatchObject({ kind: 'bound' });
 }
 /** Previously persisted queues remain readable even though new direct admission is one at a time. */
 async function seedLegacyInput(args: InputArgs): Promise<InputEntry> {
@@ -101,11 +114,35 @@ describe('durable user input ownership', () => {
       followupPermit: { kind: 'completed-turn', turnId: 'completed-before-upgrade' }
     });
     const durable = await readDurable<unknown>('session-input');
-    expect(durable).toMatchObject({ version: 1, entries: [expect.objectContaining({
+    expect(durable).toMatchObject({ version: 2, entries: [expect.objectContaining({
       id: legacy.id,
       followupPermit: { kind: 'completed-turn', turnId: 'completed-before-upgrade' }
     })] });
     expect(JSON.stringify(durable)).not.toContain('completedTurnId');
+  });
+  it('migrates a v1 automation source string into the explicit turn-or-reply boundary', async () => {
+    const row = { ...input({ mode: 'after-turn' }), state: 'sent' as const, owner: null, createdAt: now,
+      conversationId: binding.conversationId, deliveredAt: now, automationSourceTurnId: 'reply:assistant-before-v2' };
+    await writeDurableNow('session-input', { version: 1, entries: [row] });
+    resetInputForTests();
+    expect((await listInputs())[0]).toMatchObject({
+      id: row.id,
+      automationSource: { kind: 'reply', messageId: 'assistant-before-v2' }
+    });
+    const durable = await readDurable<any>('session-input');
+    expect(durable.version).toBe(2);
+    expect(durable.entries[0].automationSource).toEqual({ kind: 'reply', messageId: 'assistant-before-v2' });
+    expect(JSON.stringify(durable)).not.toContain('automationSourceTurnId');
+  });
+  it('drops malformed v1 automation source strings instead of manufacturing authority', async () => {
+    const row = { ...input({ mode: 'after-turn' }), state: 'sent' as const, owner: null, createdAt: now,
+      conversationId: binding.conversationId, deliveredAt: now, automationSourceTurnId: 'reply:' };
+    await writeDurableNow('session-input', { version: 1, entries: [row] });
+    resetInputForTests();
+    expect((await listInputs())[0]).not.toHaveProperty('automationSource');
+    const durable = await readDurable<any>('session-input');
+    expect(durable.version).toBe(2);
+    expect(durable.entries[0]).not.toHaveProperty('automationSource');
   });
   it('preserves messages beyond the former composer limit through admission, restart and browser claim', async () => {
     binding.finishEnabled = false;
@@ -573,7 +610,7 @@ describe('durable user input ownership', () => {
     expect(automate).not.toHaveBeenCalled();
     now = 2000;
     await claimBrowserInput(row.id, 'owner', binding.conversationId);
-    expect(automate).toHaveBeenCalledExactlyOnceWith(binding.conversationId, 'loop', 'before-send', undefined);
+    expect(automate).toHaveBeenCalledExactlyOnceWith(binding.conversationId, 'loop', 'before-send', undefined, undefined);
     await acknowledgeBrowserInput(row.id, 'owner', binding.conversationId);
     await acknowledgeBrowserInput(row.id, 'owner', binding.conversationId);
     expect(automate).toHaveBeenCalledTimes(1);
@@ -582,7 +619,7 @@ describe('durable user input ownership', () => {
   it('applies tool input automation before disclosure and never repeats on overlapping offers', async () => {
     await enqueueInput(input({ automation: 'off' }));
     expect(await offerToolInput(sessionId, binding.conversationId, 'first', 0)).toHaveLength(1);
-    expect(automate).toHaveBeenCalledExactlyOnceWith(binding.conversationId, 'off', 'before-send', undefined);
+    expect(automate).toHaveBeenCalledExactlyOnceWith(binding.conversationId, 'off', 'before-send', undefined, undefined);
     expect(await offerToolInput(sessionId, binding.conversationId, 'overlapping', 0)).toHaveLength(1);
     expect(automate).toHaveBeenCalledTimes(1);
   });
@@ -617,7 +654,7 @@ describe('durable user input ownership', () => {
     expect(await acknowledgeBrowserInput(row.id, 'owner')).toBe(false);
     expect(await acknowledgeBrowserInput(row.id, 'other', binding.conversationId)).toBe(false);
     expect(await acknowledgeBrowserInput(row.id, 'owner', binding.conversationId)).toBe(true);
-    expect(automate).toHaveBeenCalledExactlyOnceWith(binding.conversationId, 'goal', 'after-send', 'Build the requested project and test it');
+    expect(automate).toHaveBeenCalledExactlyOnceWith(binding.conversationId, 'goal', 'after-send', 'Build the requested project and test it', undefined);
     expect((await listInputs())[0]).toMatchObject({ sessionId: null, deliveredSessionId: sessionId, conversationId: binding.conversationId, state: 'sent' });
     expect(await enqueueInput(args)).toMatchObject({ state: 'sent', automation: 'goal' });
     expect(await acknowledgeBrowserInput(row.id, 'owner', 'conversation-other')).toBe(false);
@@ -802,7 +839,7 @@ describe('durable user input ownership', () => {
     vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('disk busy'));
     await expect(enqueueInput(input())).rejects.toThrow('disk busy');
     await flushDurable();
-    expect(await readDurable('session-input')).toEqual({ version: 1, entries: [] });
+    expect(await readDurable('session-input')).toEqual({ version: 2, entries: [] });
     expect(await listInputs()).toEqual([]);
   });
   it('does not disclose input when durable claim fails and leaves it claimable', async () => {
@@ -1019,8 +1056,8 @@ it.each(['finish', 'after-turn'] as const)('does not advance %s on interruption,
 it.each(['finish', 'after-turn'] as const)('spends a settled Thinking failed once for ten queued %s messages across restart', async mode => {
   const rows = [];
   for (let n = 0; n < 10; n++) rows.push(await enqueueInput(input({ mode, afterTurn: true, text: `Checkpoint ${n}` })));
-  binding.end = { kind: 'turn_end', outcome: 'failed', reason: 'thinking_failed', turnId: 'failed-pro-turn', time: now + 1 };
-  expect(await pendingBrowserInputs()).toEqual([{ id: rows[0]!.id, conversationId: binding.conversationId }]);
+  await bindThinkingFailedRecovery('failed-pro-turn');
+  expect(await pendingBrowserInputs()).toEqual([{ id: rows[0]!.id, conversationId: binding.conversationId, recoveryTurnId: 'failed-pro-turn' }]);
   expect(await claimBrowserInput(rows[1]!.id, 'page', binding.conversationId, true)).toBeNull();
   expect(await claimBrowserInput(rows[0]!.id, 'page', binding.conversationId, true)).not.toBeNull();
   expect(await authorizeBrowserInput(rows[0]!.id, 'page', binding.conversationId)).toBe(true);
@@ -1028,17 +1065,59 @@ it.each(['finish', 'after-turn'] as const)('spends a settled Thinking failed onc
   resetInputForTests();
   expect(await pendingBrowserInputs()).toEqual([]);
   expect((await listInputs()).filter(row => row.state === 'queued')).toHaveLength(9);
-  binding.end = { ...binding.end, turnId: 'next-failed-pro-turn', time: now + 2 };
-  expect(await pendingBrowserInputs()).toEqual([{ id: rows[1]!.id, conversationId: binding.conversationId }]);
+  await bindThinkingFailedRecovery('next-failed-pro-turn', now + 2);
+  expect(await pendingBrowserInputs()).toEqual([{ id: rows[1]!.id, conversationId: binding.conversationId, recoveryTurnId: 'next-failed-pro-turn' }]);
+});
+
+it('keeps separately authored immediate and deferred inputs as separate browser turns', async () => {
+  binding.model = 'gpt-5.6-sol';
+  const deferred = await enqueueInput(input({
+    mode: 'after-turn',
+    afterTurn: true,
+    text: 'Run the deferred migration',
+    model: 'gpt-6-pro',
+    reasoningEffort: 'pro',
+    automation: 'loop',
+    loopTrigger: 'after-turn',
+    objective: 'Finish the migration'
+  }));
+  const immediate = await enqueueInput(input({
+    text: 'Fix the immediate regression',
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'high',
+    automation: 'off'
+  }));
+
+  await bindThinkingFailedRecovery('failed-source-turn');
+  const claimed = await claimBrowserInput(immediate.id, 'page', binding.conversationId, true);
+  expect(claimed).toMatchObject({
+    id: immediate.id,
+    text: 'Fix the immediate regression',
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'high'
+  });
+  expect(claimed?.text).not.toContain('Run the deferred migration');
+  expect((await listInputs()).find(row => row.id === deferred.id)).toMatchObject({
+    state: 'queued',
+    text: 'Run the deferred migration',
+    model: 'gpt-6-pro',
+    reasoningEffort: 'pro',
+    automation: 'loop'
+  });
+
+  expect(await authorizeBrowserInput(immediate.id, 'page', binding.conversationId)).toBe(true);
+  expect(await acknowledgeBrowserInput(immediate.id, 'page', binding.conversationId, 'native-immediate')).toBe(true);
+  expect((await listInputs()).find(row => row.id === deferred.id)?.state).toBe('queued');
+  expect(await pendingBrowserInputs()).toEqual([]);
 });
 
 it.each(['late-tool', 'running-tool', 'new-turn', 'different-end', 'blocked'])('revokes a Thinking failed claim before Send after %s', async change => {
   const row = await enqueueInput(input({ mode: 'after-turn', afterTurn: true }));
-  binding.end = { kind: 'turn_end', outcome: 'failed', reason: 'thinking_failed', turnId: 'failed-pro-turn', time: now + 1 };
+  await bindThinkingFailedRecovery('failed-pro-turn');
   expect(await claimBrowserInput(row.id, 'page', binding.conversationId, true)).not.toBeNull();
   if (change === 'late-tool') binding.lastToolCallAt = now + 2;
   if (change === 'new-turn') binding.activeTurnId = 'resumed-turn';
-  if (change === 'different-end') binding.end = { ...binding.end, turnId: 'other-turn' };
+  if (change === 'different-end' && binding.end) binding.end = { ...binding.end, turnId: 'other-turn' };
   if (change === 'blocked') binding.blocked = true;
   if (change === 'running-tool') {
     await trackInFlight({ startedAt: now + 2, transportKey: null, agent: null, outcome: null, evidence: emptyEvidence(),

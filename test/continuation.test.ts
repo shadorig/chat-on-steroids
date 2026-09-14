@@ -552,7 +552,7 @@ describe('the swarm handover', () => {
       revivable: true,
       conversationId: 'worker-history-chat'
     });
-    expect(() => swarmStateForCaller({ conversationId: CHAT_A })).toThrow(/No sub-agent history/i);
+    expect(swarmStateForCaller({ conversationId: CHAT_A }).agents).toEqual([]);
 
     sendMessage({ conversationId: CHAT_B }, 'worker-1', 'continue from the exact chat you already know');
     expect(pendingWorkerRevivals()).toEqual([
@@ -587,8 +587,8 @@ describe('the swarm handover', () => {
 
     expect(goalObjectiveFor(CHAT_B)).toBe('');
     expect(goalObjectiveFor(CHAT_C)).toBe('finish every requested release task overnight');
-    expect(() => swarmStateForCaller({ conversationId: CHAT_A })).toThrow(/No sub-agent history/i);
-    expect(() => swarmStateForCaller({ conversationId: CHAT_B })).toThrow(/No sub-agent history/i);
+    expect(swarmStateForCaller({ conversationId: CHAT_A }).agents).toEqual([]);
+    expect(swarmStateForCaller({ conversationId: CHAT_B }).agents).toEqual([]);
     expect(swarmStateForCaller({ conversationId: CHAT_C }).agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
       state: 'sleeping',
       revivable: true,
@@ -656,7 +656,7 @@ describe('the swarm handover', () => {
     });
     expect(goalObjectiveFor(CHAT_A)).toBe('');
     expect(goalObjectiveFor(CHAT_B)).toBe('keep the recovery objective attached to this work');
-    expect(() => swarmStateForCaller({ conversationId: CHAT_A })).toThrow(/No sub-agent history/i);
+    expect(swarmStateForCaller({ conversationId: CHAT_A }).agents).toEqual([]);
   });
 
   it('carries the full sleeping and terminal worker history plus Goal through repeated overnight resumes', async () => {
@@ -708,8 +708,8 @@ describe('the swarm handover', () => {
       revivable: false,
       conversationId: 'worker-chain-terminal'
     });
-    expect(() => swarmStateForCaller({ conversationId: CHAT_A })).toThrow(/No sub-agent history/i);
-    expect(() => swarmStateForCaller({ conversationId: CHAT_B })).toThrow(/No sub-agent history/i);
+    expect(swarmStateForCaller({ conversationId: CHAT_A }).agents).toEqual([]);
+    expect(swarmStateForCaller({ conversationId: CHAT_B }).agents).toEqual([]);
 
     // Revival authority follows the owner chain but the worker conversation itself never moves.
     sendMessage({ conversationId: CHAT_C }, 'worker-1', 'resume in the exact old worker chat');
@@ -884,6 +884,63 @@ describe('the swarm handover', () => {
       state: 'awaiting-summary',
       automatic: true
     });
+  });
+
+  it('reads legacy requestedModel intent once and rewrites it as requestedSelection', async () => {
+    const summary = await createSession({ title: 'selection migration', conversationId: CHAT_A });
+    const token = 'legacy-requested-model-token';
+    await restoreContinuations({
+      version: 1,
+      savedAt: Date.now(),
+      entries: [{
+        token,
+        sessionId: summary.id,
+        from: CHAT_A,
+        to: null,
+        openedAt: Date.now(),
+        state: 'awaiting-summary',
+        summary: '',
+        handoffId: null,
+        claimedBy: null,
+        armed: false,
+        requestedModel: { model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        error: null
+      }]
+    });
+
+    expect(continuationByToken(token)?.requestedSelection).toEqual({ model: 'GPT-5.6 Sol', reasoningEffort: 'high' });
+    const [stored] = snapshotContinuations().entries;
+    expect(stored).toMatchObject({ requestedSelection: { model: 'GPT-5.6 Sol', reasoningEffort: 'high' } });
+    expect(stored && 'requestedModel' in stored).toBe(false);
+  });
+
+  it('prefers an explicit current requestedSelection over a stale legacy requestedModel field', async () => {
+    const summary = await createSession({ title: 'selection precedence', conversationId: CHAT_A });
+    const token = 'mixed-selection-fields-token';
+    await restoreContinuations({
+      version: 1,
+      savedAt: Date.now(),
+      entries: [{
+        token,
+        sessionId: summary.id,
+        from: CHAT_A,
+        to: null,
+        openedAt: Date.now(),
+        state: 'awaiting-summary',
+        summary: '',
+        handoffId: null,
+        claimedBy: null,
+        armed: false,
+        requestedSelection: null,
+        requestedModel: { model: 'stale-legacy-model', reasoningEffort: 'high' },
+        error: null
+      }]
+    });
+
+    expect(continuationByToken(token)?.requestedSelection).toBeNull();
+    const [stored] = snapshotContinuations().entries;
+    expect(stored).toMatchObject({ requestedSelection: null });
+    expect(stored && 'requestedModel' in stored).toBe(false);
   });
 });
 

@@ -165,7 +165,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  resetBridgeForTests();
+  await resetBridgeForTests();
   resetRecorderForTests();
   resetSessionStoreForTests();
   // Each case models one independent app history. Reusing CHAT_A/CHAT_B while retaining
@@ -338,7 +338,7 @@ describe('one press, one transaction', () => {
     expect(first.prompt).not.toContain('[[COS_CONTEXT:');
 
     const claimed = await request('POST', '/compact', {
-      body: { conversationId: CHAT_A, token: first.token, sourceAttempt: true }
+      body: { conversationId: CHAT_A, token: first.token, action: 'source-claim' }
     });
     expect(claimed.body.allowed).toBe(true);
     expect(claimed.body.sourceSend.state).toBe('attempted-unresolved');
@@ -350,7 +350,7 @@ describe('one press, one transaction', () => {
     expect(replacement.body.token).toBe(first.token);
     expect(replacement.body.prompt).toContain(`[[CLF-HANDOFF:${first.token}]]`);
     const reclaimed = await request('POST', '/compact', {
-      body: { conversationId: CHAT_A, token: first.token, sourceAttempt: true }
+      body: { conversationId: CHAT_A, token: first.token, action: 'source-claim' }
     });
     expect(reclaimed.body.allowed).toBe(true);
   });
@@ -360,10 +360,10 @@ describe('one press, one transaction', () => {
     await record();
     const first = await press();
     await request('POST', '/compact', {
-      body: { conversationId: CHAT_A, token: first.token, sourceAttempt: true }
+      body: { conversationId: CHAT_A, token: first.token, action: 'source-claim' }
     });
     const armed = await request('POST', '/compact', {
-      body: { conversationId: CHAT_A, token: first.token, sourceDispatch: true }
+      body: { conversationId: CHAT_A, token: first.token, action: 'source-arm' }
     });
     expect(armed.status).toBe(200);
     expect(armed.body.armed).toBe(true);
@@ -375,7 +375,7 @@ describe('one press, one transaction', () => {
     expect(afterArming.body.prompt).toBeNull();
     expect(afterArming.body.sourceSend.state).toBe('dispatched-unresolved');
     const reclaim = await request('POST', '/compact', {
-      body: { conversationId: CHAT_A, token: first.token, sourceAttempt: true }
+      body: { conversationId: CHAT_A, token: first.token, action: 'source-claim' }
     });
     expect(reclaim.body.allowed).toBe(false);
   });
@@ -388,15 +388,15 @@ describe('one press, one transaction', () => {
     // neither has submitted yet.
     for (const _ of [0, 1]) {
       const claimed = await request('POST', '/compact', {
-        body: { conversationId: CHAT_A, token: first.token, sourceAttempt: true }
+        body: { conversationId: CHAT_A, token: first.token, action: 'source-claim' }
       });
       expect(claimed.body.allowed).toBe(true);
     }
     const first_click = await request('POST', '/compact', {
-      body: { conversationId: CHAT_A, token: first.token, sourceDispatch: true }
+      body: { conversationId: CHAT_A, token: first.token, action: 'source-arm' }
     });
     const second_click = await request('POST', '/compact', {
-      body: { conversationId: CHAT_A, token: first.token, sourceDispatch: true }
+      body: { conversationId: CHAT_A, token: first.token, action: 'source-arm' }
     });
     expect(first_click.body.armed).toBe(true);
     expect(second_click.status).toBe(409);
@@ -414,9 +414,15 @@ describe('one press, one transaction', () => {
     expect(one.body.handoffId).toBe(two.body.handoffId);
     expect(three.body.handoffId).toBe(one.body.handoffId);
     expect((await sessionHandoffCount(sessionId)) - before).toBe(1);
-    // And one replacement chat, not three.
+    // And one replacement chat authority, not three. This request is the source page itself,
+    // so the bridge hands that live page one placement rather than also asking the OS opener.
     expect(pendingCommands()).toHaveLength(1);
-    expect(opened).toHaveLength(1);
+    const placements = [one.body.placement, two.body.placement, three.body.placement].filter(Boolean);
+    expect(placements).toHaveLength(1);
+    expect(placements[0]?.id).toBe(one.body.commandId);
+    expect(two.body.commandId).toBe(one.body.commandId);
+    expect(three.body.commandId).toBe(one.body.commandId);
+    expect(opened).toEqual([]);
   });
 
   it('reports a rejected handoff WAL write as retryable while the continuation still awaits its brief', async () => {
@@ -509,7 +515,7 @@ describe('the replacement chat', () => {
     // Claimed, then gone before the click — the same crash point as the source half, and the
     // same answer: nothing was typed under this state, so the next document may have it.
     const claimed = await request('POST', '/compact', {
-      body: { token: continuation, destinationAttempt: true }
+      body: { token: continuation, commandId, client: 'page-2', action: 'destination-claim' }
     });
     expect(claimed.body.allowed).toBe(true);
     const afterClaim = await redeem(commandId, 'page-3');
@@ -519,13 +525,13 @@ describe('the replacement chat', () => {
     // Armed. This bootstrap may exist in a chat this app cannot yet name, so it is never
     // handed to another document; only the marked message can resolve it.
     const armed = await request('POST', '/compact', {
-      body: { token: continuation, destinationDispatch: true }
+      body: { token: continuation, commandId, client: 'page-3', action: 'destination-arm' }
     });
     expect(armed.body.armed).toBe(true);
     expect((await redeem(commandId, 'page-3')).status).toBe(409);
     expect((await redeem(commandId, 'page-4')).status).toBe(409);
     expect(
-      (await request('POST', '/compact', { body: { token: continuation, destinationAttempt: true } })).body.allowed
+      (await request('POST', '/compact', { body: { token: continuation, commandId, client: 'page-3', action: 'destination-claim' } })).body.allowed
     ).toBe(false);
   });
 
@@ -627,7 +633,7 @@ describe('a restart in the middle', () => {
     expect(continuationSnapshot).not.toBeNull();
 
     const { restoreCommands } = await import('../src/main/bridge.js');
-    resetBridgeForTests();
+    await resetBridgeForTests();
     opened.length = 0;
     setBrowserOpener(async (url) => {
       opened.push(url);

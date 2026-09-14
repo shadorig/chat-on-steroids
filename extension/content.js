@@ -98,9 +98,6 @@
    * which nothing downstream reads as anything but the turn having taken that much longer.
    */
   const TURN_SETTLE_MS = 4000;
-  /** Ignore delayed activity for 30s, then listen for fresh work for another 5m. */
-  const THINKING_FAILED_IGNORE_MS = 30_000;
-  const THINKING_FAILED_TOTAL_GRACE_MS = THINKING_FAILED_IGNORE_MS + 5 * 60 * 1000;
   // While ChatGPT is generating, keep the app-owned transcript close enough to feel like a
   // stream rather than a two-second slideshow. This does not create duplicate rows: /activity
   // is cursor-based, streamBySeq is keyed by canonical seq, and assistant messages additionally
@@ -411,12 +408,6 @@
   let quietTurn = null;
   let quietOutcome = null;
   /**
-   * Provider Thinking-failed is provisional. `ignore-late` absorbs deliveries already in
-   * flight, `listening` waits for genuine resumed work, and `resumed` returns to ordinary
-   * ten-minute stall tracking.
-   */
-  let thinkingFailureWatch = null;
-  /**
    * Assistant sections that already had a completed-message action before this generation.
    *
    * Section ownership is deliberately stronger than remembering one HTMLElement. Retry can
@@ -569,7 +560,15 @@
   let unwitnessedGeneration = false;
   let lastChangeAt = 0;
   let turnProgressRevision = 0; // Distinguish work received within the same millisecond.
-  function noteTurnProgress() {
+  function noteTurnProgress(owner = turnId) {
+    if (owner && turnId && owner !== turnId) return;
+    // A failed view is terminal for input, but fresh work in that exact generation
+    // can resume it. Keep the ordinary generation owner and activity clock.
+    if (!generating && owner && lastTerminalObservation?.localTurnId === owner && lastTerminalObservation.reason === 'thinking_failed') {
+      const pageTurn = lastTerminalObservation.pageTurn;
+      adoptOpenTurn(owner);
+      genNode = pageTurn?.node || null;
+    }
     lastChangeAt = Date.now();
     turnProgressRevision++;
     if (stagePanel?.root.dataset.clfStageKind === 'wait') removeStagePanel();
@@ -1419,7 +1418,6 @@
     quietSince = 0;
     quietTurn = null;
     quietOutcome = null;
-    thinkingFailureWatch = null;
     userStopped = false;
     stallReported = false;
     fiberTerminalMessageId = null;
@@ -1549,6 +1547,10 @@
   }
 
   function resetConversation() {
+    // First-generation recovery belongs to this conversation. The navigation
+    // epoch already keeps local turn ids distinct across SPA route changes.
+    genCount = 0;
+    unrecordedGeneratingSince = 0;
     seenMessages.clear();
     reportedConversationTitle = '';
     reportedModelSelection = '';
@@ -1616,7 +1618,6 @@
     quietSince = 0;
     quietTurn = null;
     quietOutcome = null;
-    thinkingFailureWatch = null;
     turnId = null;
     genNode = null;
     priorSections = new WeakSet();
@@ -1629,7 +1630,7 @@
     // The settle window names a turn in the conversation being left behind. Carrying it
     // across would re-read chat B's tree and attribute what it finds to chat A's turn.
     fiberSettleUntil = 0;
-    fiberSettled = null;
+    lastTerminalObservation = null;
     pageToolsReported.clear();
     callsReported.clear();
     requestOwnersConfirmed.clear();
@@ -1847,7 +1848,8 @@
     // and a toast still on screen from an earlier failure was already on screen when this
     // turn began — neither says anything about how this one ended.
     const failures = (turn ? (CLF_DOM.errorsForTurn?.(turn) ?? CLF_DOM.errors()) : CLF_DOM.errors()).filter(
-      (error) => !isStale(error.node) && Boolean(turnId) && localErrorGeneration(error) === turnId
+      (error) => !isStale(error.node) && Boolean(turnId) && localErrorGeneration(error) === turnId &&
+        (error.reason !== 'thinking_failed' || unreportedError(error, turnId))
     );
     if (failures.length > 0) {
       const failure = failures.find(error => error.reason !== 'thinking_failed') || failures[0];
@@ -1887,29 +1889,6 @@
    */
   function turnStalled() {
     return turnStartedAt > 0 && Date.now() - lastChangeAt > STALL_MS;
-  }
-
-  function thinkingFailureSettled() {
-    return !!thinkingFailureWatch && thinkingFailureWatch.phase !== 'resumed' && pendingTools === 0 && !CLF_DOM.generating() &&
-      Date.now() - thinkingFailureWatch.observedAt >= THINKING_FAILED_TOTAL_GRACE_MS;
-  }
-
-  function beginThinkingFailure(observedAt) {
-    return { observedAt, phase: 'ignore-late' };
-  }
-
-  /** Pure transition for the provider-failure grace; page side effects stay in the wrapper below. */
-  function nextThinkingFailureWatch(watch, now, changedAt, toolCount) {
-    if (!watch || watch.phase === 'resumed' || now < watch.observedAt + THINKING_FAILED_IGNORE_MS) return watch;
-    if (changedAt >= watch.observedAt + THINKING_FAILED_IGNORE_MS || toolCount > 0) return { ...watch, phase: 'resumed' };
-    return watch.phase === 'ignore-late' ? { ...watch, phase: 'listening' } : watch;
-  }
-
-  function advanceThinkingFailureWatch(now = Date.now()) {
-    const before = thinkingFailureWatch;
-    thinkingFailureWatch = nextThinkingFailureWatch(before, now, lastChangeAt, pendingTools);
-    if (before?.phase !== 'resumed' && thinkingFailureWatch?.phase === 'resumed' && pendingTools > 0) noteTurnProgress();
-    return thinkingFailureWatch;
   }
 
   /** The turn section a node is rendered in, or null. */
@@ -2012,11 +1991,17 @@
           userSendReceipt = null;
         } else {
           const conversationId = CLF_DOM.conversationId();
+          // A durable desktop ACK may precede the activity pull that releases transcript
+          // custody. Keep that exact send identity stronger than later Fiber text spelling.
+          const accepted = receipt.accepted;
+          const acceptedIdentity = accepted?.messageId === message.id &&
+            accepted.conversationId === conversationId && accepted.epoch === epoch;
           const sameConversation = !receipt.conversationId || receipt.conversationId === conversationId;
           const newIdentity = !receipt.previousMessageId || receipt.previousMessageId !== message.id;
           const attachmentsMatch = receipt.text || (receipt.attachmentNames?.length &&
             JSON.stringify(receipt.attachmentNames) === JSON.stringify((userMessageSource(message)?.attachments || []).map(file => file.name).sort()));
-          if (sameConversation && newIdentity && attachmentsMatch && matchesSubmittedUser(message, receipt.text)) {
+          if (sameConversation && newIdentity && attachmentsMatch &&
+              (acceptedIdentity || matchesSubmittedUser(message, receipt.text))) {
             userSendReceipt = null;
             return { messageId: message.id, baseline: receipt.baseline };
           }
@@ -2109,16 +2094,10 @@
     // other named turn by accident. Modern generations always mint/adopt an id; this is the
     // fail-closed guard for stale/legacy/reinjected state.
     const endedTurnId = turnId;
-    // Only this fully observed inactivity boundary grants after-turn delivery.
-    // A new user message can close a failed turn early, but cannot grant that right.
-    if (result.reason === 'thinking_failed' && !thinkingFailureSettled()) {
-      result = { outcome: result.outcome, detail: result.detail };
-    }
     generating = false;
     quietSince = 0;
     quietTurn = null;
     quietOutcome = null;
-    thinkingFailureWatch = null;
     if (ended && endedTurnId) {
       for (const node of ended.nodes || [ended.node]) {
         if (node) settledGenerations.set(node, { turnId: endedTurnId, mark: sectionMark(node) });
@@ -2137,12 +2116,13 @@
       // omit `data-turn-id` entirely, and the post-turn settle window still has to be able
       // to find this generation's Fiber descriptor; the node carries fiber.js's own
       // `data-clf-fiber-turn` stamp, which is present whether or not the page id is.
-      fiberSettled = {
+      lastTerminalObservation = {
         pageTurnId: ended?.id || null,
         localTurnId: endedTurnId,
-        pageTurn: ended || null
+        pageTurn: ended || null,
+        ...(result.reason === 'thinking_failed' ? { reason: result.reason, endedAt: Date.now() } : {})
       };
-      fiberSettleUntil = Date.now() + FIBER_SETTLE_MS;
+      fiberSettleUntil = Date.now() + (result.reason === 'thinking_failed' ? STALL_MS : FIBER_SETTLE_MS);
     }
     if (endedTurnId && publishFinal && result.outcome === 'completed') {
       void refreshFiber({
@@ -2407,7 +2387,6 @@
       quietSince = 0;
       quietTurn = null;
       quietOutcome = null;
-      thinkingFailureWatch = null;
       userStopped = false;
       stallReported = false;
       genCount++;
@@ -2503,7 +2482,7 @@
       // actually still missing its id, and never past the ceiling — see `fiberSettleUntil`.
       // Flushed straight away rather than on the idle 10-second cadence: the app is usually
       // already blocked waiting for exactly this id, and the wait is measured in seconds.
-      void refreshFiber(fiberSettled).then(() => {
+      void refreshFiber(lastTerminalObservation).then(() => {
         if (!alive || !sameChat()) return;
         void flush();
       });
@@ -2517,13 +2496,14 @@
       // messages keyed by ChatGPT's own message id. Do not emit a second progress stream.
       // Native activity is emitted by refreshFiber() from ChatGPT's stable thought-message
       // identity. DOM rows alone are presentation and never mint durable page_tool ids.
-      // The native failure has its own inactivity boundary below. The generic
-      // watchdog must not reload it mid-grace, including after a long quiet run.
+      // The exact native failure closes below. Do not also describe it as a
+      // generic stall, including when it appears after a long quiet run.
       const thinkingFailure = quietOutcome?.reason === 'thinking_failed' || visibleErrors.some(
         error => error.reason === 'thinking_failed' && localErrorGeneration(error) === turnId && !isStale(error.node));
       if (!thinkingFailure && !stallReported && Date.now() - lastChangeAt > STALL_MS) {
         stallReported = true;
-        emit({ kind: 'chat_error', text: 'No visible progress for ten minutes. The turn is still marked as generating.', turnId, recoverable: true });
+        emit({ kind: 'chat_error', text: 'No visible progress for ten minutes. The app could not confirm that this turn finished.', turnId,
+          reason: 'no_visible_progress', recoverable: true });
       }
     }
 
@@ -2535,7 +2515,6 @@
       quietSince = 0;
       quietTurn = null;
       quietOutcome = null;
-      thinkingFailureWatch = null;
     }
 
     if (generating && !nowGenerating) {
@@ -2546,12 +2525,11 @@
         quietOutcome = endOutcome(turn);
       }
       const freshOutcome = endOutcome(quietTurn || turn);
-      // An error discovered after an earlier quiet/unknown observation starts its
-      // own grace. All subsequent real progress uses the existing lastChangeAt.
+      // An error discovered after an earlier quiet/unknown observation replaces the
+      // provisional outcome for this exact generation.
       if (freshOutcome.reason === 'thinking_failed' && quietOutcome?.reason !== 'thinking_failed') {
         quietSince = Date.now();
         quietOutcome = freshOutcome;
-        thinkingFailureWatch = beginThinkingFailure(quietSince);
       }
       // Preserve a failure/interruption captured before its banner disappears, while still
       // allowing the common opposite transition: the stop control vanishes first and the
@@ -2570,16 +2548,7 @@
       // A user stop also overrides the outcome captured on the first quiet observation.
       if (userStopped) quietOutcome = { outcome: 'stopped' };
       let result = quietOutcome || endOutcome(quietTurn || turn);
-      const thinkingFailed = result.reason === 'thinking_failed';
-      if (thinkingFailed && !thinkingFailureWatch) {
-        thinkingFailureWatch = beginThinkingFailure(quietSince || Date.now());
-      }
-      if (thinkingFailed) advanceThinkingFailureWatch();
-      if (thinkingFailed && thinkingFailureWatch?.phase === 'resumed' && turnStalled()) {
-        result = { outcome: 'stalled', detail: 'no visible output and no progress for ten minutes' };
-      }
-      const settled = thinkingFailed && result.outcome !== 'stalled' ? thinkingFailureSettled()
-        : quietFor >= TURN_SETTLE_MS;
+      const settled = result.reason === 'thinking_failed' || quietFor >= TURN_SETTLE_MS;
       // `unknown` means exactly "nothing proves the turn ended". A real
       // answer/error/interrupt closes after the settle window, and ten minutes of genuine
       // silence upgrades itself to `stalled` through endOutcome().
@@ -2628,6 +2597,9 @@
       // owner. An in-turn error whose section cannot be mapped stays unscoped instead of leaking
       // ChatGPT's unrelated page id into the recorder turn-id namespace.
       const recordedTurn = localErrorGeneration(error);
+      // A reload can reveal an old failure while a newer answer is still working.
+      // Only an exact local generation may publish this turn-scoped native header.
+      if (error.reason === 'thinking_failed' && !recordedTurn) continue;
       const scope = recordedTurn || '';
       if (!unreportedError(error, scope)) continue;
       markErrorReported(error, scope);
@@ -2635,13 +2607,16 @@
       // exact broken generation's terminal observation first; the quiet-settle
       // timer cannot survive that reload. Unowned or informational banners do
       // not close a generation.
-      if (generating && recordedTurn && recordedTurn === turnId && error.recoverable === true) {
-        finishGeneration(quietTurn || turn, { outcome: userStopped ? 'stopped' : 'failed', detail: error.text });
+      if (generating && recordedTurn && recordedTurn === turnId &&
+          (error.recoverable === true || error.reason === 'thinking_failed')) {
+        finishGeneration(quietTurn || turn, { outcome: userStopped ? 'stopped' : 'failed', detail: error.text,
+          ...(!userStopped && error.reason === 'thinking_failed' ? { reason: error.reason } : {}) });
       }
       emit({
         kind: 'chat_error',
         text: error.text,
         turnId: recordedTurn || undefined,
+        ...(error.reason === 'thinking_failed' ? { reason: error.reason } : {}),
         recoverable: error.recoverable === true,
         // The dialog branch above is the only thing that sets this, and it is what tells the
         // app a provider access limit was identified without the app re-reading the prose.
@@ -2776,16 +2751,16 @@
       // A hidden tab may hydrate the remaining final text after the request-id
       // settle window has ended. Reuse this observer and its exact settled owner
       // instead of waiting for visibilitychange or starting another polling loop.
-      if (!generating && fiberSettled?.localTurnId) {
+      if (!generating && lastTerminalObservation?.localTurnId) {
         if (!urgentQueued) {
           urgentQueued = true;
-          const settled = fiberSettled;
+          const settled = lastTerminalObservation;
           const settledEpoch = epoch;
           void Promise.resolve().then(() => {
             urgentQueued = false;
-            if (!alive || epoch !== settledEpoch || !sameChat() || fiberSettled !== settled) return;
+            if (!alive || epoch !== settledEpoch || !sameChat() || lastTerminalObservation !== settled) return;
             observe();
-            if (!generating && epoch === settledEpoch && fiberSettled === settled) void refreshFiber(settled);
+            if (!generating && epoch === settledEpoch && lastTerminalObservation === settled) void refreshFiber(settled);
           });
         }
         return;
@@ -2986,7 +2961,7 @@
   const FIBER_SETTLE_MS = 90_000;
   let fiberSettleUntil = 0;
   /** The turn identity to attribute a settled-window scan to, from finishGeneration. */
-  let fiberSettled = null;
+  let lastTerminalObservation = null;
   /**
    * Message ids whose per-call evidence has already been reported. Every scan re-reads the
    * whole turn, so without this the same request would be re-sent on every poll.
@@ -3807,7 +3782,7 @@
           const signature = `${activity.label}\u0000${owner}`;
           if (pageToolsReported.get(activity.messageId) === signature) continue;
           pageToolsReported.set(activity.messageId, signature);
-          if (generating && index === activeTurnIndex) noteTurnProgress();
+          if (owner) noteTurnProgress(owner);
           emit({
             kind: 'page_tool',
             text: activity.label,
@@ -3877,8 +3852,8 @@
           `${state}\u0000${message.rawText}\u0000${message.renderedHtml}\u0000${owner}` +
           `\u0000${message.createTime || ''}\u0000${message.rawMessageId || ''}`;
         if (priorMessage?.signature === signature) continue;
-        messagesReported.set(message.messageId, { signature, owner, conflicted: ownerConflict });
-        if (state === 'streaming') noteTurnProgress();
+        messagesReported.set(message.messageId, { signature, owner, conflicted: ownerConflict, text: message.rawText });
+        if (state === 'streaming' && owner && priorMessage?.text !== message.rawText) noteTurnProgress(owner);
         const liveAssistant =
           Boolean(localOwner) ||
           (generating && (index === activeTurnIndex || (activeTurnIndex < 0 && index === answer.turns.length - 1)));
@@ -3895,7 +3870,7 @@
           // locally-owned turn, first observation is the comparable clock. Historical backfill
           // has no local turn anchor, so it keeps authored create_time instead.
           ...(!liveAssistant && message.createTime ? { time: message.createTime, authoredTime: true } : {}),
-          ...(liveAssistant ? { activeNow: true } : {}),
+          ...(liveAssistant && (state === 'final' || priorMessage?.text !== message.rawText) ? { activeNow: true } : {}),
           state,
           final: state === 'final',
           ...(state === 'final' && localOwner && goalTerminalCandidate('completed', localOwner, markedTurns.some(([, marked]) =>
@@ -4620,17 +4595,30 @@
   function chronological(entries) {
     const position = (entry) => (Number.isFinite(Number(entry && entry.origin)) ? Number(entry.origin) : entry.seq);
     const bySeq = [...entries].sort((a, b) => position(a) - position(b) || a.seq - b.seq);
-    const anchors = new Map();
-    const ends = new Map();
+    // Mirror projectTurnSegments() from src/shared/turn-segments.ts. A logical provider turn id
+    // may be reopened after a terminal row; each contiguous lifecycle interval therefore gets a
+    // fresh anchor even when the id is the same. Late-attributed rows keep the most recent segment
+    // until a later start explicitly opens the next one.
+    const currentByTurn = new Map();
+    const segmentByEntry = new Map();
+    const segments = [];
     for (const entry of bySeq) {
-      if (entry.kind === 'turn_start' && entry.turnId && !anchors.has(entry.turnId)) {
-        anchors.set(entry.turnId, position(entry));
+      if (!entry.turnId) continue;
+      let segment = currentByTurn.get(entry.turnId);
+      if (entry.kind === 'turn_start' && (!segment || segment.closed)) {
+        segment = { anchor: position(entry), closed: false, endTime: undefined };
+        currentByTurn.set(entry.turnId, segment);
+        segments.push(segment);
       }
-      if (entry.kind === 'turn_end' && entry.turnId) {
-        const anchor = anchors.get(entry.turnId);
-        if (anchor !== undefined) ends.set(anchor, Math.max(ends.get(anchor) || 0, entry.time));
+      if (!segment) continue;
+      segmentByEntry.set(entry, segment);
+      if (entry.kind === 'turn_end') {
+        segment.endTime = Math.max(segment.endTime ?? Number.NEGATIVE_INFINITY, entry.time);
+        segment.closed = true;
       }
     }
+    const ends = new Map(segments.flatMap((segment) =>
+      segment.endTime === undefined ? [] : [[segment.anchor, segment.endTime]]));
     // The message that ended a turn is the last thing in that turn by definition, so it is
     // placed there rather than by the `create_time` ChatGPT stamped when it *opened* the
     // message — which can precede a connector call the same turn still had to make. See the
@@ -4669,11 +4657,12 @@
         const end = ends.get(activeAnchor);
         if (end === undefined || entry.time <= end) inferredAnchor = activeAnchor;
       }
-      const anchor = (entry.turnId ? anchors.get(entry.turnId) : inferredAnchor) ?? entryPosition;
+      const explicitSegment = segmentByEntry.get(entry);
+      const anchor = (explicitSegment && explicitSegment.anchor) ?? inferredAnchor ?? entryPosition;
       const held = groups.get(anchor);
       if (held) held.push(entry);
       else groups.set(anchor, [entry]);
-      if (entry.kind === 'turn_start' && entry.turnId) pendingAnchor = anchors.get(entry.turnId);
+      if (entry.kind === 'turn_start' && explicitSegment) pendingAnchor = anchor;
     }
     const out = [];
     for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
@@ -5857,6 +5846,8 @@
       const isWork = (entry) =>
         entry &&
         entry.turnId === turnId &&
+        !(entry.kind === 'assistant_message' && (entry.final === true || entry.state === 'final')) &&
+        !(lastTerminalObservation?.reason === 'thinking_failed' && entry.time <= lastTerminalObservation.endedAt) &&
         !browserRepairRow(entry) &&
         (entry.kind === 'tool_call' ||
           entry.kind === 'page_tool' ||
@@ -5890,7 +5881,7 @@
           ) {
             settlePresentation();
           }
-          if (changed && generating && isWork(entry)) exactTurnActivity = true;
+          if (changed && isWork(entry)) exactTurnActivity = true;
           continue;
         }
         // Commentary and native tool rows arrive again as they change, under the seq they
@@ -5908,7 +5899,7 @@
         }
         streamBySeq.set(seq, entry);
         streamAdded++;
-        if (generating && isWork(entry)) exactTurnActivity = true;
+        if (isWork(entry)) exactTurnActivity = true;
       }
       if (streamAdded > 0) trimStream();
       if (exactTurnActivity) noteTurnProgress();
@@ -5935,6 +5926,7 @@
       // resumeOpenTurn(), on the boot pull, and only to work out whether this document is
       // standing in the middle of a turn a previous one opened. See adoptTurnId.
       appActiveTurnId = typeof data.activeTurnId === 'string' && data.activeTurnId ? data.activeTurnId : null;
+      if (!generating && pendingTools > 0 && appActiveTurnId === turnId && lastTerminalObservation?.reason === 'thinking_failed') noteTurnProgress();
       if (resumeIdentityPending) {
         // A reopened Stop target must prove the original question before adoption
         // can anchor native messages under its old local turn. Hydration may lag
@@ -7700,12 +7692,6 @@
     if (goalView) return goalView;
     const now = input.now ?? Date.now();
     const frame = (stage, detail = '') => ({ stage, detail, body: '', kind: 'wait' });
-    const failure = input.thinkingFailure;
-    if (failure && failure.phase !== 'resumed') {
-      return frame('ChatGPT reported Thinking failed', failure.phase === 'ignore-late'
-        ? 'Waiting briefly in case this response resumes.'
-        : 'This response may still resume.');
-    }
     // A real assistant change immediately wins over a wait caption. Generation alone
     // does not prove which remote dependency is pending, so never invent one.
     if (now - (input.changedAt ?? now) < 3000) return null;
@@ -7992,7 +7978,6 @@
       job, progress: operationProgress, changedAt: lastChangeAt,
       summary: compactionSummaryProgress(),
       generating: generating && CLF_DOM.generating(),
-      thinkingFailure: thinkingFailureWatch,
       goal: goalConfig
         ? { ...goalConfig, phase: goalPhase, error: goalError, retryMs: goalRetryWaitMs, draft: goalDraft, opening }
         : null
@@ -8334,11 +8319,11 @@
         job = null;
         await ask({ type: 'compact', conversationId: forId, cancel: true }).catch(() => undefined);
       } else if (retireAutomatic) {
-        // This is not the user-facing Cancel path. The bridge accepts sourceLost only while its
+        // This is not the user-facing Cancel path. The bridge accepts source-release only while its
         // durable checkpoint still proves no Send happened (`not-attempted` or
-        // `attempted-unresolved`). If another page crossed sourceDispatch meanwhile, this refuses
+        // `attempted-unresolved`). If another page crossed source-arm meanwhile, this refuses
         // and the ambiguous attempt remains alive rather than being cancelled underneath it.
-        const lost = await ask({ type: 'compact', conversationId: forId, token, sourceLost: true }).catch(() => null);
+        const lost = await ask({ type: 'compact', conversationId: forId, token, action: 'source-release' }).catch(() => null);
         if (lost && lost.ok === true && lost.data && lost.data.aborted === true) job = null;
         else localError = replyError(lost) || 'The blocked handoff could not be safely retired; it was not sent twice.';
       }
@@ -8381,7 +8366,7 @@
       // Claiming the prompt. Nothing has been submitted under this state, and the app knows
       // that because this write happens before the composer is submitted at all — so a
       // document that dies between here and the next line leaves the prompt claimable again.
-      const permit = await ask({ type: 'compact', conversationId: forId, token, sourceAttempt: true });
+      const permit = await ask({ type: 'compact', conversationId: forId, token, action: 'source-claim' });
       if (!current()) return;
       if (!permit || permit.ok !== true || !permit.data || permit.data.allowed !== true) {
         CLF_DOM.clearPromptExact(prompt);
@@ -8395,7 +8380,7 @@
       // The at-most-once cut, and the last thing before the click. Exactly one document takes
       // this transition; past it the prompt may be with ChatGPT already — send() clicks first
       // and only then watches for acceptance — so no page is ever offered it again.
-      const armed = await ask({ type: 'compact', conversationId: forId, token, sourceDispatch: true });
+      const armed = await ask({ type: 'compact', conversationId: forId, token, action: 'source-arm' });
       if (!current()) return;
       if (!armed || armed.ok !== true || !armed.data || armed.data.armed !== true) {
         CLF_DOM.clearPromptExact(prompt);
@@ -8759,7 +8744,7 @@
     // The accepted helper user receipt and current provider terminal own its result.
     // A renderer lifecycle edge must not create a second, captured-node owner.
     if (desktopDecision && desktopDecision.onTarget()) return;
-    if (!endedTurnId || !goalUsable()) return;
+    if (!endedTurnId || !goalUsable() || goalConfig?.queuePending) return;
     // Only a finished, non-partial answer. See GOAL_CONTINUABLE for why every other outcome —
     // including `interrupted` — belongs to recovery rather than to this loop.
     if (!GOAL_CONTINUABLE.has(outcome)) return;
@@ -8861,7 +8846,7 @@
     const pending = goalConfig && goalConfig.pending;
     if (!pending || !pending.replyId || !pending.turnId || !conversationId) return;
     const recovery = pending.recovery;
-    if (!goalUsable() || goalBusy || (recovery?.notBefore ?? 0) > Date.now()) return;
+    if (!goalUsable() || goalConfig?.queuePending || goalBusy || (recovery?.notBefore ?? 0) > Date.now()) return;
     if (recovery?.proof?.modelClass === 'pro' && CLF_DOM.generating()) {
       goalBusy = true;
       void ask({ type: 'goal_draft', conversationId, turnId: pending.turnId, nativeBusy: true })
@@ -9024,6 +9009,14 @@
       // HTTP failures retain call()'s { ok, status, data } envelope; worker/transport
       // failures have top-level fields. Keep the machine code separate from display text.
       const failure = reply?.data || reply || {};
+      if (failure.error === 'explicit_input_precedes_goal') {
+        // The outbox owns this step. Relinquish only the page's pickup so a
+        // cancelled queue can later collect the still-owed durable Goal turn.
+        goalTurnId = null;
+        goalTicketId = null;
+        setGoalPhase('');
+        return;
+      }
       // The app still has this chat working — its record of the turn is open, or a local
       // tool ran within the last minute — so the end this page saw was not the answer. Not
       // a failure, and not a released claim either: the obligation is filed app-side, and
@@ -9083,6 +9076,7 @@
       await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
       return;
     }
+    if (goalConfig?.queuePending) return;
     if (!goalUsable()) {
       // Settings are live. Turning Goal Mode off (or removing its key) while OpenRouter is
       // drafting must revoke permission to type the result, even if that result becomes ready
@@ -9176,7 +9170,7 @@
         const ready = allowed?.draft;
         if (!allowed || !ready || ready.token !== draft.token || ready.stage !== 'ready' || ready.reply !== draft.reply ||
             !(allowed.effectiveEnabled === true || (allowed.own !== true && allowed.objective)) || allowed.hasKey !== true ||
-            allowed.blocked || authorization.data.job?.busy || authorization.data.pendingTools > 0 ||
+            allowed.blocked || allowed.queuePending || authorization.data.job?.busy || authorization.data.pendingTools > 0 ||
             goalSourceGenerating() || CLF_DOM.generating() || nativeBusy || job?.busy) return false;
         rememberUserSend();
         sendAttempted = true;
@@ -9907,7 +9901,7 @@
       if (exactBootstrapDraft()) return false;
       if (boot.type === 'resume' && !squeeze(CLF_DOM.composer()?.textContent)) {
         continuationJournalPending = false;
-        await ask({ type: 'compact', token: resumeMarker[2], destinationLost: true });
+        await ask({ type: 'compact', token: resumeMarker[2], commandId: boot.id, client: RUN_ID, action: 'destination-release' });
         return true;
       }
       await fail('the composer changed during bootstrap authorization; the draft was preserved and nothing was sent');
@@ -9930,15 +9924,20 @@
         return void (await fail('the resume bootstrap had no valid continuation marker'));
       }
       continuationJournalPending = true;
-      const permit = await ask({ type: 'compact', token: resumeMarker[2], destinationAttempt: true });
+      const permit = await ask({ type: 'compact', token: resumeMarker[2], commandId: boot.id, client: RUN_ID, action: 'destination-claim' });
       if (await rejectChangedBootstrap()) return;
       if (!permit || permit.ok !== true || !permit.data || permit.data.allowed !== true) {
+        if (permit?.error === 'outdated_page_document' || permit?.data?.error === 'outdated_page_document') {
+          await fail('Chat On Steroids updated while this ChatGPT tab was open. Reload this tab before resuming.');
+          continuationJournalPending = false;
+          return;
+        }
         await bootstrapDraft.clear();
         return;
       }
       // As on the source side: the claim above promises nothing was submitted, and this second
       // write is the exclusive cut taken immediately before the click.
-      const armed = await ask({ type: 'compact', token: resumeMarker[2], destinationDispatch: true });
+      const armed = await ask({ type: 'compact', token: resumeMarker[2], commandId: boot.id, client: RUN_ID, action: 'destination-arm' });
       if (await rejectChangedBootstrap()) return;
       if (!armed || armed.ok !== true || !armed.data || armed.data.armed !== true) {
         await bootstrapDraft.clear();
@@ -10314,7 +10313,6 @@
 
   async function acceptDesktopInput(message) {
     const recoveryPickup = typeof message.recoveryTurnId === 'string';
-    if (recoveryPickup && quietOutcome?.reason === 'thinking_failed' && thinkingFailureWatch?.phase !== 'resumed' && !thinkingFailureSettled()) return false;
     let requireStableSourceTurn = recoveryPickup;
     if (desktopInputBusy || modelCatalogBusy || !alive || (generating && !message.directTurn && !recoveryPickup) || pendingTools > 0 || goalBusy || job?.busy) return false;
     const target = message.conversationId || null;
@@ -10445,6 +10443,8 @@
         return { conversation, user: users.at(-1) };
       }, sendingTarget, 15000);
       if (!receipt) return false;
+      // Native Send listeners refresh the receipt; pin only that witnessed object.
+      const witnessedSendReceipt = userSendReceipt;
       const deliveredConversation = receipt.conversation;
       sent = true;
       if (decision) {
@@ -10463,6 +10463,13 @@
         owner: input.owner
       };
       const accepted = await retryDesktopInputReceiptCustody();
+      if (accepted && deliveredConversation && receipt.user?.id && sendingTarget() &&
+          userSendReceipt === witnessedSendReceipt && witnessedSendReceipt?.text === submittedText &&
+          witnessedSendReceipt.conversationId === target &&
+          (witnessedSendReceipt.previousMessageId ?? null) === (previousUserId ?? null) &&
+          Date.now() - witnessedSendReceipt.at <= USER_SEND_RECEIPT_MS) {
+        witnessedSendReceipt.accepted = { messageId: receipt.user.id, conversationId: deliveredConversation, epoch };
+      }
       // Stop/composer-clear may precede the exact user row. This receipt, not that early
       // native acceptance, owns retirement of the still-untouched prepared draft. A
       // rejected/cancelled claim, trusted edit, replacement editor or route preserves it.
@@ -10627,8 +10634,11 @@
     }
   }
   function catalogPageReady() {
-    // Passive picker metadata is safe while the model works or a draft exists.
-    return alive && !desktopInputBusy && CLF_DOM.composerVisible();
+    // A catalog covers every native version, not just the selected group's buckets.
+    // Elect an idle composer before inspecting those groups and restoring selection.
+    return alive && !desktopInputBusy && !generating && !CLF_DOM.generating() &&
+      CLF_DOM.composerVisible() && !CLF_DOM.hasComposerAttachments() &&
+      (catalogHelper() || !CLF_DOM.composer()?.textContent?.trim());
   }
   function catalogHelper() {
     return !conversationId && location.pathname === '/' &&
@@ -10649,19 +10659,6 @@
       await waitPageView(catalogPageReady, () => current() && catalogHelper(), 15000);
     }
     if (!current() || !catalogPageReady()) return false;
-    const passiveComposer = CLF_DOM.composer();
-    const passiveCurrent = () => current() && catalogPageReady() && CLF_DOM.composer() === passiveComposer;
-    const visibleModels = await CLF_DOM.inspectPassiveModelSettings?.(passiveCurrent);
-    if (!passiveCurrent()) return false;
-    if (visibleModels) return (await ask({ type: 'model_catalog', nonce: message.nonce, models: visibleModels }))?.ok === true;
-    // Older pickers need UI inspection. Never mutate a working/drafting page.
-    if (generating || CLF_DOM.generating() || CLF_DOM.hasComposerAttachments() ||
-        (!catalogHelper() && CLF_DOM.composer()?.textContent?.trim())) {
-      // This document is temporarily unable to complete interactive inspection. That is not
-      // evidence that the account picker is unavailable: another idle tab may answer this same
-      // nonce, and the app-side deadline owns the eventual no-observation failure.
-      return false;
-    }
     const restoredText = CLF_DOM.composer().textContent;
     if (catalogHelper() && restoredText?.trim() && !CLF_DOM.clearPromptExact(restoredText)) return false;
     // Work swaps the composer as well as its picker. Complete that owned transition
@@ -10970,7 +10967,6 @@
       controlState,
       stageView,
       goalStageView,
-      nextThinkingFailureWatch,
       settingsView,
       toggleMenu,
       closeMenu,

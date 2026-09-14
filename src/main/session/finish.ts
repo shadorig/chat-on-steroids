@@ -5,7 +5,7 @@ import { getSession } from './store.js';
 import { onSessionChange, recordProgress } from './recorder.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { draftFastFollowup, conversationMessages, automaticFinishEnabled } from '../goal.js';
-import { hasEligibleToolInput, onInputChange, listInputs, enqueueInput } from './input.js';
+import { finishBoundaryHasBrowserInput, hasEligibleToolInput, onInputChange, listInputs, enqueueInput } from './input.js';
 
 import { logWarn } from '../logger.js';
 import { retryTaskRequest } from '../task-request.js';
@@ -209,7 +209,7 @@ async function waitForFinishBoundary(sessionId: string, turnId: string, conversa
           const session = await getSession(sessionId);
           if (session?.activeTurnId !== turnId || session.conversationId !== conversationId ||
               !(await sessionFinishHeld(sessionId, turnId, conversationId))) return done(false);
-          if (await hasEligibleToolInput(sessionId, true)) return done(true);
+          if (await hasEligibleToolInput(sessionId, true) || await finishBoundaryHasBrowserInput(sessionId)) return done(true);
         } while (dirty && !closed);
       } catch (error) { done(false, error); }
       finally { checking = false; }

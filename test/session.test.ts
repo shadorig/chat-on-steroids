@@ -44,6 +44,7 @@ import {
   pruneSessions,
   readAsset,
   readEvents,
+  readTurnStartContext,
   readTurnRecoveryEvidence,
   readRecentEvents,
   readHandoff,
@@ -304,6 +305,7 @@ describe('session store', () => {
     const seed = await createSession({ title: 'catalog seed', conversationId: null });
     const seedSummary = await getSession(seed.id);
     expect(seedSummary).not.toBeNull();
+    const seedMeta = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
     // Force the next lookup to rebuild from the durable catalog rather than the live seed.
     resetSessionStoreForTests();
 
@@ -312,6 +314,7 @@ describe('session store', () => {
     const targetId = names[names.length - 1] as string;
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
@@ -325,7 +328,7 @@ describe('session store', () => {
         const id = path.basename(path.dirname(file));
         if (file.endsWith('meta.json') && id.startsWith('catalog-')) {
           return JSON.stringify({
-            ...seedSummary,
+            ...seedMeta,
             id,
             title: id,
             conversationId: id === targetId ? conversationId : null,
@@ -335,10 +338,19 @@ describe('session store', () => {
         return (realReadFile as (...callArgs: unknown[]) => ReturnType<typeof fs.readFile>)(target, ...args);
       }) as typeof fs.readFile
     );
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        const id = path.basename(path.dirname(file));
+        if (id.startsWith('catalog-')) return { mtimeMs: file.endsWith('meta.json') ? 2 : 1 } as never;
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
 
     try {
       expect((await findSessionByConversation(conversationId, { requireUnique: true }))?.id).toBe(targetId);
     } finally {
+      statSpy.mockRestore();
       readSpy.mockRestore();
       readdirSpy.mockRestore();
     }
@@ -445,6 +457,31 @@ describe('session store', () => {
     const tail = await readEvents(summary.id, { from: 4 });
     expect(tail.every((event) => event.seq >= 4)).toBe(true);
     expect(await readEvents(summary.id, { limit: 2 })).toHaveLength(2);
+  });
+
+  it('finds a named turn and its native question beyond any recent-history window', async () => {
+    const summary = await createSession({ title: 'exact turn context' });
+    await appendEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'target-question',
+      message: { text: 'question for the target turn', truncated: false, chars: 28 }
+    });
+    await appendEvent(summary.id, { time: 101, source: 'extension', kind: 'turn_start', turnId: 'target-turn' });
+    for (let index = 0; index < 80; index += 1) {
+      await appendEvent(summary.id, {
+        time: 200 + index,
+        source: 'extension',
+        kind: 'turn_start',
+        turnId: `later-turn-${index}`
+      });
+    }
+
+    expect(await readTurnStartContext(summary.id, 'target-turn')).toEqual({
+      startedAt: 101,
+      userMessageId: 'target-question'
+    });
   });
 
   it('preserves app-staged attachment identity and preview when native metadata observes the same user send', async () => {
@@ -990,6 +1027,7 @@ describe('session store', () => {
 
     expect(recovered.goalCandidates).toEqual([{
       replyId: 'assistant-stable-after-reload',
+      source: { kind: 'reply', messageId: 'assistant-stable-after-reload' },
       turnId: 'reply:assistant-stable-after-reload',
       eventSeq: expect.any(Number)
     }]);
@@ -1324,6 +1362,41 @@ describe('session store', () => {
     }
   });
 
+  it('reports exact MCP work only when this conversation and turn have request-attributed execution evidence', async () => {
+    const conversationId = 'exact-mcp-evidence';
+    const turnId = 'exact-mcp-turn';
+    const summary = await createSession({ title: 'Exact MCP evidence', conversationId });
+    await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId });
+
+    expect(await readTurnRecoveryEvidence(summary.id, 'another-conversation', turnId)).toBeNull();
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, 'another-turn'))?.exactMcpCall).toBeNull();
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, turnId))?.exactMcpCall).toBeNull();
+
+    await appendEvent(summary.id, {
+      time: 2,
+      source: 'mcp',
+      kind: 'tool_call',
+      turnId,
+      call: {
+        callId: 'exact-mcp-call',
+        tool: 'read',
+        attribution: 'request_id',
+        requestId: 'wfr-exact-mcp',
+        conversationId,
+        attributionMethod: 'request_id',
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'high',
+        args: { text: '{}', truncated: false, chars: 2 },
+        result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok',
+        durationMs: 1,
+        summary: { title: 'Read', tone: 'neutral', kind: 'read' }
+      }
+    });
+
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, turnId))?.exactMcpCall).not.toBeNull();
+  });
+
   it('treats malformed recovery checkpoint fields as non-authoritative after restart', async () => {
     const conversationId = 'recovery-checkpoint-corruption';
     const summary = await createSession({ title: 'Recovery checkpoint corruption', conversationId });
@@ -1583,6 +1656,8 @@ describe('session store', () => {
       expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
       await observeSessionModel(summary.id, 'conv-astra', 'gpt-5.6-sol', 600);
       expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+      await observeSessionModel(summary.id, 'conv-astra', ' gpt-6-pro ', 700);
+      expect((await getSession(summary.id))?.selectedModel?.model).toBe('gpt-5.6-sol');
     } finally { await saveConfig(base); }
   });
 
@@ -1728,6 +1803,7 @@ describe('handoff storage', () => {
     const seed = await createSession({ title: 'handoff catalog seed' });
     const seedSummary = await getSession(seed.id);
     expect(seedSummary).not.toBeNull();
+    const seedMeta = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
     resetSessionStoreForTests();
 
     const names = Array.from({ length: 5001 }, (_, index) => `handoff-${String(index).padStart(5, '0')}`);
@@ -1735,6 +1811,7 @@ describe('handoff storage', () => {
     const handoffId = '2026-08-24-deadbeef';
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
@@ -1748,7 +1825,7 @@ describe('handoff storage', () => {
         const id = path.basename(path.dirname(file));
         if (file.endsWith('meta.json') && id.startsWith('handoff-')) {
           return JSON.stringify({
-            ...seedSummary,
+            ...seedMeta,
             id,
             title: id,
             updatedAt: id === targetId ? 20_000 : 10_000,
@@ -1762,10 +1839,19 @@ describe('handoff storage', () => {
         return (realReadFile as (...callArgs: unknown[]) => ReturnType<typeof fs.readFile>)(target, ...args);
       }) as typeof fs.readFile
     );
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        const id = path.basename(path.dirname(file));
+        if (id.startsWith('handoff-')) return { mtimeMs: file.endsWith('meta.json') ? 2 : 1 } as never;
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
 
     try {
       expect((await latestHandoff())?.id).toBe(handoffId);
     } finally {
+      statSpy.mockRestore();
       readdirSpy.mockRestore();
       readSpy.mockRestore();
       await deleteSession(seed.id);
@@ -1810,6 +1896,7 @@ describe('handoff storage', () => {
     const seed = await createSession({ title: 'retention catalog seed' });
     const seedSummary = await getSession(seed.id);
     expect(seedSummary).not.toBeNull();
+    const seedMeta = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
     resetSessionStoreForTests();
 
     const names = Array.from({ length: 5001 }, (_, index) => `prune-${String(index).padStart(5, '0')}`);
@@ -1837,7 +1924,7 @@ describe('handoff storage', () => {
         const id = path.basename(path.dirname(file));
         if (id.startsWith('prune-') && file.endsWith('meta.json')) {
           return JSON.stringify({
-            ...seedSummary,
+            ...seedMeta,
             id,
             title: id,
             updatedAt: id === targetId ? expired : recent,
@@ -1845,8 +1932,7 @@ describe('handoff storage', () => {
             conversationId: null,
             chatIds: [],
             lastHandoffId: null,
-            lastHandoffAt: null,
-            __historySeq: 0
+            lastHandoffAt: null
           });
         }
         if (id.startsWith('prune-') && file.endsWith('messages.json')) return '{}';
@@ -1856,10 +1942,7 @@ describe('handoff storage', () => {
     const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
       (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
         const file = String(target);
-        if (path.basename(path.dirname(file)).startsWith('prune-') && file.endsWith('events.jsonl')) {
-          const error = Object.assign(new Error('synthetic missing journal'), { code: 'ENOENT' });
-          throw error;
-        }
+        if (path.basename(path.dirname(file)).startsWith('prune-')) return { mtimeMs: file.endsWith('meta.json') ? 2 : 1 } as never;
         return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
       }) as typeof fs.stat
     );
@@ -2035,7 +2118,9 @@ describe('canonical recorder 1.8', () => {
     resetRecorderForTests();
     resetSessionStoreForTests();
     await recordChatObservations(conversationId, [{ ...error, time: error.time + 1_000 }]);
-    expect(await readEvents(sessionId, { kinds: ['chat_error'] })).toHaveLength(1);
+    expect(await readEvents(sessionId, { kinds: ['chat_error'] })).toEqual([
+      expect.objectContaining({ blocking: true, recoverable: false })
+    ]);
 
     await recordChatObservations(conversationId, [{ ...error, time: error.time + 30_001 }]);
     expect(await readEvents(sessionId, { kinds: ['chat_error'] })).toHaveLength(2);
@@ -2067,6 +2152,49 @@ describe('canonical recorder 1.8', () => {
     const retry = await recordChatObservations(conversationId, [error]);
     expect(retry.stored).toBe(1);
     expect(await readEvents(retry.sessionId!, { kinds: ['chat_error'] })).toHaveLength(1);
+  });
+
+  it('keeps one exact Thinking failed notice across reload/restart beyond the burst window', async () => {
+    const conversationId = 'conv-failed-header-reload';
+    const error = { kind: 'chat_error' as const, time: 100_000, text: 'Thinking failed',
+      reason: 'thinking_failed' as const, turnId: 'failed-turn', recoverable: false };
+    const first = await recordChatObservations(conversationId, [error]);
+    await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+    await recordChatObservations(conversationId, [{ ...error, time: 500_000 }]);
+    await recordChatObservations(conversationId, [{ ...error, time: 600_000, turnId: undefined }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toEqual([
+      expect.objectContaining({ reason: 'thinking_failed', turnId: 'failed-turn' })
+    ]);
+    await recordChatObservations(conversationId, [{ ...error, time: 700_000, turnId: 'another-turn' }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toHaveLength(2);
+  });
+
+  it('reopens a failed view before an exact native final completes the same turn', async () => {
+    const conversationId = 'conv-thinking-failed-native-final';
+    const turnId = 'g-thinking-failed-native-final';
+    const first = await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: 100, turnId },
+      { kind: 'turn_end', time: 200, turnId, outcome: 'failed', reason: 'thinking_failed' }
+    ]);
+
+    await recordChatObservations(conversationId, [{
+      kind: 'assistant_message', time: 300, turnId,
+      messageId: 'assistant-thinking-failed-native-final',
+      providerMessageId: '11111111-2222-4333-8444-555555555555',
+      text: 'The answer eventually completed.', state: 'final', final: true
+    }]);
+
+    const lifecycle = await readEvents(first.sessionId!, { kinds: ['turn_start', 'turn_end'] });
+    expect(lifecycle.map(event => [event.kind, event.source, event.turnId,
+      event.kind === 'turn_end' ? event.outcome : null])).toEqual([
+      ['turn_start', 'extension', turnId, null],
+      ['turn_end', 'extension', turnId, 'failed'],
+      ['turn_start', 'app', turnId, null],
+      ['turn_end', 'extension', turnId, 'completed']
+    ]);
+    expect(lifecycle[2]?.kind === 'turn_start' && lifecycle[2].detail).toContain('fresh work resumed');
+    expect(lifecycle[3]?.kind === 'turn_end' && lifecycle[3].detail).toContain('failed view was superseded');
+    expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId).toBeNull();
   });
 
   it('deduplicates replayed turn lifecycle boundaries from the at-least-once browser journal', async () => {
@@ -2250,6 +2378,12 @@ describe('canonical recorder 1.8', () => {
       ['g-false-end', 'app']
     ]);
     expect(starts[1]?.kind === 'turn_start' && starts[1].detail).toMatch(/kept calling tools/);
+    const causal = await readEvents(sessionId!, { kinds: ['turn_start', 'turn_end', 'tool_call'] });
+    const correctiveStart = causal.find(event => event.kind === 'turn_start' && event.source === 'app' && event.turnId === 'g-false-end');
+    const lateCall = causal.find(event => event.kind === 'tool_call' && event.call.requestId === 'wfr_same_turn' && event.time === now + 40);
+    expect(correctiveStart).toBeDefined();
+    expect(lateCall).toBeDefined();
+    expect(correctiveStart!.seq).toBeLessThan(lateCall!.seq);
 
     // Reopened once; the same turn going on is not news, and the real end is accepted.
     await tool('wfr_same_turn', now + 50);

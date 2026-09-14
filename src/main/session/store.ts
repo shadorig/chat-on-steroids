@@ -22,7 +22,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { isProModel } from '../../shared/chat-models.js';
+import { chatModelSelection, isProModel } from '../../shared/chat-models.js';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type {
@@ -36,7 +36,11 @@ import type {
   StoredText
 } from '../../shared/session.js';
 import { CONTINUATION_MARKER, REASONING_EFFORTS, eventTokens, normalizedToolOutcome } from '../../shared/session.js';
-import { chronological } from '../../shared/chronology.js';
+import { chronological, positionOf } from '../../shared/chronology.js';
+import {
+  completedAutomationSourceBoundary,
+  type AutomationSourceBoundary
+} from '../../shared/automation-source.js';
 import { automaticTitle, firstTitleMessage, legacyContextTitle, refreshUserTitle } from './title.js';
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
 import { getConfig } from '../config.js';
@@ -1323,7 +1327,7 @@ export function upsertMessageEvent(
   sessionId: string,
   event: NewMessageEvent,
   options: { preferTime?: boolean } = {}
-): Promise<{ event: MessageEvent; changed: boolean }> {
+): Promise<{ event: MessageEvent; changed: boolean; contentChanged: boolean }> {
   const directKey = messageKey(event as MessageEvent);
   if (!directKey) throw new Error('Canonical message update requires ChatGPT messageId');
   return ensureOpen(sessionId).then((entry) => {
@@ -1353,7 +1357,7 @@ export function upsertMessageEvent(
         event.final !== true &&
         event.state !== 'final'
       ) {
-        return { event: previous, changed: false };
+        return { event: previous, changed: false, contentChanged: false };
       }
 
       // Message bodies can be hundreds of kilobytes. The old path JSON.stringify-compared the
@@ -1437,7 +1441,7 @@ export function upsertMessageEvent(
         (nextEvent.agent === undefined || previous.agent === nextEvent.agent) &&
         (!preferTime || previous.time === nextEvent.time)
       ) {
-        return { event: previous, changed: false };
+        return { event: previous, changed: false, contentChanged: false };
       }
       const full = {
         ...nextEvent,
@@ -1488,7 +1492,7 @@ export function upsertMessageEvent(
       }
       entry.historySeq = full.seq;
       scheduleMeta(entry);
-      return { event: full, changed: true };
+      return { event: full, changed: true, contentChanged: !sameMessage };
     });
     entry.queue = write.then(
       () => undefined,
@@ -1610,6 +1614,146 @@ export async function readRecentEvents(
   assertSessionId(sessionId);
   await flushSession(sessionId);
   return readRecentEventsFromDisk(sessionId, limit, options);
+}
+
+const AUTOMATION_BOUNDARY_KINDS = new Set<SessionEvent['kind']>([
+  'assistant_message', 'turn_start', 'turn_end', 'user_message'
+]);
+
+/** Which candidate is later in the immutable chronology/cursor domain. */
+function laterSemanticEvent(current: SessionEvent | null, candidate: SessionEvent): SessionEvent {
+  if (!current) return candidate;
+  const currentPosition = positionOf(current);
+  const candidatePosition = positionOf(candidate);
+  if (candidatePosition !== currentPosition) return candidatePosition > currentPosition ? candidate : current;
+  const rank = (event: SessionEvent): number =>
+    event.kind === 'turn_start' ? -1
+      : event.kind === 'turn_end' ? 1
+        : event.kind === 'assistant_message' && event.final === true && event.state === 'final' ? 0.5
+          : 0;
+  const rankDelta = rank(candidate) - rank(current);
+  return rankDelta > 0 || (rankDelta === 0 && candidate.seq > current.seq) ? candidate : current;
+}
+
+/**
+ * Newest completed automation source for one settled session.
+ *
+ * This is an authority query, so it has no arbitrary event/byte horizon. Canonical messages live
+ * outside events.jsonl and are merged by immutable origin position; the reverse journal scan stops
+ * only after its seq has crossed below the best proven position. Any damaged row in the consulted
+ * suffix makes the answer unknown instead of guessing across missing authority.
+ */
+export async function latestCompletedAutomationSourceBoundary(sessionId: string): Promise<AutomationSourceBoundary | null> {
+  assertSessionId(sessionId);
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'automation source boundary read', async () => {
+    let newest: SessionEvent | null = null;
+    for (const message of entry.messages.values()) {
+      if (AUTOMATION_BOUNDARY_KINDS.has(message.kind)) newest = laterSemanticEvent(newest, message);
+    }
+
+    const canonicalKeys = new Set(entry.messages.keys());
+    let scannedSeq = Number.POSITIVE_INFINITY;
+    const damaged = await scanRecentJournal(
+      sessionId,
+      Number.POSITIVE_INFINITY,
+      (event) => {
+        scannedSeq = event.seq;
+        if (!AUTOMATION_BOUNDARY_KINDS.has(event.kind)) return;
+        if ((event.kind === 'user_message' || event.kind === 'assistant_message') &&
+            messageKey(event) && canonicalKeys.has(messageKey(event)!)) return;
+        newest = laterSemanticEvent(newest, event);
+      },
+      () => newest !== null && scannedSeq < positionOf(newest)
+    );
+    if (damaged > 0 || !newest) return null;
+    if (newest.kind === 'user_message' || newest.kind === 'turn_start') return null;
+    return completedAutomationSourceBoundary(newest);
+  });
+}
+
+export interface TurnStartContext {
+  /** Exact newest start for this logical id, including an app-authored corrective reopen. */
+  startedAt: number;
+  /** Native user message immediately preceding that start, when one is proven. */
+  userMessageId: string | null;
+}
+
+/**
+ * Finds one named turn start and its native question without a bounded tail heuristic.
+ *
+ * Stop adoption and post-terminal MCP fencing both act on an exact turn identity. A damaged row in
+ * the necessary suffix therefore fails closed. Once the start is found, only the newest prior
+ * user/start/end boundary can name its question; canonical user revisions are compared by origin.
+ */
+export async function readTurnStartContext(sessionId: string, turnId: string): Promise<TurnStartContext | null> {
+  assertSessionId(sessionId);
+  if (!turnId) return null;
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'turn start context read', async () => {
+    const canonicalKeys = new Set(entry.messages.keys());
+    const canonicalUsers = [...entry.messages.values()].filter(
+      (event): event is Extract<MessageEvent, { kind: 'user_message' }> => event.kind === 'user_message'
+    );
+    const state: {
+      start: Extract<SessionEvent, { kind: 'turn_start' }> | null;
+      prior: SessionEvent | null;
+      scannedSeq: number;
+    } = { start: null, prior: null, scannedSeq: Number.POSITIVE_INFINITY };
+
+    const damaged = await scanRecentJournal(
+      sessionId,
+      Number.POSITIVE_INFINITY,
+      (event) => {
+        state.scannedSeq = event.seq;
+        if (!state.start) {
+          if (event.kind === 'turn_start' && event.turnId === turnId) {
+            state.start = event;
+            for (const user of canonicalUsers) {
+              if (positionOf(user) < event.seq) state.prior = laterSemanticEvent(state.prior, user);
+            }
+          }
+          return;
+        }
+        if (event.seq >= state.start.seq) return;
+        if (event.kind !== 'user_message' && event.kind !== 'turn_start' && event.kind !== 'turn_end') return;
+        if (event.kind === 'user_message' && messageKey(event) && canonicalKeys.has(messageKey(event)!)) return;
+        state.prior = laterSemanticEvent(state.prior, event);
+      },
+      () => state.start !== null && state.prior !== null && state.scannedSeq < positionOf(state.prior)
+    );
+    if (damaged > 0 || !state.start) return null;
+    return {
+      startedAt: state.start.time,
+      userMessageId: state.prior?.kind === 'user_message' && state.prior.source === 'extension'
+        ? state.prior.messageId ?? null
+        : null
+    };
+  });
+}
+
+/** Existing canonical assistant identity, read without revising its chronology. */
+export async function readCanonicalAssistantMessage(
+  sessionId: string,
+  input: { messageId: string; providerMessageId?: string }
+): Promise<{ turnId: string | null; state: 'streaming' | 'final'; final: boolean; text: string } | null> {
+  assertSessionId(sessionId);
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'canonical assistant lookup', async () => {
+    const direct = entry.messages.get(`assistant_message\u0000${input.messageId}`);
+    let message = direct?.kind === 'assistant_message' ? direct : null;
+    if (!message && input.providerMessageId) {
+      const matches = [...entry.messages.values()].filter((candidate): candidate is Extract<MessageEvent, { kind: 'assistant_message' }> =>
+        candidate.kind === 'assistant_message' && candidate.providerMessageId === input.providerMessageId);
+      if (matches.length === 1) message = matches[0]!;
+    }
+    return message ? {
+      turnId: message.turnId ?? null,
+      state: message.state ?? (message.final ? 'final' : 'streaming'),
+      final: message.final === true,
+      text: message.message.text
+    } : null;
+  });
 }
 
 export interface TurnRecoveryEvidence {
@@ -1995,8 +2139,7 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
     if (publicSummary.titleSource !== undefined && !['fallback', 'provider', 'manual'].includes(publicSummary.titleSource)) delete publicSummary.titleSource;
     const selected = publicSummary.selectedModel;
     if (selected !== undefined && (!selected || typeof selected !== 'object' ||
-        typeof selected.conversationId !== 'string' || typeof selected.model !== 'string' ||
-        !/^[a-zA-Z0-9 ._-]{1,80}$/.test(selected.model) || !Number.isFinite(selected.observedAt))) {
+        typeof selected.conversationId !== 'string' || !chatModelSelection(selected) || !Number.isFinite(selected.observedAt))) {
       delete publicSummary.selectedModel;
     }
     const finish = publicSummary.finishTurn;
@@ -2645,14 +2788,16 @@ export async function observeSessionModel(
   id: string, conversationId: string, model: string, observedAt: number,
   reasoningEffort?: ReasoningEffort
 ): Promise<void> {
-  if (!/^[a-zA-Z0-9 ._-]{1,80}$/.test(model) || !Number.isFinite(observedAt)) return;
+  const selection = chatModelSelection({ model, reasoningEffort });
+  if (!selection || !Number.isFinite(observedAt)) return;
   const entry = await ensureOpen(id);
   await enqueueSessionOperation(entry, 'model-selection', async () => {
     // Late old-document reports cannot change the replacement's policy. Repeated observations
     // and delayed delivery receipts cannot overwrite a newer provider selection either.
     if (entry.summary.conversationId !== conversationId ||
         observedAt < (entry.summary.selectedModel?.observedAt ?? 0)) return;
-    const selectedModel = { conversationId, model, observedAt, ...(reasoningEffort ? { reasoningEffort } : {}) };
+    const selectedModel = { conversationId, model: selection.model, observedAt,
+      ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
     if (JSON.stringify(entry.summary.selectedModel) === JSON.stringify(selectedModel)) return;
     const staged = { ...entry.summary, selectedModel };
     await writeSummary(staged, entry.historySeq);

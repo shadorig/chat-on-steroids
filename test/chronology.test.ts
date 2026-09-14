@@ -129,6 +129,16 @@ describe('the order a recorded turn is read in', () => {
     expect(reading(rows)).toEqual(['turn_start@100', 'tool_call@900', 'turn_end@400']);
   });
 
+  it('keeps a same-turn reopen after the terminal observation it supersedes', () => {
+    const rows = [
+      row(1, 100, 'turn_start', 't1', 'initial start'),
+      row(2, 200, 'turn_end', 't1', 'failed view'),
+      row(3, 300, 'turn_start', 't1', 'recovered start'),
+      row(4, 300, 'turn_end', 't1', 'completed after recovery')
+    ];
+    expect(reading(rows)).toEqual(['initial start', 'failed view', 'recovered start', 'completed after recovery']);
+  });
+
   it('gives a delayed call back to the turn that made it, not the one that has started since', () => {
     // 5 s of attribution grace is long enough for the user to have sent the next message.
     const rows = [

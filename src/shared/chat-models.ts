@@ -1,4 +1,15 @@
-import type { ReasoningEffort } from './session.js';
+import { isReasoningEffort, type ReasoningEffort } from './session.js';
+
+export type ChatModelSelection = { model: string; reasoningEffort: ReasoningEffort | null };
+
+/** Canonical persisted/browser selection shape. Unknown or malformed values fail closed. */
+export function chatModelSelection(value: unknown): ChatModelSelection | null {
+  if (!value || typeof value !== 'object') return null;
+  const { model, reasoningEffort } = value as Record<string, unknown>;
+  if (typeof model !== 'string' || model.length === 0 || model.trim() !== model || !/^[a-zA-Z0-9 ._-]{1,80}$/.test(model) ||
+      (reasoningEffort != null && !isReasoningEffort(reasoningEffort))) return null;
+  return { model, reasoningEffort: isReasoningEffort(reasoningEffort) ? reasoningEffort : null };
+}
 /** GPT-6 Pro is Astra. Compare exact picker names/slugs, never arbitrary substring matches. */
 export function isAstraModel(model: string | null | undefined, effort?: ReasoningEffort): boolean {
   const normalized = (model ?? '').trim().toLowerCase().replace(/\s+/g, '-');

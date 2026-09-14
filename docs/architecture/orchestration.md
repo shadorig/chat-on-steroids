@@ -15,6 +15,8 @@ local session S: conversation A  --->  conversation B
 
 `src/main/session/continuation.ts` owns the transaction. The handoff text is context for the model; it is not the durable session identity and does not decide whether the move happened.
 
+The continuation also freezes the requested model/reasoning selection when the transaction is created. Destination opening uses that frozen intent; restore of an older record with no saved selection leaves it absent rather than reconstructing intent from whatever model the session happens to show later.
+
 ### Transaction phases
 
 The durable transaction progresses from source-handoff acquisition through one destination claim to an irreversible durable session rebind, followed by idempotent projection repair. Failure can abort while the transaction is still safely pre-commit; it cannot roll back a completed rebind. The exact persisted state vocabulary and compatibility handling live in `src/main/session/continuation.ts`.
@@ -99,7 +101,7 @@ Objectives, per-chat switches and reply obligations use separate named durable l
 
 - Objectives are chat/session state, not global config. Compact & Resume moves them A → B.
 - Per-chat switches are durable user decisions. An explicit chat override can remain Off even if an app-wide default later changes. Decision-helper chats are marked as helper identity and are never themselves normal Goal sources.
-- Reply obligations are bounded stable-final identities with handled tombstones. Their durable row lets reload/restart recover an owed decision without scanning rendered transcript history.
+- Reply obligations are bounded stable-final identities with handled tombstones. Their durable row includes the exact source-turn identity, so normal precedence/consumption checks are O(1) and reload/restart does not need to rediscover authority by scanning a bounded transcript tail. Legacy snapshots may resolve the source once during migration only.
 
 User-visible save/switch acknowledgements use an immediate durable barrier. If that write fails, the live value is restored rather than reporting a state that can disappear on restart.
 
@@ -110,6 +112,8 @@ The browser/page owns whether a native turn has legitimately reached the relevan
 A draft freezes the mode, prompts, objective, model/reasoning and owning browser client that started it. Mid-request settings changes retire the old attempt; they do not reinterpret its response under new policy.
 
 Stop, block, newer turn/input, mode changes, settings changes, continuation and explicit revocation can invalidate an attempt. Revalidate current authority before publication/delivery after awaits.
+
+Explicit user input outranks automatic Goal/Loop work at a shared source boundary. That boundary is an explicit identity: either a completed turn id or, when the page-local turn identity did not survive, the stable final assistant-message id. Runtime authority keeps that distinction structured rather than smuggling reply identity through a turn-id string. The precedence query is read-only: `queued` temporarily blocks automatic work, while `consumed` tells the command path to durably deactivate the superseded automatic obligation. UI/view projection never mutates Goal merely by asking what is pending. Activation and deactivation are separate durable commands (`tryActivateGoalReplyNow` / `deactivateGoalReplyNow`) rather than a boolean setter with hidden admission side effects.
 
 ### Backends and helper roles
 

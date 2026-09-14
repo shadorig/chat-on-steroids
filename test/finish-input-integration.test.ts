@@ -9,7 +9,7 @@ import { initDurableStore, resetDurableForTests, flushDurable } from '../src/mai
 import { initSessionStore, createSession, appendEvent, observeSessionModel, resetSessionStoreForTests, flushSessions } from '../src/main/session/store.js';
 import { automaticFinishEnabled, setGoalSwitchNow, resetGoalStateForTests } from '../src/main/goal.js';
 import { announceSessionFinish, settleSessionFinishForTests, setFinishNotifier } from '../src/main/session/finish.js';
-import { installInputAuthority, listInputs, offerToolInput, resetInputForTests, pendingBrowserInputs } from '../src/main/session/input.js';
+import { installInputAuthority, listInputs, offerToolInput, resetInputForTests, pendingBrowserInputs, enqueueInput } from '../src/main/session/input.js';
 let directory = '';
 afterEach(async () => {
   await flushSessions(); await flushDurable();
@@ -18,6 +18,27 @@ afterEach(async () => {
   if (directory) await removeTempDir(directory);
 });
 describe('finish producer to durable injection integration', () => {
+  it('keeps an after-turn head ahead of a later finish checkpoint while finish remains held', async () => {
+    directory = await makeTempDir('clf-finish-queue-');
+    initConfigPath(directory); initDurableStore(directory); initSessionStore(directory);
+    installInputAuthority({ automaticFinishEnabled });
+    await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, finishTool: true, finishAction: 'notify' } });
+    const conversationId = randomUUID();
+    const session = await createSession({ conversationId, title: 'Ordered queue' });
+    hooks.caller = { sessionId: session.id, conversationId };
+    await appendEvent(session.id, { source: 'extension', kind: 'turn_start', turnId: 'held-turn', time: 1000 });
+    const head = await enqueueInput({ id: randomUUID(), sessionId: session.id, text: 'Next native turn', mode: 'after-turn', dueAt: 0, model: 'gpt-6-pro', reasoningEffort: 'pro' });
+    await observeSessionModel(session.id, conversationId, 'gpt-6-pro', 1500);
+    await enqueueInput({ id: randomUUID(), sessionId: session.id, text: 'Later checkpoint', mode: 'finish', dueAt: 0, model: 'gpt-6-pro', reasoningEffort: 'pro' });
+    hooks.followup.mockClear();
+    expect(await announceSessionFinish(session.id, 'Wrapping up')).toMatch(/^HELD:/);
+    expect(hooks.followup).not.toHaveBeenCalled();
+    expect(await pendingBrowserInputs()).toEqual([]);
+    expect((await offerToolInput(session.id, conversationId, randomUUID(), Date.now(), true)).messages).toEqual([]);
+    await appendEvent(session.id, { source: 'extension', kind: 'turn_end', turnId: 'held-turn', outcome: 'completed', time: Date.now() + 1 });
+    expect(await pendingBrowserInputs()).toEqual([expect.objectContaining({ id: head.id })]);
+  });
+
   it.each(['goal', 'loop'] as const)('Notify with armed %s produces and retains one real tool injection', async mode => {
     directory = await makeTempDir('clf-finish-input-');
     initConfigPath(directory); initDurableStore(directory); initSessionStore(directory);

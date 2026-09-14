@@ -163,6 +163,21 @@ async function attributedMcp(conversationId: string): Promise<void> {
     outcome: 'ok', durationMs: 1, startedAt: Date.now(), requestId });
 }
 
+async function refreshFailedView(conversationId: string, advance: (ms: number) => void, delay = 0): Promise<void> {
+  const bridge = await import('../src/main/bridge.js');
+  if (delay) {
+    expect((await post('/status', { openConversations: [conversationId] })).body.repairs
+      .some((row: any) => row.conversationId === conversationId)).toBe(false);
+  }
+  advance(delay);
+  await bridge.sweepStaleSwarm(Date.now());
+  const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs
+    .find((row: any) => row.conversationId === conversationId);
+  expect(repair).toMatchObject({ reason: 'failed-view' });
+  await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+  advance(5 * 60_000);
+}
+
 describe.each(['input', 'loop'] as const)('MCP admission for %s recovery', destination => {
   describe.each(['silence', 'thinking_failed'] as const)('%s boundary', boundary => {
     it.each(['none', 'previous-turn', 'native-tool', 'request-only', 'current-turn'] as const)(
@@ -208,6 +223,7 @@ describe.each(['input', 'loop'] as const)('MCP admission for %s recovery', desti
           await post('/events', { conversationId, events: [
             { kind: 'turn_end', turnId: 'current-turn', outcome: 'failed', reason: 'thinking_failed', time: now }
           ] });
+          await refreshFailedView(conversationId, ms => { now += ms; });
         }
         const eligible = evidence === 'current-turn';
         if (row) {
@@ -237,18 +253,21 @@ it.each(['gpt-6-pro', 'gpt-5.6-sol'])('carries settled Thinking failed through H
   const second = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn', afterTurn: true });
   await attributedMcp(conversationId);
   await post('/events', { conversationId, events: [
-    { kind: 'chat_error', turnId: 'native-failed-turn', text: 'Thinking failed', recoverable: false, time: Date.now() }
+    { kind: 'chat_error', turnId: 'native-failed-turn', text: 'Thinking failed', reason: 'thinking_failed', recoverable: false, time: Date.now() }
   ] });
+  expect((await readEvents(session.id, { kinds: ['chat_error'] })).at(-1)).toMatchObject({ reason: 'thinking_failed', recoverable: false });
   expect(await input.pendingBrowserInputs()).toEqual([]);
-  // Content-script tests prove the actual 30s + 5m boundary. This is its wire result.
+  // Content closes the failed view immediately; the refresh/listening owner gates automatic delivery.
   const end = { kind: 'turn_end', turnId: 'native-failed-turn', outcome: 'failed', reason: 'thinking_failed', detail: 'Thinking failed', time: Date.now() + 1 };
   expect((await post('/events', { conversationId, events: [end] })).status).toBe(200);
   expect((await readEvents(session.id, { kinds: ['turn_end'] })).at(-1)).toMatchObject({ reason: 'thinking_failed', outcome: 'failed' });
-  const pro = model === 'gpt-6-pro';
-  expect(await input.pendingBrowserInputs()).toEqual([{ id: first.id, conversationId, ...(pro ? { recoveryTurnId: 'native-failed-turn' } : {}) }]);
-  const clock = vi.spyOn(Date, 'now');
+  expect(await input.pendingBrowserInputs()).toEqual([]);
+  let now = Date.now();
+  const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
   try {
-    if (pro) {
+    await refreshFailedView(conversationId, ms => { now += ms; });
+    expect(await input.pendingBrowserInputs()).toEqual([{ id: first.id, conversationId, recoveryTurnId: 'native-failed-turn' }]);
+    {
       const busyAt = Date.now();
       clock.mockReturnValue(busyAt);
       expect((await post('/input/claim', { id: first.id, owner: 'failed-turn-page', conversationId, recoveryBusyTurnId: 'native-failed-turn' })).body.ok).toBe(true);
@@ -365,11 +384,14 @@ it.each(['open', 'stalled', 'final-during-listen', 'failure-during-listen'])('fi
       now++;
       await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId: 'silence-turn', time: now,
         ...(boundary === 'final-during-listen' ? { outcome: 'completed' } : { outcome: 'failed', reason: 'thinking_failed' }) }] });
-      if (boundary === 'failure-during-listen') {
-        expect((await input.listInputs()).find(row => row.id === first.id)?.followupPermit).toMatchObject({
-          kind: 'recovery', grant: { proof: { kind: 'thinking-failed', turnId: 'silence-turn' } }
-        });
-      }
+    }
+    // The refresh already in flight keeps its hydration protection; the failed view must be
+    // confirmed separately before its stronger exact failure proof can replace the silence proof.
+    if (boundary === 'failure-during-listen') {
+      await refreshFailedView(conversationId, ms => { now += ms; }, 3 * 60_000);
+      expect((await input.listInputs()).find(row => row.id === first.id)?.followupPermit).toMatchObject({
+        kind: 'recovery', grant: { proof: { kind: 'thinking-failed', turnId: 'silence-turn' } }
+      });
     }
     if (boundary !== 'final-during-listen') {
       const permit = (await input.listInputs()).find(row => row.id === first.id)!.followupPermit;

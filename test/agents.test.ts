@@ -1365,7 +1365,7 @@ describe('a worker that is sleeping', () => {
     resetSwarm();
 
     expect(swarmState()).toMatchObject({ running: false, retainedHistory: false, agents: [] });
-    expect(() => swarmStateForCaller(prime)).toThrow(/No sub-agent history/i);
+    expect(swarmStateForCaller(prime)).toMatchObject({ running: false, retainedHistory: false, agents: [] });
     expect(retiredWorkerForConversation('c-worker-clear-dormant')).toMatchObject({
       id: 'worker-1',
       conversationId: 'c-worker-clear-dormant'
@@ -2439,10 +2439,12 @@ describe('through the MCP endpoint', () => {
     expect(JSON.stringify(agentsSchema)).not.toMatch(/join/i);
   });
 
-  it('tells an unrelated chat AGENTS_BUSY and nothing whatsoever about the run', async () => {
+  it('returns empty status to an unrelated chat without exposing the other run', async () => {
     startSwarm(1);
     const text = await asChat('c-stranger', 'status');
-    expect(text).toContain('AGENTS_BUSY');
+    expect(text).toContain('No workers or retained worker history');
+    const status = await structuredAsChat('c-stranger', 'status');
+    expect(status).toMatchObject({ self: null, run_id: null, agents: [] });
     expect(text).not.toContain('worker-1');
     expect(text).not.toContain('task 1');
     expect(text).not.toContain(PRIME_CHAT);

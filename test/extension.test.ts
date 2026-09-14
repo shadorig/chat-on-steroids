@@ -13,6 +13,7 @@ import vm from 'node:vm';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 const { APP_VERSION, BRIDGE_PROTOCOL } = await import('../src/main/version.js');
+const { CONTINUATION_CHECKPOINT_ACTIONS } = await import('../src/main/browser-bridge/continuation-protocol.js');
 
 let domSource = '';
 let backgroundSource = '';
@@ -33,8 +34,8 @@ describe('extension release metadata', () => {
     ) as { version: string };
     expect(pkg.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(15);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 15;');
+    expect(BRIDGE_PROTOCOL).toBe(17);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 17;');
   });
 
   /**
@@ -122,6 +123,15 @@ describe('extension release metadata', () => {
     expect(js).toContain("type: 'overwriteNow'");
     expect(backgroundSource).toContain('async overwriteNow()');
     expect(backgroundSource).toContain("chrome.tabs.sendMessage(id, { type: 'clf-overwrite-now' })");
+  });
+});
+
+describe('extension continuation protocol mirror', () => {
+  it('ships exactly the same checkpoint action vocabulary as the main-process contract', () => {
+    const block = backgroundSource.match(/const checkpointAction = \[([\s\S]*?)\]\.includes\(message\.action\)/);
+    expect(block?.[1]).toBeTruthy();
+    const mirrored = [...block![1]!.matchAll(/'([^']+)'/g)].map(match => match[1]);
+    expect(mirrored).toEqual([...CONTINUATION_CHECKPOINT_ACTIONS]);
   });
 });
 
@@ -1336,19 +1346,19 @@ describe('worker settings authority', () => {
     const token = '0123456789abcdef0123456789abcdef';
 
     await worker.send({ type: 'compact', conversationId: CHAT, ticket: true, automatic: true }, 44);
-    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceLost: true }, 44);
-    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceDispatch: true }, 44);
-    await worker.send({ type: 'compact', conversationId: CHAT, token, destinationDispatch: true }, 44);
+    await worker.send({ type: 'compact', conversationId: CHAT, token, action: 'source-release' }, 44);
+    await worker.send({ type: 'compact', conversationId: CHAT, token, action: 'source-arm' }, 44);
+    await worker.send({ type: 'compact', conversationId: CHAT, token, action: 'destination-arm', commandId: 'cmd-destination', client: 'page-destination' }, 44);
 
     expect(posted).toEqual([
       expect.objectContaining({ conversationId: CHAT, ticket: true, automatic: true }),
-      expect.objectContaining({ conversationId: CHAT, token, sourceLost: true }),
-      expect.objectContaining({ conversationId: CHAT, token, sourceDispatch: true }),
-      expect.objectContaining({ conversationId: CHAT, token, destinationDispatch: true })
+      expect.objectContaining({ conversationId: CHAT, token, action: 'source-release' }),
+      expect.objectContaining({ conversationId: CHAT, token, action: 'source-arm' }),
+      expect.objectContaining({ conversationId: CHAT, token, action: 'destination-arm', commandId: 'cmd-destination', client: 'page-destination' })
     ]);
   });
 
-  it('carries destinationLost, and still refuses anything not on the checkpoint list', async () => {
+  it('carries an owned destination release action, and still refuses anything not on the checkpoint list', async () => {
     const posted: Record<string, unknown>[] = [];
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
       const url = new URL(input);
@@ -1367,18 +1377,21 @@ describe('worker settings authority', () => {
 
     // The page sends this and the app acts on it — it retires the lease and re-offers the brief
     // to a fresh chat at once instead of waiting the lease out. The relay used to drop it.
-    await worker.send({ type: 'compact', conversationId: CHAT, token, destinationLost: true }, 44);
+    await worker.send({ type: 'compact', conversationId: CHAT, token, action: 'destination-release', commandId: 'cmd-release', client: 'page-release' }, 44);
     // A field nobody named must not ride along on a valid token.
-    await worker.send({ type: 'compact', conversationId: CHAT, token, sourceLost: true, invented: true }, 44);
+    await worker.send({ type: 'compact', conversationId: CHAT, token, action: 'source-release', invented: true }, 44);
     // And a checkpoint without its token says nothing about any transaction.
-    await worker.send({ type: 'compact', conversationId: CHAT, destinationLost: true }, 44);
+    const malformed = await worker.send({ type: 'compact', conversationId: CHAT, action: 'destination-release' }, 44);
+    const unknownAction = await worker.send({
+      type: 'compact', conversationId: CHAT, token, action: 'checkpoint-something-else'
+    }, 44);
 
-    expect(posted).toHaveLength(3);
-    expect(posted[0]).toMatchObject({ conversationId: CHAT, token, destinationLost: true });
-    expect(posted[1]).toMatchObject({ conversationId: CHAT, token, sourceLost: true });
+    expect(posted).toHaveLength(2);
+    expect(posted[0]).toMatchObject({ conversationId: CHAT, token, action: 'destination-release', commandId: 'cmd-release', client: 'page-release' });
+    expect(posted[1]).toMatchObject({ conversationId: CHAT, token, action: 'source-release' });
     expect(posted[1]).not.toHaveProperty('invented');
-    expect(posted[2]).not.toHaveProperty('destinationLost');
-    expect(posted[2]).not.toHaveProperty('token');
+    expect(malformed).toMatchObject({ ok: false, error: 'bad_destination_checkpoint' });
+    expect(unknownAction).toMatchObject({ ok: false, error: 'bad_checkpoint_action' });
   });
 
   it.each(['new-chat', 'other-chat', 'pending-navigation'])('checks the current Chrome route for compaction after %s', async scenario => {
@@ -1499,6 +1512,103 @@ describe('worker settings authority', () => {
     });
     expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/settings')).toBe(false);
   });
+
+  /**
+   * The half of this route that no test covered: the replacement chat's own checkpoints.
+   *
+   * Every case above sends `conversationId` alongside the token, because every one of them is
+   * the *source* chat — a conversation that exists. The destination is the opposite by
+   * construction: content.js asks for its permit from a page opened at `/?clf=<id>`, before
+   * ChatGPT has assigned anything, so it sends a token and a flag and no conversation id at
+   * all. Nothing here ever exercised that shape, and it is the shape the whole handoff depends
+   * on: refuse it and the page clears its composer and stops, with no ack and no log line
+   * anywhere — which is exactly what a stuck handoff looks like from the outside.
+   */
+  /**
+   * The replacement chat asks for its permit while ChatGPT is still loading.
+   *
+   * Measured in the browser on 2026-09-10: the tab redeemed at 04:39:55.218 and got the whole
+   * 48,975-character brief, then asked for `destinationAttempt` at 04:39:58.262 — three seconds
+   * into a freshly opened ChatGPT, which is still `loading`. The worker refused it as a stale
+   * document without ever calling the app, content.js read that as a denied permit, cleared the
+   * composer and returned without an ack. The app then waited out its whole deadline and gave up
+   * with "the chat this app opened did not report back in time", and nothing anywhere said why.
+   *
+   * The loading/pendingUrl guard is for a tab navigating *away* from what the message names. A
+   * checkpoint that names no conversation, from a document the worker still owns, is the
+   * opposite case: there is nothing to navigate away from yet.
+   */
+  it.each(['loading', 'pending'])('forwards a replacement chat permit while the tab is still %s', async state => {
+    const posted: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/compact' && init.method === 'POST') {
+        posted.push(JSON.parse(String(init.body || '{}')));
+        return response(200, { allowed: true });
+      }
+      return response(404, {});
+    });
+    const tab = state === 'loading'
+      ? { id: 47, url: 'https://chatgpt.com/?clf=cmd-successor', status: 'loading' }
+      : { id: 47, url: 'https://chatgpt.com/?clf=cmd-successor', pendingUrl: 'https://chatgpt.com/?clf=cmd-successor' };
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsGet: async () => tab });
+    await worker.registerTab(47);
+    const token = '0123456789abcdef0123456789abcdef';
+
+    const commandId = 'cmd-successor', client = 'run-successor-document';
+    const reply = await worker.send({ type: 'compact', token, commandId, client, action: 'destination-claim' }, 47);
+
+    expect(reply).not.toMatchObject({ error: 'stale_document' });
+    expect(posted).toEqual([expect.objectContaining({ token, commandId, client, action: 'destination-claim' })]);
+  });
+
+  it('forwards the destination checkpoints a replacement chat sends, which name no conversation', async () => {
+    const posted: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/compact' && init.method === 'POST') {
+        posted.push(JSON.parse(String(init.body || '{}')));
+        return response(200, { allowed: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsGet: async () => ({ id: 46, url: 'https://chatgpt.com/?clf=cmd-successor' }) });
+    await worker.registerTab(46);
+    const token = '0123456789abcdef0123456789abcdef';
+
+    const commandId = 'cmd-successor', client = 'run-successor-document';
+    await worker.send({ type: 'compact', token, commandId, client, action: 'destination-claim' }, 46);
+    await worker.send({ type: 'compact', token, commandId, client, action: 'destination-arm' }, 46);
+    await worker.send({ type: 'compact', token, commandId, client, action: 'destination-release' }, 46);
+
+    expect(posted).toEqual([
+      expect.objectContaining({ token, commandId, client, action: 'destination-claim' }),
+      expect.objectContaining({ token, commandId, client, action: 'destination-arm' }),
+      expect.objectContaining({ token, commandId, client, action: 'destination-release' })
+    ]);
+  });
+
+  it.each(['conversation', 'pending-conversation', 'pending-foreign'])('refuses a replacement permit on a %s route', async state => {
+    const fetch = vi.fn(async (input: string) => new URL(input).pathname === '/hello'
+      ? response(200, { app: 'chat-on-steroids', paired: true }) : response(200, { allowed: true }));
+    const home = 'https://chatgpt.com/?clf=cmd-successor';
+    const chat = `https://chatgpt.com/c/${CHAT}`;
+    const tab = { id: 48, url: state === 'conversation' ? chat : home,
+      ...(state === 'pending-conversation' ? { pendingUrl: chat } : {}),
+      ...(state === 'pending-foreign' ? { pendingUrl: 'https://example.com/' } : {}) };
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch,
+      tabsGet: async () => tab });
+    await worker.registerTab(48);
+    expect(await worker.send({ type: 'compact', token: '0123456789abcdef0123456789abcdef',
+      commandId: 'cmd-successor', client: 'run-successor-document', action: 'destination-claim' }, 48))
+      .toMatchObject({ ok: false, error: 'stale_document' });
+    expect(fetch.mock.calls.some(([input]) => new URL(input).pathname === '/compact')).toBe(false);
+  });
+
 
   /**
    * The mode a goal was written in, which the app turns into a durable per-chat switch.

@@ -175,6 +175,11 @@ var CLF_DOM = (() => {
       if (!node) return '';
       if (role === 'user') {
         const parts = [...node.querySelectorAll('.whitespace-pre-wrap')]
+          .filter((part) => {
+            const outer = part.parentElement && part.parentElement.closest &&
+              part.parentElement.closest('.whitespace-pre-wrap');
+            return !outer || outer === node || !(node.contains && node.contains(outer));
+          })
           .filter(part => !part.hasAttribute?.('data-clf-user-text'))
           .map((part) => text(part))
           .filter(Boolean);
@@ -1967,12 +1972,16 @@ var CLF_DOM = (() => {
         const data = event.data;
         if (event.source !== window || event.origin !== location.origin || data?.source !== 'clf-picker-reply' || data.nonce !== nonce || data.v !== 1) return;
         const state = data.picker;
+        const modelFamilyId = value =>
+          typeof value === 'string' && /^[a-zA-Z0-9._ -]{1,80}$/.test(value) && value.trim() === value && value.length > 0
+            ? value
+            : null;
         const valid = state && typeof state.version === 'string' && Number.isInteger(state.currentBucket) &&
           Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 20 &&
-          state.versions.every(v => typeof v.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
+          state.versions.every(v => modelFamilyId(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
           Array.isArray(state.choices) && state.choices.length > 0 && state.choices.length <= 12 &&
           state.choices.every(c => Number.isInteger(c.bucket) && typeof c.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.id) && typeof c.label === 'string' && c.label.length > 0 && c.label.length <= 80 &&
-            typeof c.familyId === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.familyId) && typeof c.familyLabel === 'string' && c.familyLabel.length > 0 && c.familyLabel.length <= 80 &&
+            modelFamilyId(c.familyId) && typeof c.familyLabel === 'string' && c.familyLabel.length > 0 && c.familyLabel.length <= 80 &&
             ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(c.effort) && typeof c.available === 'boolean') &&
           new Set(state.versions.map(v => v.id)).size === state.versions.length && new Set(state.choices.map(c => c.bucket)).size === state.choices.length &&
           state.versions.some(v => v.id === state.version) && state.choices.some(c => c.bucket === state.currentBucket);
@@ -2015,6 +2024,7 @@ var CLF_DOM = (() => {
     return {
       state,
       async open() {
+        if (!await wait(trigger, 15000) || !await prepareChatModelSurface(stillCurrent)) return null;
         if (!picker()) { const button = await wait(trigger, 15000); if (!key(button, 'Enter') || !await wait(picker)) return null; }
         return state();
       },
@@ -2101,21 +2111,6 @@ var CLF_DOM = (() => {
       if (!entry.aliases.includes(choice.id)) entry.aliases.push(choice.id);
       result.set(choice.familyId, entry);
     }
-  }
-  /** Complete account-evaluated catalogue already retained by the closed native picker. */
-  async function inspectPassiveModelSettings(stillCurrent = () => true) {
-    if (!stillCurrent() || !modelPickerTrigger()) return null;
-    const state = await readPickerState();
-    if (!stillCurrent() || !state) return null;
-    const represented = new Set(state.choices.filter(choice => choice.available).map(choice => choice.familyId));
-    // A retained picker often contains choices only for its selected version. Publishing that as
-    // the account catalogue would silently delete every other family. Passive state is authoritative
-    // only when it represents every enabled version; otherwise the idle interactive path does the
-    // existing one-version-at-a-time inspection.
-    if (state.versions.some(version => !represented.has(version.id))) return null;
-    const result = new Map();
-    collectModelChoices(result, state);
-    return result.size ? [...result.values()] : null;
   }
   async function inspectModelSettings(stillCurrent = () => true, failure = () => {}) {
     const ui = modelPickerAccess(stillCurrent), original = await ui.open();
@@ -2258,7 +2253,6 @@ var CLF_DOM = (() => {
     projectHomeId,
     enterProject,
     visibleModelSelection,
-    inspectPassiveModelSettings,
     inspectModelSettings,
     uploadImages,
     captureComposerDraft,

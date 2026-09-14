@@ -46,7 +46,7 @@ import {
 import { MAX_GOAL_SYSTEM_PROMPT_CHARS } from '../shared/goal.js';
 import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS } from './config.js';
-import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
+import { clearAllGoalSwitches, consumeGoalReplyForInputNow, deactivateGoalReplyNow, draftTaskPlan, goalPendingSourceForInput, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalLoopTriggerNow, setGoalObjectiveNow, tryActivateGoalReplyNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, logWarn, onLog } from './logger.js';
@@ -482,7 +482,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       // Off pauses execution; it is not the destructive Clear swarm action. Preserve every
       // prime-owned worker history so re-enable/restart can still show and revive exact chats.
       pauseSwarmForDisable();
-      cancelWorkerCommands('multi-agent mode was turned off');
+      await cancelWorkerCommands('multi-agent mode was turned off');
       try {
         if (!(await persistAgentAuthorityNow())) {
           throw new Error('Multi-agent teardown has no immediate durable persistence sink.');
@@ -884,8 +884,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: inputArgs.shape.text, afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
   handle('sessions:cancelInput', async (payload) => cancelDesktopInput(z.object({ id: z.string().uuid() }).parse(payload).id));
   handle('sessions:inputAutomation', async payload => {
-    const { id, mode } = z.object({ id: z.string().uuid(), mode: z.enum(['off', 'goal', 'loop']) }).parse(payload);
-    return setInputAutomation(id, mode);
+    const { id, mode, loopTrigger } = z.object({
+      id: z.string().uuid(),
+      mode: z.enum(['off', 'goal', 'loop']),
+      loopTrigger: inputArgs.shape.loopTrigger
+    }).parse(payload);
+    return setInputAutomation(id, mode, loopTrigger);
   });
   handle('window:getZoom', async () => (getWindow()?.webContents.getZoomFactor() ?? UI_BASE_ZOOM) / UI_BASE_ZOOM);
   handle('window:zoom', async (payload) => {
@@ -1028,7 +1032,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       if (!(await persistAgentAuthorityNow())) {
         throw new Error('The agent clear could not be made durable. Retry the clear action.');
       }
-      if (outcome.cleared === 'worker') cancelWorkerCommands(outcome.reason, id, runId);
+      if (outcome.cleared === 'worker') await cancelWorkerCommands(outcome.reason, id, runId);
     }
     // The prime's report stays in the main process: the renderer needs the outcome, not
     // the message queued for the prime agent.
@@ -1077,6 +1081,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     },
     changed: () => push('session:changed'),
     recordDelivered: (entry) => getConfig().sessions.record ? recordDeliveredInput(entry) : Promise.resolve(true),
+    pendingAutomationSource: (conversationId, sessionId) => goalPendingSourceForInput(conversationId, sessionId),
+    consumeAutomationObligation: (conversationId, sessionId, source) =>
+      consumeGoalReplyForInputNow(conversationId, sessionId, source),
     prepareText: async (entry, limits) => {
       const control = entry.conversationId ? goalSwitchFor(entry.conversationId) : getConfig().goal;
       const mode = entry.automation ?? (control.enabled ? control.mode : 'off');
@@ -1087,14 +1094,15 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       return !entry.sessionId && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish'
         ? prepareSessionPrompt(text, entry, limits) : text;
     },
-    applyAutomation: async (conversationId, automation, phase, objective) => {
+    applyAutomation: async (conversationId, automation, phase, objective, loopTrigger) => {
       // This message supersedes the old final; never pick that old final up merely
       // because the composer enabled Goal for the next turn.
       const mode = automation === 'off' ? goalSwitchFor(conversationId).mode : automation;
       // Reserve switch ordering immediately, before awaiting another ledger write.
       // A user Off arriving during persistence must remain later than this attempt.
       const switchWrite = setGoalSwitchNow(conversationId, mode, automation !== 'off');
-      const [held] = await Promise.all([switchWrite, setGoalReplyActiveNow(conversationId, false)]);
+      const [held] = await Promise.all([switchWrite, deactivateGoalReplyNow(conversationId)]);
+      if (held.enabled && held.mode === 'loop' && loopTrigger) await setGoalLoopTriggerNow(conversationId, loopTrigger);
       // A fresh chat can finish before its send ACK arrives. Its newest final is
       // this message's own response, so it may be picked up after binding.
       // Objective ownership transfers with delivery even if the user switched Off
@@ -1102,7 +1110,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       // execution authority; retaining authored text must never imply reactivation.
       if (objective !== undefined) await setGoalObjectiveNow(conversationId, objective);
       const live = goalSwitchFor(conversationId);
-      if (phase === 'after-send' && held.enabled && live.enabled && live.mode === held.mode) await setGoalReplyActiveNow(conversationId, true);
+      if (phase === 'after-send' && held.enabled && live.enabled && live.mode === held.mode) await tryActivateGoalReplyNow(conversationId);
     }
   });
   let statePushGeneration = 0;

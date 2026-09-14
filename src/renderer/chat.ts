@@ -5,11 +5,12 @@ import { safeExternalLink } from '../shared/external-link.js';
 import { createAgentPanel } from './agent-panel.js';
 import { renderAgentPlan } from './agent-plan.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
-import { preserveTimelineViewport } from './timeline-scroll.js';
+import { captureTimelineViewport, preserveTimelineViewport, restoreTimelineViewport, type TimelineViewport } from './timeline-scroll.js';
 import { toolResultText } from './tool-result.js';
+import { chatErrorPresentation, projectChatErrorResolutions, type ChatErrorResolution } from './chat-error.js';
 import { communicationTitle, foldAgentCommunication } from './agent-communication.js';
 import { initContextMeter, paintContextMeter } from './context-meter.js';
-import { isAstraModel } from '../shared/chat-models.js';
+import { isAstraModel, supportsAfterTurnLoop } from '../shared/chat-models.js';
 import type { InputImage, InputAttachment, InputAutomation } from '../shared/input.js';
 import { canAttemptImageProjection, canAttemptToolText, isFollowupInput } from '../shared/input.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
@@ -114,6 +115,7 @@ let sessionPageLoading = false;
 let loadedOlderSessions = false;
 let activeId: string | null = null;
 let selectedId: string | null = null;
+const sessionViewports = new Map<string, TimelineViewport>();
 let newChatSelected = true;
 let selectedProjectId: string | null = null;
 let projects: LocalProject[] = [];
@@ -154,6 +156,7 @@ function restoreDraft(): void {
   $('activeGoalRow').hidden = true; $('recoveryStatus').hidden = true;
   $<HTMLTextAreaElement>('chatInput').value = inputDrafts.get(draftKey()) ?? '';
   const automation = $<HTMLSelectElement>('chatAutomation'); automation.value = 'off'; delete automation.dataset.edited;
+  $<HTMLSelectElement>('loopTrigger').value = 'session-finish';
   $<HTMLTextAreaElement>('sessionObjective').value = ''; delete $('sessionObjective').dataset.edited; delete $('sessionObjective').dataset.sessionId;
   paintTaskPlan(); paintComposerImages();
 }
@@ -1069,7 +1072,26 @@ function paintTaskActions(): void {
     ui(button, 'title', () => planMode ? t("Return to a normal message; keep your draft") : text ? t("Split your message into editable stages") : t("Write a message in the composer first"));
   }
 }
+function openingLoopTriggerEligible(): boolean {
+  if (selectedId !== null || $<HTMLSelectElement>('chatAutomation').value !== 'loop') return false;
+  const model = confirmedComposerModel();
+  return !!model && supportsAfterTurnLoop(model.model, model.reasoningEffort);
+}
+function paintOpeningLoopTrigger(): void {
+  if (selectedId !== null) return;
+  $('loopTriggerRow').hidden = !openingLoopTriggerEligible();
+}
+function openingLoopTrigger(): InputArgs['loopTrigger'] | undefined {
+  return openingLoopTriggerEligible()
+    ? ($<HTMLSelectElement>('loopTrigger').value === 'after-turn' ? 'after-turn' : 'session-finish')
+    : undefined;
+}
+function setOpeningInputAutomation(id: string, mode: InputAutomation) {
+  const trigger = mode === 'loop' ? openingLoopTrigger() : undefined;
+  return trigger === undefined ? api.setInputAutomation(id, mode) : api.setInputAutomation(id, mode, trigger);
+}
 function paintAutomationSwitch(): void {
+  paintOpeningLoopTrigger();
   paintGoalProgress();
   paintActiveGoal();
   const select = $<HTMLSelectElement>('chatAutomation');
@@ -1165,7 +1187,8 @@ async function loadDetail(navigate = false, prepend = false, newerFrom?: number)
     paintDetail();
     return;
   }
-  if (detailFor !== wanted) historyBefore = null;
+  const opening = detailFor !== wanted;
+  if (opening) historyBefore = null;
   // Live deltas must not evict a historical page while the user is reading it.
   const incremental = newerFrom === undefined && historyBefore === null && detailFor === wanted && detailCursor !== null;
   const detail = await run(
@@ -1203,6 +1226,11 @@ async function loadDetail(navigate = false, prepend = false, newerFrom?: number)
       : detail.events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), incremental ? detailCursor! : 0);
   totalEvents = detail.total;
   paintDetail(!prepend && newerFrom === undefined);
+  if (opening) {
+    const viewport = sessionViewports.get(wanted);
+    if (viewport) restoreTimelineViewport($('chatBody'), $('timeline'), viewport);
+    else $('chatBody').scrollTop = $('chatBody').scrollHeight;
+  }
   void loadHandoff();
   // A burst can contain more than one renderer-sized page between coalesced notifications.
   // Drain it page by page rather than silently jumping the cursor or lifting the payload cap.
@@ -1583,7 +1611,7 @@ function paintInputReceipt(row: HTMLElement, item: ReturnType<typeof timelineIte
   receipt.parentElement?.classList.toggle('has-input-receipt', !receipt.hidden);
 }
 
-function eventBody(event: SessionEvent, context?: { id: string; current: () => boolean }): HTMLElement {
+function eventBody(event: SessionEvent, context?: { id: string; current: () => boolean; errorResolution?: ChatErrorResolution }): HTMLElement {
   switch (event.kind) {
     case 'session_start':
       return el('p', 'meta', () => t("Session started — {0}", [event.title]));
@@ -1649,9 +1677,12 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
     }
     case 'chat_error': {
       const notice = el('div', 'chat-error-notice');
+      const presentation = chatErrorPresentation(event, context?.errorResolution);
       notice.setAttribute('role', 'status');
-      const title = el('strong', '', () => t("ChatGPT reported a problem"));
-      notice.append(title, textBlock('msg', event.message.text, event.message.truncated, event.message.chars));
+      notice.dataset.severity = presentation.severity;
+      const title = el('strong', '', presentation.title);
+      notice.append(title, textBlock('msg', presentation.message, event.message.truncated, event.message.chars),
+        el('p', 'chat-error-next', presentation.guidance));
       return notice;
     }
     case 'tool_call':
@@ -1707,7 +1738,7 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
   }
 }
 
-function eventRow(event: SessionEvent): HTMLElement {
+function eventRow(event: SessionEvent, errorResolution?: ChatErrorResolution): HTMLElement {
   const row = el('div', `ev ev-${event.kind}`);
   const time = document.createElement('time');
   time.textContent = clockTime(event.time);
@@ -1717,7 +1748,7 @@ function eventRow(event: SessionEvent): HTMLElement {
   if (event.agent && event.agent !== 'prime' && !(currentWorker?.kind === 'worker' && currentWorker.agentId === event.agent)) {
     body.append(el('span', 'chip', event.agent));
   }
-  body.append(eventBody(event));
+  body.append(eventBody(event, errorResolution ? { id: selectedId ?? '', current: () => true, errorResolution } : undefined));
   // A refused call from a chat Compact & Resume already replaced is not a placement failure:
   // its request id proved exactly which chat it came from, and that chat's stopped turn simply
   // kept calling from OpenAI's side. Say so beside the row, or a full Unattributed bucket of
@@ -2191,6 +2222,7 @@ function paintDetail(followBottom = true): void {
   const filtered = visibleEvents();
   const windowed = boundedTimeline(filtered);
   const shown = windowed.shown;
+  const errorResolutions = projectChatErrorResolutions(events);
 
   // Preserve the visible logical row when late transcript revisions change the
   // height above it; retaining absolute scrollTop would move the reader's content.
@@ -2223,7 +2255,8 @@ function paintDetail(followBottom = true): void {
     if (!deps.state()?.config.ui.developerMode && item.kind === 'event' && item.event.source === 'app' && item.event.kind === 'progress' && item.event.progressId?.startsWith('browser-repair:')) continue;
     if (!deps.state()?.config.ui.developerMode && item.kind === 'event' && ['session_start', 'session_end', 'turn_start', 'turn_end', 'note'].includes(item.event.kind)) continue;
     const key = itemKey(item);
-    const sig = itemSignature(item);
+    const sig = itemSignature(item) + (item.kind === 'event' && item.event.kind === 'chat_error'
+      ? JSON.stringify(chatErrorPresentation(item.event, errorResolutions.get(item.event.seq))) : '');
     keep.add(key);
     const cached = rowCache.get(key);
     if (cached && cached.sig === sig) {
@@ -2232,7 +2265,8 @@ function paintDetail(followBottom = true): void {
       timelineRows.push(cached.row);
       continue;
     }
-    const row = item.kind === 'compaction' ? compactionRow(item.block, cached?.row) : eventRow(item.event);
+    const row = item.kind === 'compaction' ? compactionRow(item.block, cached?.row)
+      : eventRow(item.event, item.event.kind === 'chat_error' ? errorResolutions.get(item.event.seq) : undefined);
     row.dataset.timelineKey = key;
     row.dataset.activityBoundary = activityBoundary;
     paintInputReceipt(row, item);
@@ -3204,9 +3238,9 @@ async function retryPlannedInput(entry: InputEntry): Promise<void> {
   if (dismissedInputNotices.has(entry.id) || entry.stagesApplied || !['failed', 'cancelled'].includes(entry.state)) return;
   // The outbox retains the authored workflow after failure. Retry that payload, not
   // its stage-one display text, and never revive the old browser claim/receipt.
-  const { sessionId, projectId, text, objective, stages, images, attachments, attachmentDelivery, automation, model, reasoningEffort, afterTurn } = entry;
+  const { sessionId, projectId, text, objective, stages, images, attachments, attachmentDelivery, automation, loopTrigger, model, reasoningEffort, afterTurn } = entry;
   const args: InputArgs = { id: crypto.randomUUID(), sessionId, projectId, text, objective, stages, images, attachments, attachmentDelivery,
-    automation, model, reasoningEffort, afterTurn, mode: entry.requestedMode ?? entry.mode, dueAt: Date.now() };
+    automation, loopTrigger, model, reasoningEffort, afterTurn, mode: entry.requestedMode ?? entry.mode, dueAt: Date.now() };
   const generation = selectionGeneration;
   // Hide during the attempt, but persist dismissal only after its replacement is durable.
   dismissedInputNotices.add(entry.id); void refreshInputQueue();
@@ -3305,7 +3339,7 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
   void refreshInputQueue();
   paintDeliveryControls();
   try {
-    const result = await run(api.sendInput({ id, sessionId, projectId, text, ...attachmentPayload, stages: plan?.slice(1), objective, automation: mode === 'finish' ? undefined : $<HTMLSelectElement>('chatAutomation').value as InputAutomation, mode: mode === 'finish' ? 'finish' : mode === 'auto' ? 'auto' : 'after-turn', dueAt, ...modelSettings }));
+    const result = await run(api.sendInput({ id, sessionId, projectId, text, ...attachmentPayload, stages: plan?.slice(1), objective, automation: mode === 'finish' ? undefined : $<HTMLSelectElement>('chatAutomation').value as InputAutomation, loopTrigger: openingLoopTrigger(), mode: mode === 'finish' ? 'finish' : mode === 'auto' ? 'auto' : 'after-turn', dueAt, ...modelSettings }));
     if (cancelledStarts.has(id)) return;
     if (!result) {
       if (selectedId === sessionId && selectionGeneration === generation && !input.value) input.value = authoredDraft;
@@ -3320,8 +3354,8 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
     inputQueueGeneration++;
     pendingComposerInputs = [...pendingComposerInputs.filter(row => row.id !== result.id), result];
     if (sessionId === null && selectionGeneration === generation && pendingNewInput?.id === id && result.automation &&
-        $<HTMLSelectElement>('chatAutomation').value !== result.automation)
-      await run(api.setInputAutomation(result.id, $<HTMLSelectElement>('chatAutomation').value as InputAutomation));
+        ($<HTMLSelectElement>('chatAutomation').value !== result.automation || openingLoopTrigger() !== result.loopTrigger))
+      await run(setOpeningInputAutomation(result.id, $<HTMLSelectElement>('chatAutomation').value as InputAutomation));
     if (sessionId === null && selectionGeneration === generation) pendingNewInput = { id: result.id, generation };
     $('composerStatus').textContent = '';
     void refreshInputQueue();
@@ -3358,6 +3392,9 @@ function showView(name: string): void {
 
 function selectSession(id: string): void {
   rememberDraft();
+  if (selectedId && detailFor === selectedId) {
+    sessionViewports.set(selectedId, captureTimelineViewport($('chatBody'), $('timeline')));
+  }
   selectionGeneration++;
   newChatSelected = false;
   selectedId = id;
@@ -3380,7 +3417,11 @@ function selectSession(id: string): void {
 }
 
 function selectNewChat(projectId: string | null = null): void {
-  rememberDraft(); selectionGeneration++; pendingNewInput = null;
+  rememberDraft();
+  if (selectedId && detailFor === selectedId) {
+    sessionViewports.set(selectedId, captureTimelineViewport($('chatBody'), $('timeline')));
+  }
+  selectionGeneration++; pendingNewInput = null;
   newChatSelected = true; selectedId = null; selectedProjectId = projectId; detailFor = null; detailCursor = null;
   applyComposerSessionModel(null, null);
   cancelTaskPlan();
@@ -3407,17 +3448,19 @@ export function initChat(next: Deps): void {
     load: id => run(api.getSession(id, { limit: 160 })), openMain: selectSession, working: sessionWorking,
     render: (source, id, current) => {
       let boundary = '';
+      const errorResolutions = projectChatErrorResolutions(source);
       const rows = boundedTimeline(source).shown.flatMap(event => {
         if (!['tool_call', 'page_tool', 'agent_message'].includes(event.kind)) boundary = `event:${event.seq}`;
         if (!['user_message', 'assistant_message', 'tool_call', 'page_tool', 'agent_message', 'chat_error'].includes(event.kind)) return [];
         const row = el('div', `ev ev-${event.kind}`); const body = el('div', 'ev-body');
         row.dataset.timelineKey = `event:${event.seq}`; row.dataset.activityBoundary = boundary;
-        body.append(eventBody(event, { id, current })); row.append(body); return [row];
+        body.append(eventBody(event, { id, current, errorResolution: event.kind === 'chat_error' ? errorResolutions.get(event.seq) : undefined })); row.append(body); return [row];
       });
       return groupToolRows(rows, `pane:${id}`, agentToolGroups);
     }
   });
   initChatModels(() => {
+    paintOpeningLoopTrigger();
     const config = deps.state()?.config;
     if (config) paintContextMeter(sessions.find(session => session.id === selectedId) ?? null, config, confirmedComposerModel());
   });
@@ -3451,7 +3494,7 @@ export function initChat(next: Deps): void {
     const mode = select.value as InputAutomation;
     if (!id) {
       const pending = pendingNewInput;
-      if (pending?.generation === generation) await run(api.setInputAutomation(pending.id, mode));
+      if (pending?.generation === generation) await run(setOpeningInputAutomation(pending.id, mode));
       return;
     }
     select.disabled = true; paintAutomationSwitch();
@@ -3464,8 +3507,13 @@ export function initChat(next: Deps): void {
   });
   $('loopTrigger').addEventListener('change', async () => {
     const id = selectedId, generation = selectionGeneration;
-    if (!id) return;
     const select = $<HTMLSelectElement>('loopTrigger');
+    if (!id) {
+      const pending = pendingNewInput;
+      if (pending?.generation === generation) await run(setOpeningInputAutomation(pending.id,
+        $<HTMLSelectElement>('chatAutomation').value as InputAutomation));
+      return;
+    }
     select.disabled = true;
     try { await run(api.setSessionLoopTrigger(id, select.value === 'after-turn' ? 'after-turn' : 'session-finish')); }
     finally {
@@ -3501,7 +3549,7 @@ export function initChat(next: Deps): void {
           if (!opening) { if (goalProgress?.requestId === requestId) { goalProgress.phase = 'failed'; goalProgress.error ||= 'Opening message generation failed'; paintGoalProgress(); } return; }
           const dueAt = Date.now(), inputId = crypto.randomUUID();
           const entry: InputEntry = { id: inputId, sessionId: null, projectId, text: opening.reply, objective: draft.trim(), automation: mode,
-            mode: 'auto', dueAt, model, reasoningEffort, state: 'queued', owner: null, createdAt: dueAt, conversationId: null };
+            loopTrigger: openingLoopTrigger(), mode: 'auto', dueAt, model, reasoningEffort, state: 'queued', owner: null, createdAt: dueAt, conversationId: null };
           startingInputs.set(inputId, entry); pendingNewInput = { id: inputId, generation: selection };
           goalProgress = { requestId, selection, inputId, phase: 'queued', text: '' }; paintDeliveryControls();
           try {
@@ -3509,8 +3557,9 @@ export function initChat(next: Deps): void {
             if (accepted) { inputQueueGeneration++; pendingComposerInputs = [...pendingComposerInputs.filter(row => row.id !== inputId), accepted];
               // Off may arrive while sendInput is still validating/enqueuing, before
               // the outbox row exists. Reconcile that same pending intent after acceptance.
-              if (selectionGeneration === selection && pendingNewInput?.id === inputId && automation.value !== mode)
-                await run(api.setInputAutomation(inputId, automation.value as InputAutomation));
+              if (selectionGeneration === selection && pendingNewInput?.id === inputId &&
+                  (automation.value !== mode || openingLoopTrigger() !== entry.loopTrigger))
+                await run(setOpeningInputAutomation(inputId, automation.value as InputAutomation));
               if (current()) objective.dataset.saved = draft;
             } else if (goalProgress?.requestId === requestId) { goalProgress.phase = 'failed'; goalProgress.error = 'Opening message could not be queued'; }
           } finally { startingInputs.delete(inputId); paintDeliveryControls(); void refreshInputQueue(); }

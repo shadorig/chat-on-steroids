@@ -66,7 +66,7 @@ The table names primary implementation entry points, not permanent module paths 
 | local session/history | `src/main/session/store.ts` and `recorder.ts` |
 | exact MCP request ownership | `src/main/session/correlation.ts` |
 | user input and delivery custody | `src/main/session/input.ts` |
-| browser commands and receipts | `src/main/bridge.ts` plus extension command custody |
+| browser commands and receipts | `src/main/browser-bridge/command-ledger.ts` plus extension command custody |
 | Compact & Resume transaction | `src/main/session/continuation.ts` |
 | worker families/inboxes | `src/main/agents.ts` |
 | Goal objective/switch/reply obligation | `src/main/goal.ts` |
@@ -90,6 +90,12 @@ Important consequences:
 - `flushDurable()` settles independent writers even if one fails; one bad state file must not skip every sibling during shutdown.
 
 The same rule appears across subsystems: **publish durable intent before acknowledging the event that consumes that intent**. Browser commands persist leases before handing text to a page; user settings that are reported saved cross their durable barrier first; worker command retirement waits for the worker snapshot that explains it.
+
+## Compatibility lifetimes
+
+Compatibility code has the lifetime of the evidence it must still read, not the lifetime of the implementation that replaced it. Historical records may need permanent display/read compatibility; persisted operational snapshots need migration only across the supported stored-state horizon; mixed-running-version protocol shims exist only while an older already-loaded participant can legitimately coexist with the current process. Keep those cases explicit rather than treating every legacy branch as permanent fallback behavior.
+
+A compatibility reader may translate old representation into the current model, but it must not grant authority that malformed current-format state lacks. Current schemas fail closed on missing or invalid ownership fields; only a version that is explicitly known to predate that field may enter the migration path. When the supported horizon makes a compatibility branch unreachable, delete the reader, its fixture and its migration-only vocabulary together.
 
 ## Unknown identity and stale async work
 

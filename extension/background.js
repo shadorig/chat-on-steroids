@@ -40,7 +40,7 @@ const MODEL_REQUEST_TIMEOUT_MS = 190_000;
 /** The reason a deadline aborts with, so it is a fact the caller can act on rather than prose. */
 const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 15;
+const BRIDGE_PROTOCOL = 17;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -1846,6 +1846,31 @@ function offerDesktopInput(tabId, message) {
   void chrome.tabs.sendMessage(tabId, message).catch(() => undefined);
 }
 
+/**
+ * Retires the exact borrowed managed page that a failed New Chat transition left at home.
+ *
+ * This is destructive cleanup, so every authority fact is re-proven after the replacement tab
+ * already exists: the borrowed page came from a reusable conversation, made exactly the expected
+ * one-hop transition to home, still belongs to the same document epoch, reports no conversation
+ * or draft, and Chrome still shows the exact unpinned, non-navigating home URL.
+ */
+async function retireAbandonedManagedHome(candidate, source, latest, reusable) {
+  if (!reusable.has(conversationFromUrl(candidate?.url)) || latest?.url !== 'https://chatgpt.com/' ||
+      tabEpochs[String(candidate?.id)] !== source.navigationEpoch + 1) return false;
+  const abandoned = { ...source, navigationEpoch: source.navigationEpoch + 1 };
+  try {
+    const proof = await tabReply(candidate.id, { type: 'clf-tab-close-check', conversationId: null }, { documentId: source.documentId });
+    const current = await chrome.tabs.get(candidate.id);
+    if (proof?.safe !== true || proof.conversationId !== null || proof.navigationEpoch !== abandoned.navigationEpoch ||
+        !ownsDocument(abandoned) || !current || current.pinned || current.pendingUrl || current.url !== 'https://chatgpt.com/') return false;
+    await chrome.tabs.remove(candidate.id);
+    return true;
+  } catch {
+    // A draft, navigation, ownership change or missing proof always keeps the document.
+    return false;
+  }
+}
+
 async function deliverDesktopInputs(inputs, background, reusableConversations = [], activeIds) {
   if (!Array.isArray(inputs)) return;
   // Only the app's complete outbox projection retires spent opening authority.
@@ -1972,6 +1997,13 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
             tab = await createChatTab(url, background);
             await elect(input.id, { tab: tab.id, stage: 'ready', fallbackUsed: true });
             tabs.push(tab);
+            // A failed New Chat transition can leave the borrowed managed page empty. Its
+            // conversation ownership is gone, so ordinary pruning can never retire it. The same
+            // preparation owns this exact one-hop home; close it only after the replacement exists
+            // and a fresh draft check proves the abandoned document is still safe to retire.
+            if (await retireAbandonedManagedHome(candidate, source, latest, reusable)) {
+              tabs = tabs.filter(row => row.id !== candidate.id);
+            }
           }
           break;
         }
@@ -2609,27 +2641,17 @@ function isChatGptUrl(value) {
 const tabOperationQueues = new Map();
 
 /**
- * Which checkpoint fields may cross to the app, and what each one has to look like.
+ * Which checkpoint payload fields may cross to the app, and what each one has to look like.
  *
  * Named in one list rather than eight hand-copied ternaries, because this body is rebuilt
  * field by field and a field nobody remembered to list is dropped in silence with both ends
- * of the feature looking correct. `destinationLost` did exactly that: content.js sends it and
- * bridge.ts acts on it, so the page could prove a brief never left it and the app would have
- * retired the lease and re-offered the brief at once — but the relay never carried the field,
- * so that path could not run and the chat waited out the whole lease instead.
+ * of the feature looking correct. Send-state transitions are deliberately not in this list:
+ * protocol 17 gives both source and destination one exclusive `action`, validated below.
  *
  * Still an allowlist, not a passthrough: nothing reaches the app unless it is named here, and
  * every field stays token-paired, because the field only says anything about the transaction
  * the token names.
  */
-const COMPACT_CHECKPOINT_FLAGS = [
-  'sourceAttempt',
-  'sourceDispatch',
-  'sourceLost',
-  'destinationAttempt',
-  'destinationDispatch',
-  'destinationLost'
-];
 const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId'];
 // Not a checkpoint of its own: it qualifies `sourceMessageId` by saying how far that exact
 // marked response has grown. Sent only alongside the field it describes, so a bare count can
@@ -2639,9 +2661,6 @@ const COMPACT_CHECKPOINT_COUNTS = { sourceProgress: 'sourceMessageId' };
 function compactCheckpointFields(message) {
   if (!message || typeof message.token !== 'string') return {};
   const fields = {};
-  for (const flag of COMPACT_CHECKPOINT_FLAGS) {
-    if (message[flag] === true) fields[flag] = true;
-  }
   for (const name of COMPACT_CHECKPOINT_TEXT) {
     if (typeof message[name] === 'string') fields[name] = message[name];
   }
@@ -3066,14 +3085,45 @@ const HANDLERS = {
   async compact(message, _sender, source) {
     await load();
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    // Content scripts survive extension reloads in an already-open ChatGPT document. Protocol 17
+    // replaced both source and destination checkpoint booleans with one action; make mixed-generation
+    // state explicit instead of clearing a resume draft after a generic denied permit.
+    if (message.sourceAttempt === true || message.sourceDispatch === true || message.sourceLost === true ||
+        message.destinationAttempt === true || message.destinationDispatch === true || message.destinationLost === true) {
+      return { ok: false, error: 'outdated_page_document', reloadRequired: true };
+    }
+    const checkpointAction = [
+      'source-claim', 'source-arm', 'source-release',
+      'destination-claim', 'destination-arm', 'destination-release'
+    ].includes(message.action)
+      ? message.action : null;
+    if (message.action !== undefined && !checkpointAction) {
+      return { ok: false, error: 'bad_checkpoint_action' };
+    }
+    const destinationAction = checkpointAction && checkpointAction.startsWith('destination-') ? checkpointAction : null;
+    if (destinationAction &&
+        (typeof message.token !== 'string' || typeof message.commandId !== 'string' || !message.commandId ||
+         typeof message.client !== 'string' || !message.client)) {
+      return { ok: false, error: 'bad_destination_checkpoint' };
+    }
+    if (checkpointAction && !destinationAction && typeof message.token !== 'string') {
+      return { ok: false, error: 'bad_checkpoint' };
+    }
     await noteTabConversation(source, message.conversationId);
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     // MessageSender.url can still name the document's initial New Chat address after
     // ChatGPT assigns /c/B through an SPA transition. Read Chrome's current tab and
     // retain the exact document/epoch lease across that await before accepting its route.
     const tab = await chrome.tabs.get(source.tab).catch(() => null);
-    if (!ownsDocument(source) || !tab || tab.pendingUrl || tab.status === 'loading' ||
-        !isChatGptUrl(tab.url) || conversationFromUrl(tab.url) !== cleanConversationId(message.conversationId))
+    if (!ownsDocument(source) || !tab || !isChatGptUrl(tab.url))
+      return { ok: false, error: 'stale_document' };
+    const named = cleanConversationId(message.conversationId);
+    // Destination permits precede the first Send and therefore have no chat route. Loading that
+    // same leased document is normal; leaving it for another route is not. Named source
+    // checkpoints still require a fully settled matching conversation.
+    if (named
+      ? (tab.pendingUrl || tab.status === 'loading' || conversationFromUrl(tab.url) !== named)
+      : (conversationFromUrl(tab.url) !== null || (tab.pendingUrl && tab.pendingUrl !== tab.url)))
       return { ok: false, error: 'stale_document' };
     const sourceUrl = tab.url;
     const result = await call('/compact', {
@@ -3085,6 +3135,11 @@ const HANDLERS = {
         cancel: message.cancel === true,
         ticket: message.ticket === true,
         automatic: message.automatic === true,
+        ...(checkpointAction ? {
+          token: message.token,
+          action: checkpointAction,
+          ...(destinationAction ? { commandId: message.commandId, client: message.client } : {})
+        } : {}),
         // The capture. `token` names the transaction the page was given when it marked the
         // compaction turn, and `summary` is that turn's own answer. Both are forwarded
         // verbatim and only together: the app refuses a brief whose token does not name an

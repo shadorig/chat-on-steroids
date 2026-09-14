@@ -286,7 +286,7 @@ beforeEach(async () => {
   vi.mocked(shell.openExternal).mockReset().mockResolvedValue(undefined);
   vi.mocked(app.getVersion).mockReset().mockReturnValue('0.0.0');
   resetSwarm();
-  resetBridgeForTests();
+  await resetBridgeForTests();
   resetWorkspaces();
   // The app opens the worker's chat itself; a command only exists while a page it opened
   // still has it to redeem.

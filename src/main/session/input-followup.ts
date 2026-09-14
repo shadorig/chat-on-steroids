@@ -3,7 +3,6 @@ import { isChatBlocked } from './blocked-chats.js';
 import { inFlightToolCalls } from '../mcp/call-context.js';
 import { getSession, readRecentEvents } from './store.js';
 import {
-  captureRecoveryProof,
   recoveryGrantSchema,
   validateRecoveryProof,
   type RecoveryGrant
@@ -65,17 +64,10 @@ export async function validateFollowupPermit(
     }
   }
   if (session.activeTurnId) return null;
-  // Completion or an explicitly classified Thinking failed after its browser inactivity grace can
-  // permit one checkpoint. Generic failures and idle pages cannot.
+  // Ordinary completion can mint its permit from durable lifecycle state. Recovery failures are
+  // different: their exact proof and listen deadline are assigned only by the bridge after the
+  // browser confirms the recovery refresh, so a bare failed turn must never mint Send authority.
   if (end?.kind !== 'turn_end' || !end.turnId || end.time < entry.createdAt) return null;
-  const thinkingFailed = end.outcome === 'failed' && end.reason === 'thinking_failed';
-  if (end.outcome !== 'completed' && !thinkingFailed) return null;
-  if (thinkingFailed && ((session.lastToolCallAt ?? 0) > end.time || inFlightToolCalls(session.conversationId) > 0)) return null;
-  if (thinkingFailed) {
-    if (!session.conversationId) return null;
-    const proof = await captureRecoveryProof({ sessionId: entry.sessionId, conversationId: session.conversationId,
-      turnId: end.turnId, kind: 'thinking-failed' });
-    return proof ? { kind: 'recovery', grant: { proof } } : null;
-  }
+  if (end.outcome !== 'completed') return null;
   return { kind: 'completed-turn', turnId: end.turnId };
 }

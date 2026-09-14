@@ -158,7 +158,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  resetBridgeForTests();
+  await resetBridgeForTests();
   resetRecorderForTests();
   writeDurableSoon('bridge-commands', null);
   await flushDurable();

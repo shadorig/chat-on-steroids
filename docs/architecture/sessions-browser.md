@@ -33,7 +33,7 @@ Large inline text budgets are rendering/transport decisions, not permission to l
 
 The recorder does not use “looks like the same chat” heuristics to attribute tools. Exact request correlation decides ownership; unresolved calls remain first-class Unattributed history.
 
-Browser-reported completion is also evidence, not infallible truth. If an exact same-request local call starts after a reported completed end, the recorder can reopen that turn in-process because the call proves the page's completion observation was premature. Display chronology must preserve that later correction instead of folding it away as old UI noise.
+Browser-reported completion is also evidence, not infallible truth. A durable `turn_end` is an **immutable observation in the append-only journal**, not a row that later evidence edits or deletes. If stronger exact evidence proves the same logical turn continued, the recorder appends `turn_start` for that same turn id with `source: 'app'`; a later terminal observation then appends the next `turn_end`. This A/start → A/end → A/app-reopen → A/end shape is used even when the first fresh evidence is already an exact native final. Shared chronology treats each same-id reopen as a new bounded segment so consumers never reorder the correction ahead of the terminal observation it supersedes.
 
 The provider-page signals themselves are documented in `docs/chatgpt-turn-signals.md`.
 
@@ -56,6 +56,8 @@ Provider account-usage observations from `extension/usage.js` are a different da
 ## One durable input owner
 
 `src/main/session/input.ts` is the outbox for user-authored messages and generated checkpoints. An input has a stable id and moves through explicit custody states such as queued, browser/tool-owned, sent, failed or cancelled.
+
+One authored input owns one conversational delivery and one receipt. The outbox does not silently append a deferred instruction to another input: model/reasoning selection, automation, objective, attachments and source-boundary semantics remain attached to the input that authored them. A later eligible boundary may deliver a later queued entry, but transport convenience never turns two authored intents into one receipt.
 
 The critical rule is:
 
@@ -128,13 +130,15 @@ Tab identity includes the Chrome tab/document plus navigation epoch. Navigation 
 
 ## Durable browser commands
 
-`src/main/bridge.ts` owns app-side commands such as opening a worker/revival/resume destination or stopping an exact turn. A command progresses through durable intent, one page lease, browser action, durable receipt and retirement.
+`src/main/browser-bridge/command-ledger.ts` owns durable app-side command and receipt custody. `src/main/browser-bridge/command-coordinator.ts` coordinates that ledger with process-local execution state such as deadlines and placement offers, including the narrow continuation/broker fences that span those concerns. `src/main/bridge.ts` adapts authenticated browser routes onto those owners. A command progresses through durable intent, one page lease, browser action, durable receipt and retirement.
 
 The lease is persisted **before** command text is handed to a page. That prevents an app restart or second tab from redeeming the same bootstrap as a fresh operation. The page's per-document client id is part of the lease; a second document is refused unless the specific operation is still at a safe pre-send takeover point.
 
 A command id is a correlation marker behind bridge authentication, not a credential. A stale marker whose command was cancelled, superseded or completed yields no text and no action.
 
 Receipts are durable answers to lost/ambiguous ACKs. A prior receipt is replayable only to the same document/conversation identity that completed the command. For cross-file transitions, the owning state is made durable before the command receipt is allowed to retire the transport; worker bootstrap retirement, for example, waits for the critical worker snapshot that explains the result.
+
+Continuation Send checkpoints are protocol actions, not independent booleans. Bridge protocol 17 uses exactly one source or destination action: `source-claim`, `source-arm`, `source-release`, `destination-claim`, `destination-arm` or `destination-release`. Destination actions are additionally paired with the exact command id and document/client owner. Missing ownership identity is rejected rather than coerced to an empty credential. An already-loaded older page that still emits checkpoint booleans is an explicit mixed-version case and is told that its document is outdated/reload-required instead of waiting for a generic command timeout.
 
 ## Browser Send acceptance
 
@@ -154,6 +158,8 @@ Recovery reasons have separate evidence and budgets—missing owned tabs, live-t
 - an attributed call is strong proof that the request-id join works, but it does not prove an assistant-error repair succeeded or that a page answer stream recovered;
 - a repair handout is not success until the browser confirms it; unconfirmed custody stays in the repair protocol instead of being silently counted as done;
 - old durable history alone does not grant a new recovery episode after process restart.
+
+For an exact provider failed-view observation, main-process recovery is represented by one discriminated `TurnActivityLease`: active work, failed view awaiting refresh, or failed view listening after a confirmed refresh. The browser reports evidence and performs the requested browser action; it does not own a second five-minute recovery state machine. A confirmed refresh is the transition that starts the listening lease. Fresh exact work replaces that failed-view lease with ordinary active work. Each semantic lease has an explicit process-local generation identity; scheduling timestamps may defer that same generation but never create new authority, and stale asynchronous work must match the current generation before publishing.
 
 Goal and compaction have their own bounded pickup schedules because they represent still-owed durable obligations. Those schedules are implementation policy; consult current `bridge.ts` rather than copying their numeric cadence into another authority.
 
@@ -179,7 +185,7 @@ The outbox and Goal ledger still own their own persistence. `recovery-arbitratio
 
 Cleanup and authority are deliberately separate. Stop/new-work paths withdraw stale recovery rows best-effort so state converges quickly, but final claim/Send authorization always revalidates the proof and fails closed. A transient cleanup write failure must not turn an already-durable Stop or provider observation into a false primary-operation failure.
 
-Provider `Thinking failed` has its own explicit settlement state in the extension: a short `ignore-late` phase, then a `listening` phase, then either terminal failure after the full grace or `resumed` ordinary stall tracking if fresh work appears. The explicit native failure signal outranks ChatGPT's transient interruption marker; an exact later native final outranks the provisional failure. Error discovery on the hot path is scoped to the active assistant turn plus global provider notices rather than rescanning historical turn DOM.
+Provider `Thinking failed` is a machine-coded native failed-view observation (`reason: 'thinking_failed'`). The content script closes that page-local generation immediately once the native failure is settled and keeps only a bounded post-terminal Fiber/request-id observation window. Recovery grace belongs to the main-process lease described above. The explicit native failure signal outranks ChatGPT's transient interruption marker; an exact later native final is stronger evidence and reopens the same durable turn before completing it. Error discovery on the hot path is scoped to the active assistant turn plus global provider notices rather than rescanning historical turn DOM. The generic ten-minute watchdog is separately coded as `no_visible_progress`; renderer behavior never depends on matching English provider prose for current events.
 
 The long silence window for Pro-class work is intentionally conservative. Local timing audits showed that tool/progress gaps are not themselves terminal evidence, including gaps inside one request/turn; the implementation therefore treats the window as a recovery scheduling bound only. The proof rules above, not the measured duration, grant continuation authority.
 

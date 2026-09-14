@@ -85,12 +85,6 @@ interface Hook {
   readDescriptor(raw: unknown): Descriptor | null;
   controlState(input: Record<string, unknown>): { mode: string; label: string; hint: string; action: string };
   stageView(input: Record<string, unknown>): StagePanelView | null;
-  nextThinkingFailureWatch(
-    watch: { observedAt: number; phase: string } | null,
-    now: number,
-    changedAt: number,
-    toolCount: number
-  ): { observedAt: number; phase: string } | null;
   /** The goal loop's half of the same panel, testable without a job in the way. */
   goalStageView(goal: Record<string, unknown> | null): StagePanelView | null;
   settingsView(input: Record<string, unknown>): {
@@ -251,8 +245,8 @@ async function harness(
         // The durable pre-Send fence. Most tests are not about it and get a permissive
         // default, but a test that answers one of these shapes itself is answering it on
         // purpose and wins.
-        const arming = message.sourceDispatch === true || message.destinationDispatch === true;
-        if (message.type === 'compact' && (arming || message.sourceAttempt === true || message.destinationAttempt === true)) {
+        const arming = message.action === 'source-arm' || message.action === 'destination-arm';
+        if (message.type === 'compact' && (arming || message.action === 'source-claim' || message.action === 'destination-claim')) {
           const own: any = await reply.get('compact')?.(message);
           const spoke =
             own &&
@@ -401,12 +395,8 @@ const startedCompactions = (harness: Harness): any[] =>
       !message.ticket &&
       !message.cancel &&
       !message.summary &&
-      !message.sourceAttempt &&
-      !message.sourceLost &&
-      !message.sourceDispatch &&
       !message.sourceMessageId &&
-      !message.destinationAttempt &&
-      !message.destinationDispatch &&
+      !message.action &&
       !message.destinationMessageId
   );
 
@@ -5325,6 +5315,23 @@ describe('where the page stream puts an event that was recorded late', () => {
     );
   });
 
+  it('matches desktop chronology when the same logical turn is corrected and reopened', async () => {
+    live = await harness();
+    const window = [
+      row(1, 100, 'turn_start', 'same-turn'),
+      row(2, 110, 'progress', 'same-turn'),
+      row(3, 120, 'turn_end', 'same-turn'),
+      row(4, 200, 'turn_start', 'same-turn'),
+      row(5, 210, 'progress', 'same-turn'),
+      row(6, 205, 'tool_call', 'same-turn'),
+      row(7, 230, 'turn_end', 'same-turn')
+    ];
+
+    const expected = chronological(window).map((entry) => entry.seq);
+    expect(expected).toEqual([1, 2, 3, 4, 6, 5, 7]);
+    expect(live.hook.chronological(window).map((entry) => entry.seq)).toEqual(expected);
+  });
+
   it('gives a delayed call back to the turn that made it after the next turn has opened', async () => {
     live = await harness();
     const groups = live.hook.streamTurnGroups(
@@ -6464,7 +6471,7 @@ describe('a stop button that goes missing while the turn is still running', () =
 
     expect(live.sent.some((message) => message.type === 'reload_owned_chat')).toBe(false);
     expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toContain(
-      'No visible progress for ten minutes. The turn is still marked as generating.'
+      'No visible progress for ten minutes. The app could not confirm that this turn finished.'
     );
     expect(emitted(live.sent, 'chat_error').at(-1)!.event.recoverable).toBe(true);
 
@@ -6660,7 +6667,7 @@ describe('a stop button that goes missing while the turn is still running', () =
     live.hook.observe();
     await settle();
     expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).not.toContain(
-      'No visible progress for ten minutes. The turn is still marked as generating.'
+      'No visible progress for ten minutes. The app could not confirm that this turn finished.'
     );
   });
 
@@ -6680,7 +6687,7 @@ describe('a stop button that goes missing while the turn is still running', () =
     live.hook.observe();
     await settle();
     expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toContain(
-      'No visible progress for ten minutes. The turn is still marked as generating.'
+      'No visible progress for ten minutes. The app could not confirm that this turn finished.'
     );
   });
 
@@ -6907,6 +6914,26 @@ describe('a content script reloaded into a turn already in flight', () => {
     await settle();
     await live.hook.flush();
     expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+  });
+
+  it('recognizes an unrecorded running turn after another conversation used this SPA document', async () => {
+    live = await harness('https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      { activity: () => activity({ activeTurnId: null, userAnchors: [] }) }, midTurn);
+    live.hook.observe(); await settle();
+    live.advance(live.hook.TURN_SETTLE_MS); live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+    const firstTurn = emitted(live.sent, 'turn_start')[0]!.event.turnId;
+    for (const node of live.document.querySelectorAll('[data-turn-id]')) node.remove();
+    live.dom.reconfigure({ url: 'https://chatgpt.com/c/bbbbbbbb-cccc-4ddd-8eee-ffffffffffff' });
+    live.hook.observe(); await live.hook.pullActivity(); await settle();
+    userTurn(live.document, 'other-user', 'A separate running task', { sent: false });
+    assistantTurn(live.document, 'other-assistant', ['Still working']);
+    startGenerating(live.document, { send: false });
+    live.hook.observe(); await settle();
+    live.advance(live.hook.TURN_SETTLE_MS); live.hook.observe(); await settle(); await live.hook.flush();
+    const starts = emitted(live.sent, 'turn_start');
+    expect(starts).toHaveLength(2);
+    expect(starts[1]!.event.turnId).not.toBe(firstTurn);
   });
 
   it.each([false, true])('does not reopen a completed native answer from a stale Stop control (new question: %s)', async newQuestion => {
@@ -7671,91 +7698,43 @@ describe('how a turn is recorded as having ended', () => {
     live.hook.observe(); await settle();
     return { section, button, id };
   }
-  it('records Thinking failed promptly but requires 30 seconds silence and then five full minutes', async () => {
+  it('closes Thinking failed immediately, once, without inventing a final answer', async () => {
     const { id } = await failedThinkingTurn();
-    expect(emitted(live!.sent, 'chat_error').map(row => row.event)).toContainEqual(
-      expect.objectContaining({ text: 'Thinking failed', turnId: id, recoverable: false }));
-    live!.advance(30_000); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(300_000 - 1); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(1); live!.hook.observe(); await settle();
     expect(emitted(live!.sent, 'turn_end').map(row => row.event)).toEqual([
       expect.objectContaining({ turnId: id, outcome: 'failed', reason: 'thinking_failed' })]);
-    live!.hook.observe(); await settle();
+    live!.advance(330_000); live!.hook.observe(); await settle();
     expect(emitted(live!.sent, 'turn_end')).toHaveLength(1);
     expect(emitted(live!.sent, 'assistant_message').some(row => row.event.final)).toBe(false);
   });
-  it('does not let a silence refresh ticket bypass the Thinking failed grace', async () => {
+  it.each(['tool_call', 'page_tool', 'progress', 'assistant_message'])('resumes the same failed turn on fresh %s even within 30 seconds', async kind => {
     const { id } = await failedThinkingTurn();
-    expect(await live!.runtimeMessage({ type: 'clf-desktop-input', id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
-      conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', recoveryTurnId: id })).toEqual({ ok: false });
-    expect(live!.sent.filter(row => row.type === 'desktop_input')).toEqual([]);
-  });
-  it.each(['tool_call', 'progress', 'assistant_message'])('returns Thinking failed to the ten-minute fallback on fresh %s, without counting replay', async kind => {
-    const { id } = await failedThinkingTurn();
-    live!.advance(240_000);
-    const entry = { seq: 51, time: Date.now(), kind, turnId: id, text: 'New model activity',
+    live!.advance(1000);
+    const entry = { seq: 51, time: live!.window.Date.now(), kind, turnId: id, text: 'New model activity',
       ...(kind === 'assistant_message' ? { messageId: 'interim', state: 'streaming' } : {}) };
     live!.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [entry], pendingTools: 0, activeTurnId: id } }));
     await live!.hook.pullActivity();
-    live!.advance(329_999);
-    await live!.hook.pullActivity(); // replay is not new model work
     live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(1); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(270_001); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.outcome).toBe('stalled');
+    expect(emitted(live!.sent, 'turn_start')).toHaveLength(1);
+    live!.advance(599_999); await live!.hook.pullActivity(); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end')).toHaveLength(1);
+    live!.advance(2); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_end').at(-1)?.event).toMatchObject({turnId: id, outcome: 'stalled'});
   });
-  it('keeps Thinking failed open while a local tool runs and returns to the ten-minute fallback', async () => {
+  it('adopts the exact app-reopened failed turn while MCP is running', async () => {
     const { id } = await failedThinkingTurn();
-    let pendingTools = 1;
-    live!.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [], pendingTools, activeTurnId: id } }));
+    live!.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [], pendingTools: 1, activeTurnId: id } }));
     await live!.hook.pullActivity();
     live!.advance(330_000); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    pendingTools = 0; await live!.hook.pullActivity();
-    live!.advance(329_999); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(1); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(270_001); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.outcome).toBe('stalled');
+    expect(emitted(live!.sent, 'turn_end')).toHaveLength(1);
   });
-  it.each(['tool_call', 'assistant_message'])('ignores delayed %s during the first fixed 30 seconds', async kind => {
-    const { id } = await failedThinkingTurn();
-    live!.advance(20_000);
-    const entry = { seq: 51, time: live!.window.Date.now(), kind, turnId: id, text: 'Delayed delivery',
-      ...(kind === 'assistant_message' ? { messageId: 'late-interim', state: 'streaming' } : {}) };
-    live!.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [entry], pendingTools: 0, activeTurnId: id } }));
-    await live!.hook.pullActivity();
-    live!.advance(309_999); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(1); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBe('thinking_failed');
-  });
-  it('restarts the failure grace after Stop returns, retaining a disappeared failure header', async () => {
-    const { button } = await failedThinkingTurn();
-    live!.advance(240_000); startGenerating(live!.document, { send: false });
-    live!.hook.observe(); await settle();
-    live!.advance(60_000); stopGenerating(live!.document);
-    live!.hook.observe(); await settle();
-    button.remove();
-    live!.advance(329_999); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    live!.advance(1); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBe('thinking_failed');
-  });
-  it('accepts a later exact native final during the failure grace as successful completion', async () => {
+  it('accepts a later exact native final after Thinking failed', async () => {
     const { section } = await failedThinkingTurn();
-    live!.advance(60_000);
+    live!.advance(1000);
     await bindFiberTurns([{ section, turn: { turnId: 'failed-thinking-page-turn', endMessageId: 'recovered-final',
       messages: [{ messageId: 'recovered-final', rawMessageId: 'recovered-final', stable: true,
         rawText: 'The answer completed.', renderedHtml: '<p>The answer completed.</p>' }] } }]);
     await live!.hook.refreshFiber(); await settle();
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event).toMatchObject({ outcome: 'completed' });
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBeUndefined();
+    expect(emitted(live!.sent, 'assistant_message').at(-1)?.event).toMatchObject({final: true});
   });
   it('lets an explicit Thinking failed header outrank the provider interruption marker', async () => {
     live = await harness();
@@ -7770,29 +7749,12 @@ describe('how a turn is recorded as having ended', () => {
     live.advance(330_000); live.hook.observe(); await settle();
     expect(emitted(live.sent, 'turn_end').at(-1)?.event).toMatchObject({ turnId: id, outcome: 'failed', reason: 'thinking_failed' });
   });
-  it('does not let the ten-minute watchdog preempt a late Thinking failed observation', async () => {
-    const { button } = await failedThinkingTurn();
-    // Return to an unknown quiet turn, then let the native failure appear after
-    // nine quiet minutes. It still receives the full 30s plus five-minute grace.
-    startGenerating(live!.document, { send: false });
-    button.remove(); live!.hook.observe(); await settle();
-    live!.advance(540_000);
-    const section = live!.document.querySelector('[data-turn-id="failed-thinking-page-turn"]') as HTMLElement;
-    thinkingFailed(section); stopGenerating(live!.document);
-    live!.hook.observe(); await settle();
-    live!.advance(329_999); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end')).toEqual([]);
-    expect(emitted(live!.sent, 'chat_error').some(row => row.event.recoverable === true)).toBe(false);
-    live!.advance(1); live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBe('thinking_failed');
-  });
-  it('does not grant failure queue authority when a user replaces the turn before grace expires', async () => {
-    await failedThinkingTurn();
+  it('keeps a new user turn separate from a failed turn', async () => {
+    const { id } = await failedThinkingTurn();
     live!.advance(1000); startGenerating(live!.document);
     assistantTurn(live!.document, 'next-response', []);
     live!.hook.observe(); await settle();
-    expect(emitted(live!.sent, 'turn_end').at(-1)?.event.reason).toBeUndefined();
-    live!.advance(300_000); live!.hook.observe(); await settle();
+    expect(emitted(live!.sent, 'turn_start').at(-1)?.event.turnId).not.toBe(id);
     expect(emitted(live!.sent, 'turn_end')).toHaveLength(1);
   });
   it.each(['historical', 'quoted', 'hidden', 'user', 'own-ui'])('does not let a %s Thinking failed header fail the live turn', async location => {
@@ -7813,7 +7775,7 @@ describe('how a turn is recorded as having ended', () => {
     stopGenerating(live.document); live.hook.observe(); await settle();
     live.advance(300_000); live.hook.observe(); await settle();
     expect(emitted(live.sent, 'turn_end')).toEqual([]);
-    if (location !== 'historical') expect(emitted(live.sent, 'chat_error')).toEqual([]);
+    expect(emitted(live.sent, 'chat_error')).toEqual([]);
   });
 
   it('does not turn ordinary assistant prose into an error because it quotes transport-failure wording', async () => {
@@ -10355,7 +10317,7 @@ describe('the Compact & resume control', () => {
     live = await harness(undefined, {
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
       compact: (message) =>
-        message.sourceLost
+        message.action === 'source-release'
           ? { ok: true, data: { aborted: true, job: null } }
           : {
               ok: true,
@@ -10374,9 +10336,9 @@ describe('the Compact & resume control', () => {
 
     const compacts = live.sent.filter((message) => message.type === 'compact');
     expect(compacts[0]).toMatchObject({ ticket: true, automatic: true });
-    expect(compacts).toContainEqual(expect.objectContaining({ token: 'tok-auto-page-error', sourceLost: true }));
+    expect(compacts).toContainEqual(expect.objectContaining({ token: 'tok-auto-page-error', action: 'source-release' }));
     expect(compacts.some((message) => message.cancel === true)).toBe(false);
-    expect(live.sent.some((message) => message.type === 'compact' && message.sourceAttempt === true)).toBe(false);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'source-claim')).toBe(false);
     expect(composerText(live.document)).toBe('draft that makes prompt insertion fail');
     expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('clear the message box');
   });
@@ -10435,11 +10397,11 @@ describe('the Compact & resume control', () => {
         }
       }),
       compact: (message) => {
-        if (message.sourceAttempt) {
+        if (message.action === 'source-claim') {
           return { ok: true, data: { allowed: true } };
         }
-        if (message.sourceDispatch) return { ok: true, data: { armed: true } };
-        if (message.sourceLost) return { ok: true, data: { aborted: true } };
+        if (message.action === 'source-arm') return { ok: true, data: { armed: true } };
+        if (message.action === 'source-release') return { ok: true, data: { aborted: true } };
         return {
           ok: true,
           data: {
@@ -10465,9 +10427,9 @@ describe('the Compact & resume control', () => {
 
     expect(startedCompactions(live)).toHaveLength(1);
     expect(live.sent.some((message) => message.type === 'compact' && message.cancel === true)).toBe(false);
-    expect(live.sent.some((message) => message.type === 'compact' && message.sourceLost === true)).toBe(true);
-    expect(live.sent.some((message) => message.type === 'compact' && message.sourceAttempt === true)).toBe(false);
-    expect(live.sent.some((message) => message.type === 'compact' && message.sourceDispatch === true)).toBe(false);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'source-release')).toBe(true);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'source-claim')).toBe(false);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'source-arm')).toBe(false);
     expect(composerText(live.document)).toBe(stale);
   });
 
@@ -10649,7 +10611,7 @@ describe('the Compact & resume control', () => {
     const compacts = live.sent.filter((message) => message.type === 'compact');
     expect(compacts.some((message) => message.cancel === true)).toBe(true);
     expect(startedCompactions(live)).toHaveLength(0);
-    expect(live.sent.some((message) => message.type === 'compact' && message.sourceDispatch === true)).toBe(false);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'source-arm')).toBe(false);
     expect(composerText(live.document)).not.toContain('Write the one handoff brief');
   });
 
@@ -10693,7 +10655,7 @@ describe('the Compact & resume control', () => {
     await settle();
 
     expect(startedCompactions(live)).toHaveLength(1);
-    expect(live.sent.some((message) => message.type === 'compact' && message.sourceAttempt === true)).toBe(true);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'source-claim')).toBe(true);
     expect((live.document.querySelector('.clf-composer') as HTMLElement).dataset.clfMode).toBe('busy');
 
     // The impatient second press. The sheet's action row is now a cancel, so it must not
@@ -10720,9 +10682,9 @@ describe('the Compact & resume control', () => {
     live = await harness(undefined, {
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
       compact: (message) =>
-        message.sourceAttempt
+        message.action === 'source-claim'
           ? { ok: true, data: { allowed: true } }
-          : message.sourceDispatch
+          : message.action === 'source-arm'
             ? { ok: false, error: 'source_send_reclaimed' }
             : {
                 ok: true,
@@ -10746,7 +10708,7 @@ describe('the Compact & resume control', () => {
     expect(live.sent).toContainEqual(expect.objectContaining({
       type: 'compact',
       token: 'tok-reclaimed',
-      sourceDispatch: true
+      action: 'source-arm'
     }));
     // Not a cancel: the transaction is alive and belongs to whoever armed it.
     expect(live.sent.some((message) => message.type === 'compact' && message.cancel === true)).toBe(false);
@@ -10757,11 +10719,11 @@ describe('the Compact & resume control', () => {
     live = await harness(undefined, {
       activity: () => ({ ok: true, data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null } }),
       compact: (message) => {
-        if (message.sourceAttempt) {
+        if (message.action === 'source-claim') {
           order.push('claim');
           return { ok: true, data: { allowed: true } };
         }
-        if (message.sourceDispatch) {
+        if (message.action === 'source-arm') {
           order.push('arm');
           return { ok: true, data: { armed: true } };
         }
@@ -11024,18 +10986,6 @@ describe('truthful quiet operation status', () => {
     live = await harness();
     expect(live.hook.stageView({ now: 10000, changedAt: 0, generating: true })).toMatchObject({ stage: 'Still waiting for the current operation to complete' });
     expect(live.hook.stageView({ now: 10000, changedAt: 0, generating: false })).toBeNull();
-  });
-  it('models Thinking failed as one explicit grace transition and explains the wait', async () => {
-    live = await harness();
-    const observedAt = 1000;
-    const initial = { observedAt, phase: 'ignore-late' };
-    expect(live.hook.nextThinkingFailureWatch(initial, observedAt + 29_999, observedAt, 0)).toBe(initial);
-    const listening = live.hook.nextThinkingFailureWatch(initial, observedAt + 30_000, observedAt, 0);
-    expect(listening).toEqual({ observedAt, phase: 'listening' });
-    expect(live.hook.nextThinkingFailureWatch(listening, observedAt + 30_001, observedAt + 30_000, 0))
-      .toEqual({ observedAt, phase: 'resumed' });
-    expect(live.hook.stageView({ thinkingFailure: listening, now: observedAt + 30_001, changedAt: observedAt + 30_001 }))
-      .toMatchObject({ stage: 'ChatGPT reported Thinking failed', detail: 'This response may still resume.' });
   });
 });
 
@@ -11346,7 +11296,7 @@ describe('the fresh chat the app opened', () => {
       live.sent.findIndex((message) => message.type === 'status')
     );
     expect(live.document.querySelector('#prompt-textarea')!.textContent).toContain('the long carried handoff');
-    expect(live.sent.some((message) => message.type === 'compact' && message.destinationAttempt === true)).toBe(true);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'destination-claim')).toBe(true);
 
     releaseStatus();
     await settle();
@@ -11391,7 +11341,7 @@ describe('the fresh chat the app opened', () => {
     expect(typeof redeems[0]!.client).toBe('string');
     expect(redeems[0]!.client).not.toBe('');
     expect(submitted).toContain('Handoff: h-1');
-    expect(live.sent.some((message) => message.type === 'compact' && message.destinationAttempt === true)).toBe(true);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'destination-claim')).toBe(true);
     // The id ChatGPT gave the chat is reported like a worker's. The marker still commits the
     // continuation when the page finds it; this ACK commits it when the page does not — on
     // 2026-09-02 a brief was sent and worked on and its marker never redeemed, and the
@@ -11489,7 +11439,7 @@ describe('the fresh chat the app opened', () => {
 
     expect(live.sent.filter((message) => message.type === 'redeem')).toHaveLength(1);
     expect(submitted).toContain('Handoff: h-project');
-    expect(live.sent.some((message) => message.type === 'compact' && message.destinationAttempt === true)).toBe(true);
+    expect(live.sent.some((message) => message.type === 'compact' && message.action === 'destination-claim')).toBe(true);
     // What proves the Project route was read is that the page can name the chat ChatGPT just
     // gave it, in the ACK that lets the app commit the continuation: with a `/c/` test of its
     // own, every message after the send still carried no conversation at all.
@@ -12603,7 +12553,7 @@ describe('the context meter and automatic compaction', () => {
 
     expect(stopped).not.toHaveBeenCalled();
     expect(startedCompactions(live)).toEqual([]);
-    expect(live.sent.some(message => message.type === 'compact' && message.sourceDispatch)).toBe(false);
+    expect(live.sent.some(message => message.type === 'compact' && message.action === 'source-arm')).toBe(false);
     expect(stop.isConnected).toBe(true);
   });
 
@@ -12655,11 +12605,11 @@ describe('the context meter and automatic compaction', () => {
     live = await harness(undefined, {
       activity: () => withContext(205_000, settings({ auto: true, threshold: 200_000 }), filed ? automaticTicket(sendState) : {}),
       compact: (message: Record<string, unknown>) => {
-        if (message.sourceAttempt) {
+        if (message.action === 'source-claim') {
           sendState = 'attempted-unresolved';
           return { ok: true, data: { allowed: true } };
         }
-        if (message.sourceDispatch) {
+        if (message.action === 'source-arm') {
           sendState = 'dispatched-unresolved';
           return { ok: true, data: { armed: true } };
         }
@@ -12695,7 +12645,7 @@ describe('the context meter and automatic compaction', () => {
     expect(live.sent).toContainEqual(expect.objectContaining({
       type: 'compact',
       token: 'tok-auto-1',
-      sourceAttempt: true
+      action: 'source-claim'
     }));
 
     // And not again: the ticket's durable send position is the one in-flight authority.
@@ -12722,11 +12672,11 @@ describe('the context meter and automatic compaction', () => {
         });
       },
       compact: (message: Record<string, unknown>) => {
-        if (message.sourceAttempt) {
+        if (message.action === 'source-claim') {
           sendState = 'attempted-unresolved';
           return { ok: true, data: { allowed: true } };
         }
-        if (message.sourceDispatch) {
+        if (message.action === 'source-arm') {
           sendState = 'dispatched-unresolved';
           return { ok: true, data: { armed: true } };
         }
@@ -12762,11 +12712,11 @@ describe('the context meter and automatic compaction', () => {
     live = await harness(undefined, {
       activity: () => withContext(50_000, settings({ auto: false }), manual()),
       compact: (message: Record<string, unknown>) => {
-        if (message.sourceAttempt) {
+        if (message.action === 'source-claim') {
           sendState = 'attempted-unresolved';
           return { ok: true, data: { allowed: true } };
         }
-        if (message.sourceDispatch) {
+        if (message.action === 'source-arm') {
           sendState = 'dispatched-unresolved';
           return { ok: true, data: { armed: true } };
         }
@@ -13710,9 +13660,9 @@ describe('the goal loop', () => {
           command: { id: commandId, type: 'resume', text: '[[CLF-RESUME:0123456789abcdef0123456789abcdef]]\n\nthe carried handoff', agent: null }
         }),
         compact: (message) =>
-          message.destinationAttempt
+          message.action === 'destination-claim'
             ? { ok: true, data: { allowed: true } }
-            : message.destinationDispatch
+            : message.action === 'destination-arm'
               ? { ok: true, data: { armed: true } }
               : message.destinationMessageId
               ? { ok: true, data: { committed: true, conversationId: CHAT, commandId } }
@@ -13790,13 +13740,13 @@ describe('the goal loop', () => {
           command: { id: commandId, type: 'resume', text: `[[CLF-RESUME:${token}]]\n\nthe carried handoff`, agent: null }
         }),
         compact: (message) => {
-          if (message.destinationAttempt) return { ok: true, data: { allowed: true } };
-          if (message.destinationDispatch) {
+          if (message.action === 'destination-claim') return { ok: true, data: { allowed: true } };
+          if (message.action === 'destination-arm') {
             // The user's Escape, between the app arming the click and the click itself.
             page!.querySelector('#prompt-textarea')!.textContent = '';
             return { ok: true, data: { armed: true } };
           }
-          if (message.destinationLost) return { ok: true, data: { released: true } };
+          if (message.action === 'destination-release') return { ok: true, data: { released: true } };
           return { ok: false, error: 'unexpected_compact_shape' };
         },
         ack: () => ({ ok: true }),
@@ -13812,7 +13762,7 @@ describe('the goal loop', () => {
 
     await settle(400);
 
-    expect(live.sent.filter((message) => message.type === 'compact' && message.destinationLost === true)).toEqual([
+    expect(live.sent.filter((message) => message.type === 'compact' && message.action === 'destination-release')).toEqual([
       expect.objectContaining({ token })
     ]);
     expect(live.sent.some((message) => message.type === 'ack')).toBe(false);
@@ -13836,9 +13786,9 @@ describe('the goal loop', () => {
           command: { id: commandId, type: 'resume', text: bootstrapText, agent: null }
         }),
         compact: (message) =>
-          message.destinationAttempt
+          message.action === 'destination-claim'
             ? { ok: true, data: { allowed: true } }
-            : message.destinationDispatch
+            : message.action === 'destination-arm'
               ? { ok: true, data: { armed: true } }
               : message.destinationMessageId
               ? { ok: true, data: { committed: true, conversationId: CHAT, commandId } }
@@ -16475,8 +16425,8 @@ describe('resume irreversible boundary audit', () => {
     live = await harness(`https://chatgpt.com/?clf=${commandId}`, {
       redeem: () => ({ ok: true, command: { id: commandId, type: 'resume', text: `[[CLF-RESUME:${token}]] handoff`, agent: null } }),
       compact: message => {
-        if (message.destinationAttempt) return { ok: true, data: { allowed: true } };
-        if (message.destinationDispatch) { page.querySelector('#prompt-textarea')!.textContent = 'UNRELATED USER DRAFT'; return { ok: true, data: { armed: true } }; }
+        if (message.action === 'destination-claim') return { ok: true, data: { allowed: true } };
+        if (message.action === 'destination-arm') { page.querySelector('#prompt-textarea')!.textContent = 'UNRELATED USER DRAFT'; return { ok: true, data: { armed: true } }; }
         return { ok: true, data: {} };
       }, ack: () => ({ ok: true })
     }, document => {
@@ -16506,7 +16456,7 @@ describe('resume irreversible boundary audit', () => {
     });
     await settle(200);
     expect(clicks).toBe(1);
-    expect(live.sent.filter(message => message.type === 'compact' && message.destinationLost)).toEqual([]);
+    expect(live.sent.filter(message => message.type === 'compact' && message.action === 'destination-release')).toEqual([]);
     live.dom.reconfigure({ url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
     userTurn(live.document, 'ambiguous-destination', 'provider response after the editor replacement', { sent: false });
     live.hook.observe(); await settle(200); await live.hook.flush();

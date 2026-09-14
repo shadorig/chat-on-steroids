@@ -26,7 +26,7 @@ import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import type { Capabilities, Root } from '../../shared/types.js';
+import { CAPABILITY_LABELS, WRITE_CAPABILITIES, type Capabilities, type Root } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
 import { logInfo, logWarn } from '../logger.js';
 import { toolSchema } from './tool-declarations.js';
@@ -328,27 +328,20 @@ function noteTransportIdentity(transportKey: string | null): void {
   );
 }
 
-/** Deliver bounded completed output after all other appendices have spent their text budget. */
-async function withBackgroundExecRecovery(
+/** Build bounded completed output after all earlier appendices have spent their text budget. */
+async function backgroundExecRecoveryAppendix(
   context: CallContext,
   result: ToolResult
-): Promise<ToolResult> {
+): Promise<ToolContent[]> {
   const { publication, caller } = context;
-  if (!publication || !caller.requestId || !caller.sessionId) return result;
+  if (!publication || !caller.requestId || !caller.sessionId) return [];
   const used = result.content.reduce((bytes, part) => bytes + (part.type === 'text' ? Buffer.byteLength(part.text, 'utf8') : 0), 0);
-    const budget = Math.min(12_000, DEFAULT_MAX_OUTPUT_TOKENS * 4 - used) - 64;
-  if (budget < 1_024) return result;
+  const budget = Math.min(12_000, DEFAULT_MAX_OUTPUT_TOKENS * 4 - used) - 64;
+  if (budget < 1_024) return [];
   const output = await offerBackgroundExecOutput(caller.sessionId, publication, budget);
   // The page is the priority. Running-terminal reminders can wait for a later response.
   const text = output ?? backgroundExecRecoveryNotices(caller.sessionId, publication).join('\n');
-  if (!text) return result;
-  return {
-    ...result,
-    content: [
-      ...result.content,
-      { type: 'text', text: `\n--- Background command results ---\n${text}` }
-    ]
-  };
+  return text ? [{ type: 'text', text: `\n--- Background command results ---\n${text}` }] : [];
 }
 
 /**
@@ -360,29 +353,22 @@ async function withBackgroundExecRecovery(
  * between a completed local operation, its unknown attribution, and an undelivered agent
  * message: none of those facts implies that completed work is about to disappear.
  */
-function withUnattributedNotice(
+function unattributedNoticeAppendix(
   conversationId: string | null | undefined,
-  result: ToolResult
-): ToolResult {
-  if (conversationId) return result;
+): ToolContent[] {
+  if (conversationId) return [];
   const eta = unattributedRepairEta();
-  if (eta === null) return result;
-  return {
-    ...result,
-    content: [
-      ...result.content,
-      {
-        type: 'text',
-        text:
-          '\n--- Identity notice ---\n' +
-          'This app could not tell which ChatGPT conversation made this call, so it is filed as ' +
-          `Unattributed. The next recovery check for eligible active chats is in about ${eta}s; ` +
-          'this does not identify this chat as a reload target. The result above still states what ran. ' +
-          'Do not repeat a successful mutation to repair attribution. A later exact request-id match can ' +
-          'reattach this recorded call. Retry a refused operation once, and preserve any undelivered report in the chat.'
-      }
-    ]
-  };
+  if (eta === null) return [];
+  return [{
+    type: 'text',
+    text:
+      '\n--- Identity notice ---\n' +
+      'This app could not tell which ChatGPT conversation made this call, so it is filed as ' +
+      `Unattributed. The next recovery check for eligible active chats is in about ${eta}s; ` +
+      'this does not identify this chat as a reload target. The result above still states what ran. ' +
+      'Do not repeat a successful mutation to repair attribution. A later exact request-id match can ' +
+      'reattach this recorded call. Retry a refused operation once, and preserve any undelivered report in the chat.'
+  }];
 }
 
 /**
@@ -396,12 +382,11 @@ function withUnattributedNotice(
  * Messages are *offered* here, not retired. They are retired when this agent calls
  * again, because that is the first real evidence this result reached ChatGPT.
  */
-function withInbox(
+function inboxAppendix(
   conversationId: string | null | undefined,
   agent: string | null,
-  result: ToolResult,
   onFinish = false
-): ToolResult {
+): ToolContent[] {
   // Conversation ownership is the durable authority. This matters most for a parked prime:
   // there is deliberately no live `agent:prime` while another history may be active, but its
   // exact conversation still owns final worker reports queued before parking. The finish flag
@@ -410,20 +395,14 @@ function withInbox(
   const scoped = offerMessagesForConversation(conversationId, onFinish, onFinish);
   const recipient = scoped?.agentId ?? agent;
   const messages = scoped?.messages ?? [];
-  if (messages.length === 0) return result;
+  if (messages.length === 0) return [];
   const lines = messages
     .map(
       (message) =>
         `• ${message.from}${message.offers > 1 ? ' (delivery retry)' : ''}: ${message.text}`
     )
     .join('\n');
-  return {
-    ...result,
-    content: [
-      ...result.content,
-      { type: 'text', text: `\n--- ${messages.length} message(s) for ${recipient ?? 'this conversation'} ---\n${lines}` }
-    ]
-  };
+  return [{ type: 'text', text: `\n--- ${messages.length} message(s) for ${recipient ?? 'this conversation'} ---\n${lines}` }];
 }
 
 /**
@@ -445,7 +424,8 @@ export async function dispatch(
   surface: SurfaceId,
   run: () => Promise<ToolResult>,
   parent?: CallContext,
-  roots: readonly Root[] = getConfig().roots
+  roots: readonly Root[] = getConfig().roots,
+  supplementalContext = false
 ): Promise<ToolResult> {
   // The context is built here, one layer out from where the work happens, because the
   // compaction barrier asks about the whole request and not just the handler. A call is
@@ -465,7 +445,7 @@ export async function dispatch(
   };
   try {
     const result = await trackMcpRequest(() =>
-      trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent, roots))
+      trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent, roots, supplementalContext))
     );
     // In-process callers have no socket; resolving their outer invocation publishes it.
     if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
@@ -499,7 +479,8 @@ async function dispatchTracked(
   surface: SurfaceId,
   run: () => Promise<ToolResult>,
   nested: boolean,
-  roots: readonly Root[]
+  roots: readonly Root[],
+  supplementalContext: boolean
 ): Promise<ToolResult> {
   noteTransportIdentity(transportKey);
   const markTiming = beginToolTiming();
@@ -820,10 +801,13 @@ async function dispatchTracked(
   // The Plugins handler owns validation/redaction of external results. A dispatcher refusal
   // never visited that owner and therefore needs its own single redaction pass.
   const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
-  let delivered = nested ? baseResult : withUnattributedNotice(
-    context.caller.conversationId,
-    withInbox(context.caller.conversationId, context.agent, baseResult, isFinish)
-  );
+  let supplementalContent: ToolContent[] = nested ? [] : [
+    ...inboxAppendix(context.caller.conversationId, context.agent, isFinish),
+    ...unattributedNoticeAppendix(context.caller.conversationId)
+  ];
+  let delivered: ToolResult = supplementalContent.length
+    ? { ...baseResult, content: [...baseResult.content, ...supplementalContent] }
+    : baseResult;
   // Ordinary tools carry direct user input, but only the explicit finish signal
   // advances a planned stage. Successful work is not evidence that a stage is done.
   const userInput = nested ? { messages: [], reminder: '' } : await offerToolInput(context.caller.sessionId, context.caller.conversationId, context.caller.requestId, startedAt, name === 'session_finish' && !result.isError).catch(() => {
@@ -837,17 +821,29 @@ async function dispatchTracked(
       for (const image of message.images) attachments.push({ type: 'image', mimeType: 'image/webp', data: image.dataUrl.slice(image.dataUrl.indexOf(',') + 1) });
     }
     if (userInput.reminder) attachments.push({ type: 'text', text: '\n\n' + userInput.reminder });
+    supplementalContent = [...supplementalContent, ...attachments];
     delivered = { ...delivered, content: [...delivered.content, ...attachments] };
   }
   if (!nested && handlerRan && !blockedChat && !supersededConversation && !compacting) {
-    delivered = await withBackgroundExecRecovery(context, delivered);
+    const background = await backgroundExecRecoveryAppendix(context, delivered);
+    if (background.length) {
+      supplementalContent = [...supplementalContent, ...background];
+      delivered = { ...delivered, content: [...delivered.content, ...background] };
+    }
   }
-  if (surface === 'plugins' && delivered.content.length > baseResult.content.length) {
+  if (surface === 'plugins' && supplementalContent.length > 0) {
     // All delivery projections above append to the immutable handler result. Only these
     // new app-authored blocks need redacting; traversing its large external payload again
     // wastes work and can make the recorded result differ from what the caller received.
-    const added = pluginManager.redactResult({ content: delivered.content.slice(baseResult.content.length) });
-    delivered = { ...delivered, content: [...baseResult.content, ...added.content as ToolResult['content']] };
+    const added = pluginManager.redactResult({ content: supplementalContent });
+    supplementalContent = added.content as ToolContent[];
+    delivered = { ...delivered, content: [...baseResult.content, ...supplementalContent] };
+  }
+  if (surface === 'core' && supplementalContext && delivered.structuredContent) {
+    const supplemental = supplementalContent
+      .filter((part): part is Extract<ToolContent, { type: 'text' }> => part.type === 'text')
+      .map(part => part.text).join('\n');
+    if (supplemental) delivered = { ...delivered, structuredContent: { ...delivered.structuredContent, delivery_context: supplemental } };
   }
   const recorderStartedAt = Date.now();
   // Event duration includes identity/handler/delivery work. Recorder and local HTTP finish
@@ -1012,6 +1008,8 @@ export interface SurfaceRegistrar {
       description: string;
       inputSchema: Schema;
       outputSchema?: z.ZodType;
+      /** Mirrors app-authored delivery addenda into `structuredContent.delivery_context`. */
+      supplementalContext?: boolean;
       annotations?: ToolAnnotations;
       /**
        * Opaque host metadata advertised verbatim in tools/list.
@@ -1063,33 +1061,46 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
       return dispatch(name, args, parent.caller.transportKey, parent.caller.requestId, surface, async () => {
         const entry = handlers.get(name);
         return entry ? entry.run(args) : fail('UNKNOWN_TOOL: this tool is not available on this connector.');
-      }, parent, ctx.roots);
+      }, parent, ctx.roots, false);
     },
     register(name, config, handler) {
       names.push(name);
       handlers.set(name, { description: config.description, run: async args => {
         const parsed = await config.inputSchema.safeParseAsync(args);
-        return parsed.success ? handler(parsed.data) : fail('INVALID_ARGUMENTS: arguments do not match this tool’s schema.');
+        if (parsed.success) return handler(parsed.data);
+        const details = parsed.error.issues.slice(0, 3).map(issue =>
+          `${issue.path.map(String).join('.').slice(0, 80) || 'arguments'}: ${issue.message.slice(0, 300)}`
+        ).join('; ');
+        return fail(`INVALID_ARGUMENTS: ${details}`);
       } });
-      observe?.(name, config);
+      if (config.supplementalContext === true && config.outputSchema && !(config.outputSchema instanceof z.ZodObject)) {
+        throw new Error(`${name}: supplementalContext requires an object output schema when outputSchema is declared`);
+      }
+      const outputSchema = config.outputSchema && config.supplementalContext === true
+        ? (config.outputSchema as z.ZodObject).extend({ delivery_context: z.string().optional().describe('App-authored delivery context mirrored from the text result.') })
+        : config.outputSchema;
+      const observed = { ...config, ...(outputSchema ? { outputSchema } : {}) };
+      observe?.(name, observed);
       // No identity field is ever added here. Every tool's schema is exactly what its
       // surface declared: who is calling is a fact about the conversation, established from
       // page evidence in `dispatch`, and never something the model is asked to carry.
+      const { supplementalContext: _supplementalContext, ...registeredConfig } = observed;
       server?.registerTool(name, {
-        ...config,
+        ...registeredConfig,
         inputSchema: toolSchema(config.inputSchema),
-        ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
+        ...(outputSchema ? { outputSchema: toolSchema(outputSchema) } : {})
       }, ((args: never, mcpCtx?: McpCallContext) =>
         dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
-          handler(args), undefined, ctx.roots
+          handler(args), undefined, ctx.roots, config.supplementalContext === true
         )) as never);
     },
     guarded(cap, name, fn) {
       return guard(name, async () => {
         if (!caps[cap]) {
           return fail(
-            `TOOL_DISABLED: ${name} is disabled by the current Chat On Steroids permissions. ` +
-              'Ask the user to enable the permission in the app, then retry. If the tool list in this conversation is stale, start a new chat.'
+            ctx.readOnly && WRITE_CAPABILITIES.includes(cap)
+              ? `TOOL_DISABLED: ${name} is disabled because Read-only mode is on. Ask the user to turn Read-only off in the app, then retry.`
+              : `TOOL_DISABLED: ${name} requires the "${CAPABILITY_LABELS[cap]}" permission. Ask the user to enable "${CAPABILITY_LABELS[cap]}" in the app, then retry.`
           );
         }
         return fn();

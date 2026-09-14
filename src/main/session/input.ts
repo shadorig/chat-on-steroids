@@ -3,8 +3,13 @@
  * Tool delivery repeats under a stable message id until a later request proves receipt.
  */
 import { z } from 'zod';
-import { browserInputModel, isFollowupInput, MAX_PROJECTED_IMAGE_COUNT, MAX_TOOL_INPUT_TEXT_BYTES, TOOL_INPUT_HEADER, type BrowserInputFailureReason, type InputImage } from '../../shared/input.js';
+import { browserInputModel, MAX_PROJECTED_IMAGE_COUNT, MAX_TOOL_INPUT_TEXT_BYTES, TOOL_INPUT_HEADER, type BrowserInputFailureReason, type InputImage } from '../../shared/input.js';
 import type { SessionSummary } from '../../shared/session.js';
+import {
+  automationSourceBoundaryEquals,
+  type AutomationSourceBoundary
+} from '../../shared/automation-source.js';
+import { isDeferredFollowup, isImmediateUserInput, orderInputs } from './input-policy.js';
 import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
@@ -50,7 +55,7 @@ export interface ToolInputBatch {
   /** One transport instruction after the complete batch, including its images. */
   reminder: string;
 }
-export interface InputActivity { possible: boolean; exact: boolean; model?: 'pro' | 'non-pro' | 'unknown' }
+export interface InputActivity { possible: boolean; exact: boolean; model?: 'pro' | 'non-pro' | 'unknown'; turnId?: string }
 type InputDeliveryHooks = {
   activity?: (session: SessionSummary) => InputActivity;
   wakeDecision?: (entry: Readonly<InputEntry>, signal: AbortSignal) => Promise<void>;
@@ -58,7 +63,9 @@ type InputDeliveryHooks = {
   recordDelivered?: (entry: Readonly<InputEntry>) => Promise<boolean>;
   prepareText?: (entry: Readonly<InputEntry>, limits: PromptLimits) => string | Promise<string>;
   queuedAfterTurn?: (entry: Readonly<InputEntry>) => Promise<void>;
-  applyAutomation: (conversationId: string, automation: NonNullable<InputArgs['automation']>, phase: 'before-send' | 'after-send', objective?: string) => Promise<void>;
+  pendingAutomationSource?: (conversationId: string, sessionId: string) => AutomationSourceBoundary | null | Promise<AutomationSourceBoundary | null>;
+  consumeAutomationObligation?: (conversationId: string, sessionId: string, source: AutomationSourceBoundary) => Promise<void>;
+  applyAutomation: (conversationId: string, automation: NonNullable<InputArgs['automation']>, phase: 'before-send' | 'after-send', objective?: string, loopTrigger?: InputArgs['loopTrigger']) => Promise<void>;
   changed: () => void;
 };
 type InputAuthorityHooks = {
@@ -72,10 +79,10 @@ export function configureInputDelivery(hooks: InputDeliveryHooks): void { delive
 /** The main composition root installs the complete authority set before IPC/browser work starts. */
 export function installInputAuthority(hooks: InputAuthorityHooks): void { authorityHooks = { ...hooks }; }
 /** One delivery policy for composer presentation, admission and the final send fence. */
-export async function sessionInputPolicy(sessionId: string, observedActivity?: InputActivity): Promise<{ queueAtFinish: boolean; canInject: boolean; directTurn: InputEntry['directTurn'] | null; browserAllowed: boolean; settled: boolean }> {
+export async function sessionInputPolicy(sessionId: string, observedActivity?: InputActivity): Promise<{ queueAtFinish: boolean; canInject: boolean; injectionTurnId: string | null; directTurn: InputEntry['directTurn'] | null; browserAllowed: boolean; settled: boolean }> {
   const [end] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
   const session = await getSession(sessionId);
-  if (!session?.conversationId || isChatBlocked(session.conversationId)) return { queueAtFinish: false, canInject: false, directTurn: null, browserAllowed: false, settled: false };
+  if (!session?.conversationId || isChatBlocked(session.conversationId)) return { queueAtFinish: false, canInject: false, injectionTurnId: null, directTurn: null, browserAllowed: false, settled: false };
   const activity = observedActivity ?? deliveryHooks?.activity?.(session) ?? { possible: !!session.activeTurnId, exact: !!session.activeTurnId };
   const stopped = session.finishTurn?.released === true;
   const selection = session.selectedModel?.conversationId === session.conversationId ? session.selectedModel : null;
@@ -89,12 +96,27 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
     (session.lastToolCallAt ?? -1) < end.time && inFlightToolCalls(session.conversationId) === 0
     ? { id: end.turnId, startedAt: end.time } : null;
   const canInject = !stopped && activity.exact && !directTurn;
+  const injectionTurnId = canInject ? session.activeTurnId ?? activity.turnId ?? null : null;
   const astra = session.origin?.kind !== 'worker' && session.origin?.kind !== 'helper' &&
     session.selectedModel?.conversationId === session.conversationId && isAstraModel(session.selectedModel.model, session.selectedModel.reasoningEffort);
   const terminal = end?.kind === 'turn_end' && !!end.turnId && end.outcome !== 'unknown';
-  return { canInject, directTurn, queueAtFinish: astra && canInject && getConfig().ui.finishTool === true,
-    browserAllowed: !session.activeTurnId && !activity.possible && !activity.exact && (!astra || terminal),
-    settled: terminal && (session.lastToolCallAt ?? 0) <= end.time };
+  const executing = inFlightToolCalls(session.conversationId) > 0;
+  const settled = terminal && ((end.outcome === 'completed' && !activity.possible && !activity.exact) ||
+    (end.outcome === 'failed' && end.reason === 'thinking_failed'));
+  return { canInject, injectionTurnId, directTurn, queueAtFinish: astra && canInject && getConfig().ui.finishTool === true,
+    browserAllowed: !session.activeTurnId && !activity.possible && !activity.exact && !executing && (!astra || terminal),
+    settled: settled && !executing && (session.lastToolCallAt ?? 0) <= end.time };
+}
+
+/** Freeze the exact automation boundary this explicit authored message is taking over. */
+async function authoredAutomationSource(sessionId: string, conversationId: string): Promise<AutomationSourceBoundary | null> {
+  const pending = await deliveryHooks?.pendingAutomationSource?.(conversationId, sessionId);
+  if (pending) return pending;
+  const session = await getSession(sessionId);
+  if (!session || session.conversationId !== conversationId) return null;
+  if (session.activeTurnId) return { kind: 'turn', turnId: session.activeTurnId };
+  const [boundary] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] });
+  return boundary?.kind === 'turn_end' && boundary.turnId ? { kind: 'turn', turnId: boundary.turnId } : null;
 }
 async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
   if (entry.attachmentDelivery === 'tool-image-projection') return false;
@@ -130,12 +152,14 @@ export function onInputChange(listener: () => void): () => void {
 /** Observation only: the kernel remains the sole tool-input consumer. */
 export function hasEligibleToolInput(sessionId: string, finishBoundary = false): Promise<boolean> {
   return serial(async () => {
-    const current = ordered(await load());
+    const current = orderInputs(await load());
     if (current.some(row => row.sessionId === sessionId && row.state === 'browser')) return false;
+    const head = current.find(row => row.sessionId === sessionId && isDeferredFollowup(row) && ['queued', 'tool'].includes(row.state));
     for (const row of current) {
       if (row.sessionId !== sessionId || row.dueAt > Date.now()) continue;
       if (row.attachments?.length && row.attachmentDelivery !== 'tool-image-projection') continue;
       if (row.mode === 'after-turn' || (row.mode === 'finish' && !finishBoundary)) continue;
+      if (row.mode === 'finish' && row !== head) continue;
       if (row.state === 'tool') return true;
       if (row.state === 'queued') return row.mode === 'auto' || (finishBoundary && row.mode === 'finish');
     }
@@ -154,9 +178,6 @@ const preparable = (row: InputEntry): boolean => row.state === 'queued' ||
 const needsHistory = (row: InputEntry): boolean => row.purpose !== 'decision' && !row.historyRecorded &&
   ((row.state === 'tool' && Number.isFinite(row.offeredAt)) || ((row.state === 'sent' || row.state === 'cancelled') && !!row.messageId));
 const pendingStages = (row: InputEntry): boolean => row.state === 'sent' && !!row.stages?.length && !row.stagesApplied;
-const ordered = (rows: InputEntry[]): InputEntry[] => [...rows].sort((a, b) =>
-  (a.queueOrder ?? a.dueAt) - (b.queueOrder ?? b.dueAt) || a.createdAt - b.createdAt);
-
 function serial<T>(work: () => Promise<T>): Promise<T> {
   const result = chain.then(work, work);
   chain = result.catch(() => undefined);
@@ -214,7 +235,8 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
       return { ...row, state: 'failed', error: 'Not sent: the browser did not pick up this message within 60 seconds.' };
     // Native preparation bounds include the 60s upload and 15s picker hydration.
     // Once Send is authorized, its 30s receipt + 15s fresh-route wait are the entire tail.
-    if (row.state === 'browser' && Date.now() - (row.sendAuthorizedAt ?? row.offeredAt ?? row.createdAt) >= (row.sendAuthorizedAt === undefined ? (row.attachments?.length ? 720_000 : row.images?.length ? 120_000 : 60_000) : 45_000))
+    if (row.state === 'browser' && Date.now() - (row.sendAuthorizedAt ?? row.offeredAt ?? row.createdAt) >= (row.sendAuthorizedAt === undefined ?
+      (row.attachments?.length ? 720_000 : row.images?.length ? 120_000 : 60_000) : 45_000))
       return { ...row, state: 'cancelled', error: row.requiresAuthorization && row.sendAuthorizedAt === undefined
         ? 'Not sent: browser preparation timed out. This attempt was cancelled.'
         : 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.' };
@@ -243,14 +265,14 @@ async function commit(next: InputEntry[]): Promise<void> {
 async function transition(current: InputEntry[], next: InputEntry[], automated: InputEntry[], phase: 'before-send' | 'after-send'): Promise<void> {
   if (automated.length) {
     if (!deliveryHooks) throw new Error('Input delivery is not ready');
-    const reserved = new Map(automated.map((entry) => [entry.id, entry]));
+    const reserved = new Map(automated.map(entry => [entry.id, next.find(row => row.id === entry.id) ?? entry] as const));
     await commit(current.map((entry): InputEntry => {
       const claimed = reserved.get(entry.id);
       return claimed ? { ...claimed, state: 'failed', error: phase === 'after-send'
         ? 'Message sent, but automation was not confirmed. Check its chat settings.'
         : 'Automation was not confirmed; this message was not sent. Send again to retry.' } : entry;
     }));
-    for (const entry of automated) await deliveryHooks.applyAutomation(entry.conversationId!, entry.automation!, phase, entry.objective);
+    for (const entry of automated) await deliveryHooks.applyAutomation(entry.conversationId!, entry.automation!, phase, entry.objective, entry.loopTrigger);
   }
   await commit(next);
 }
@@ -281,15 +303,15 @@ function authoredToolEnvelopeFits(text: string): boolean {
   return Buffer.byteLength(`${TOOL_INPUT_HEADER}${text}\n\n${instruction}`) <= MAX_TOOL_INPUT_TEXT_BYTES;
 }
 function append(current: InputEntry[], entry: InputEntry, stackDirect = false): InputEntry[] {
-  if (isFollowupInput(entry)) {
-    const positioned = current.filter(row => row.sessionId === entry.sessionId && isFollowupInput(row) && !terminal(row) && row.queueOrder !== undefined);
+  if (isDeferredFollowup(entry)) {
+    const positioned = current.filter(row => row.sessionId === entry.sessionId && isDeferredFollowup(row) && !terminal(row) && row.queueOrder !== undefined);
     if (positioned.length) entry = { ...entry, queueOrder: Math.max(...positioned.map(row => row.queueOrder!)) + 1 };
   }
   // Only ordinary browser sends occupy the global composer slot. Durable tool
   // intent can queue independently; actual handout still fences browser claims.
-  if (!stackDirect && entry.purpose !== 'decision' && !isFollowupInput(entry) && current.some(row => (row.transportIntent !== 'tool' || row.sessionId === entry.sessionId) && (row.sessionId === entry.sessionId || (!row.finishOwner && !entry.finishOwner)) && row.purpose !== 'decision' &&
+  if (!stackDirect && entry.purpose !== 'decision' && !isDeferredFollowup(entry) && current.some(row => (row.transportIntent !== 'tool' || row.sessionId === entry.sessionId) && (row.sessionId === entry.sessionId || (!row.finishOwner && !entry.finishOwner)) && row.purpose !== 'decision' &&
       !(!entry.finishOwner && row.finishOwner && row.state === 'tool') &&
-      (!isFollowupInput(row) || row.state === 'browser') && ['queued', 'browser', 'tool'].includes(row.state))) {
+      (!isDeferredFollowup(row) || row.state === 'browser') && ['queued', 'browser', 'tool'].includes(row.state))) {
     throw new Error('One message is already awaiting delivery. Cancel it before sending another.');
   }
   const active = current.filter((row) => !terminal(row) || needsHistory(row) || pendingStages(row));
@@ -336,9 +358,9 @@ async function prepareImageProjection(input: InputArgs, finishOwner?: InputEntry
     throw new Error('Inject up to four images into an active chat; otherwise use Send or After this turn');
   }
   const [policy, owner] = await Promise.all([sessionInputPolicy(input.sessionId), getSession(input.sessionId)]);
-  if (!policy.canInject || !owner?.activeTurnId || !owner.conversationId) throw new Error('Inject images into an active chat');
+  if (!policy.canInject || !policy.injectionTurnId || !owner?.conversationId) throw new Error('Inject images into an active chat');
   return {
-    owner: { conversationId: owner.conversationId, turnId: owner.activeTurnId },
+    owner: { conversationId: owner.conversationId, turnId: policy.injectionTurnId },
     images: await createToolImageProjections(input.attachments ?? [])
   };
 }
@@ -355,7 +377,7 @@ export async function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['fin
   enqueueFlights.set(input.id, { fingerprint, work });
   try {
     const result = await work;
-    if (result.sessionId && result.conversationId && isFollowupInput(result) && result.state === 'queued') {
+    if (result.sessionId && result.conversationId && isDeferredFollowup(result) && result.state === 'queued') {
       await deliveryHooks?.queuedAfterTurn?.(result).catch(error =>
         logWarn(`input: could not reconcile queued instruction with recovered continuation: ${String(error)}`));
     }
@@ -388,8 +410,8 @@ async function enqueueInputOnce(input: InputArgs, finishOwner?: InputEntry['fini
     if (input.attachmentDelivery === 'tool-image-projection') {
       if (preparedProjection && input.sessionId) {
         const owner = await getSession(input.sessionId);
-        if (!policy?.canInject || owner?.activeTurnId !== preparedProjection.owner.turnId ||
-            owner.conversationId !== preparedProjection.owner.conversationId) {
+        if (!policy?.canInject || policy.injectionTurnId !== preparedProjection.owner.turnId ||
+            owner?.conversationId !== preparedProjection.owner.conversationId) {
           throw new Error('The active chat changed while preparing images; send again');
         }
       }
@@ -426,11 +448,15 @@ async function enqueueInputOnce(input: InputArgs, finishOwner?: InputEntry['fini
       }
     }
     entry.conversationId = await target(entry);
+    if (!finishOwner && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId) {
+      const automationSource = await authoredAutomationSource(entry.sessionId, entry.conversationId);
+      if (automationSource) entry.automationSource = automationSource;
+    }
     if (finishOwner && !(await finishInputCurrent(entry))) throw new Error('The automatic follow-up no longer belongs to an active turn');
     if (imageOwner) {
       policy = await sessionInputPolicy(input.sessionId!);
       const owner = await getSession(input.sessionId!);
-      if (!policy.canInject || owner?.activeTurnId !== imageOwner.turnId || owner.conversationId !== imageOwner.conversationId || entry.conversationId !== imageOwner.conversationId)
+      if (!policy.canInject || policy.injectionTurnId !== imageOwner.turnId || owner?.conversationId !== imageOwner.conversationId || entry.conversationId !== imageOwner.conversationId)
         throw new Error('The active chat changed while preparing images; send again');
     }
     // User input supersedes only automatic work that has never been handed out.
@@ -477,7 +503,7 @@ export function listInputs(): Promise<InputEntry[]> {
     }
     if (next.length !== current.length || next.some((entry, index) => entry !== current[index])) await commit(next);
     await publishHistory();
-    return ordered(await load()).map((entry) => ({ ...entry }));
+    return orderInputs(await load()).map((entry) => ({ ...entry }));
   });
 }
 /** The outbox owns blob lifetime. IPC/staging must not reconstruct this state machine. */
@@ -499,7 +525,9 @@ async function publishHistory(): Promise<void> {
   const recorded = new Set<string>();
   for (const row of current) {
     if (!needsHistory(row)) continue;
-    try { if (deliveryHooks?.recordDelivered && await deliveryHooks.recordDelivered(row)) recorded.add(row.id); }
+    try { if (deliveryHooks?.recordDelivered && await deliveryHooks.recordDelivered(row)) {
+      recorded.add(row.id);
+    } }
     catch { /* delivered, retained, and still visible until canonical recording succeeds */ }
   }
   if (recorded.size) {
@@ -537,12 +565,14 @@ export function cancelInput(id: string): Promise<boolean> {
 export function reorderQueuedInputs(sessionId: string, ids: string[]): Promise<boolean> {
   return serial(async () => {
     const current = await load();
-    const queue = current.filter(row => row.sessionId === sessionId && isFollowupInput(row) && row.state === 'queued');
+    const queue = current.filter(row => row.sessionId === sessionId && isDeferredFollowup(row) && row.state === 'queued');
     // A stale snapshot must not move claimed input or omit newly queued work.
     if (!ids.length || ids.length !== queue.length || new Set(ids).size !== ids.length ||
         queue.some(row => !ids.includes(row.id))) return false;
     const positions = new Map(ids.map((id, index) => [id, index]));
-    await commit(current.map(row => positions.has(row.id) ? { ...row, queueOrder: positions.get(row.id)! } : row));
+    const recovery = queue.find(row => row.followupPermit?.kind === 'recovery')?.followupPermit;
+    await commit(current.map(row => positions.has(row.id) ? { ...row, queueOrder: positions.get(row.id)!,
+      ...(recovery ? { followupPermit: row.id === ids[0] ? recovery : undefined } : {}) } : row));
     return true;
   });
 }
@@ -563,7 +593,7 @@ export function editQueuedInput(id: string, text: string, afterTurn?: boolean): 
   return serial(async () => {
     const value = inputArgs.shape.text.parse(text);
     const current = await load();
-    const row = current.find(entry => entry.id === id && entry.state === 'queued' && isFollowupInput(entry));
+    const row = current.find(entry => entry.id === id && entry.state === 'queued' && isDeferredFollowup(entry));
     if (!row) return false;
     if (current.filter(entry => !terminal(entry)).reduce((sum, entry) => sum + Buffer.byteLength(entry === row ? value : entry.text), 0) > 1024000) throw new Error('Queued messages exceed the text limit');
     await commit(current.map(entry => entry === row ? { ...row, text: value, ...(afterTurn === undefined ? {} : { afterTurn }), deliveryText: undefined } : entry));
@@ -586,7 +616,8 @@ export function authorizeBrowserInput(id: string, owner: string, conversationId:
       } : entry));
       return false;
     }
-    await commit(current.map(entry => entry === row ? { ...row, sendAuthorizedAt: Date.now() } : entry));
+    const authorizedAt = Date.now();
+    await commit(current.map(entry => entry === row ? { ...entry, sendAuthorizedAt: authorizedAt } : entry));
     // Known destinations are bound before Send and normally require no authority write at all.
     // Only a fresh chat, whose conversation id does not exist until native Send succeeds, gets a
     // durable unresolved-send fence before the browser receives `true`.
@@ -617,9 +648,10 @@ export function authorizeBrowserInput(id: string, owner: string, conversationId:
 }
 /** The same outbox serialization owns mode changes and browser ACK. A late ACK
  * must observe Off; an ACK that won first is followed by the exact bound-chat Off. */
-export function setInputAutomation(id: string, automation: NonNullable<InputArgs['automation']>): Promise<boolean> {
+export function setInputAutomation(id: string, automation: NonNullable<InputArgs['automation']>, loopTrigger?: InputArgs['loopTrigger']): Promise<boolean> {
   return serial(async () => {
     const mode = z.enum(['off', 'goal', 'loop']).parse(automation);
+    const trigger = inputArgs.shape.loopTrigger.parse(loopTrigger);
     const current = await load();
     const entry = current.find(row => row.id === id && row.purpose !== 'decision' && ['queued', 'browser', 'sent', 'tool'].includes(row.state));
     if (!entry) return false;
@@ -627,13 +659,14 @@ export function setInputAutomation(id: string, automation: NonNullable<InputArgs
     if (conversationId && await conversationWasSuperseded(conversationId)) return false;
     const sessionId = entry.sessionId ?? entry.deliveredSessionId;
     if (sessionId && (await getSession(sessionId))?.conversationId !== conversationId) return false;
-    await commit(current.map(row => row === entry ? { ...row, automation: mode } : row));
+    await commit(current.map(row => row === entry ? { ...row, automation: mode,
+      ...(trigger === undefined ? {} : { loopTrigger: trigger }) } : row));
     if (conversationId && (mode === 'off' || entry.state !== 'queued')) {
       if (!deliveryHooks) throw new Error('Input delivery is not ready');
       // Mode changes preserve the chat's current objective. Only the delivery
       // transition transfers the opening text; an old outbox row must not overwrite
       // an objective the user edited after this message was delivered.
-      await deliveryHooks.applyAutomation(conversationId, mode, entry.state === 'sent' ? 'after-send' : 'before-send');
+      await deliveryHooks.applyAutomation(conversationId, mode, entry.state === 'sent' ? 'after-send' : 'before-send', undefined, trigger ?? entry.loopTrigger);
     }
     return true;
   });
@@ -652,7 +685,7 @@ export function noteInputStartupError(id: string, error: string | null): Promise
 function queuedAfterTurn(row: InputEntry, session: SessionSummary): boolean {
   const astra = session.selectedModel?.conversationId === session.conversationId &&
     isAstraModel(session.selectedModel.model, session.selectedModel.reasoningEffort);
-  return row.sessionId === session.id && isFollowupInput(row) && row.state === 'queued' && row.dueAt <= Date.now() &&
+  return row.sessionId === session.id && (isDeferredFollowup(row) || (isImmediateUserInput(row) && row.offeredAt === undefined)) && row.state === 'queued' && row.dueAt <= Date.now() &&
     (row.mode !== 'finish' || row.afterTurn === true || !astra);
 }
 export async function hasQueuedAfterTurnInput(sessionId: string): Promise<boolean> {
@@ -697,7 +730,9 @@ export function bindRecoveryToQueuedInput(input: {
     // One source turn may own at most one outbox row. If a queued row already names this turn,
     // update that exact row or block; never select a second row and duplicate the checkpoint.
     if (sameBoundary && !queuedAfterTurn(sameBoundary, session)) return { kind: 'blocked' };
-    const row = sameBoundary ?? ordered(current).find(row => queuedAfterTurn(row, session));
+    const candidates = orderInputs(current).filter(row => row.sessionId === input.sessionId && row.state === 'queued');
+    const row = sameBoundary ?? candidates.find(row => isImmediateUserInput(row) && row.offeredAt === undefined && row.dueAt <= Date.now()) ??
+      candidates.find(row => queuedAfterTurn(row, session));
     if (!row) return { kind: 'none' };
     const held = recoveryGrantFor(row);
     if (held?.proof.turnId === proof.turnId && held.proof.kind === proof.kind &&
@@ -741,14 +776,45 @@ export function revokeRecoveryInputs(sessionId: string): Promise<void> {
   });
 }
 
+/** The visible user outbox precedes automatic Goal work, including an ineligible queue head. */
+export function explicitInputPrecedence(sessionId: string, source?: AutomationSourceBoundary): Promise<'queued' | 'consumed' | null> {
+  return serial(async () => {
+    const rows = await load();
+    if (rows.some(row => row.sessionId === sessionId && row.purpose !== 'decision' &&
+      ['queued', 'browser', 'tool'].includes(row.state))) return 'queued';
+    if (!source) return null;
+    // Crash fence only. Normal successful delivery explicitly consumes Goal through its owner;
+    // this retained source identity prevents a two-file crash between the outbox receipt and that
+    // tombstone from resurrecting automatic work on restart.
+    const consumedByExplicitReceipt = rows.some(row => row.sessionId === sessionId && row.automationSource &&
+      automationSourceBoundaryEquals(row.automationSource, source) && row.deliveredAt !== undefined);
+    const consumedByFollowupPermit = source.kind === 'turn' && rows.some(row => row.sessionId === sessionId && row.followupPermit &&
+      followupPermitTurnId(row.followupPermit) === source.turnId &&
+      (row.sendAuthorizedAt !== undefined || row.deliveredAt !== undefined || row.requiresAuthorization === false));
+    return consumedByExplicitReceipt || consumedByFollowupPermit ? 'consumed' : null;
+  });
+}
+
+/** A native-only visible queue head needs the held answer to finish before it can send. */
+export function finishBoundaryHasBrowserInput(sessionId: string): Promise<boolean> {
+  return serial(async () => {
+    const head = orderInputs(await load()).find(row => row.sessionId === sessionId && row.purpose !== 'decision' &&
+      ['queued', 'browser', 'tool'].includes(row.state));
+    if (!head || head.state !== 'queued' || head.dueAt > Date.now() ||
+        !(head.mode === 'after-turn' || (head.attachments?.length && head.attachmentDelivery !== 'tool-image-projection'))) return false;
+    const session = await getSession(sessionId);
+    return !!session && queuedAfterTurn(head, session);
+  });
+}
+
 /** Metadata only. Text is disclosed to one document only after an exclusive durable claim. */
 async function claimableFollowupPermit(entry: InputEntry, current: InputEntry[]): Promise<FollowupPermit | null> {
-  if (!entry.sessionId || !isFollowupInput(entry)) return null;
+  if (!entry.sessionId || !isDeferredFollowup(entry)) return null;
   // Finish-only stages have no browser authority. They must not block a later
   // explicit After This Turn instruction from spending this completed turn.
   let first: InputEntry | undefined;
-  for (const row of ordered(current)) {
-    if (row.sessionId === entry.sessionId && isFollowupInput(row) && row.state === 'queued' && row.dueAt <= Date.now() && await browserInputAllowed(row)) { first = row; break; }
+  for (const row of orderInputs(current)) {
+    if (row.sessionId === entry.sessionId && isDeferredFollowup(row) && row.state === 'queued' && row.dueAt <= Date.now() && await browserInputAllowed(row)) { first = row; break; }
   }
   if (first?.id !== entry.id) return null;
   const permit = await validateFollowupPermit(entry, id => authorityHooks.recoveryAllowed?.(id) === true);
@@ -760,7 +826,7 @@ async function claimableFollowupPermit(entry: InputEntry, current: InputEntry[])
   if (current.some(row => row !== entry && row.sessionId === entry.sessionId && row.followupPermit &&
       followupPermitTurnId(row.followupPermit) === turnId)) return null;
   if (current.some(row => row.sessionId === entry.sessionId && row.state === 'tool')) return null;
-  if (current.some(row => row.sessionId === entry.sessionId && !isFollowupInput(row) && row.purpose !== 'decision' &&
+    if (current.some(row => row.sessionId === entry.sessionId && !isDeferredFollowup(row) && !isImmediateUserInput(row) && row.purpose !== 'decision' &&
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return permit;
 }
@@ -768,9 +834,9 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
   return serial(async () => {
     const result: Array<{ id: string; conversationId: string | null; recoveryTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
     const current = await load();
-    for (const entry of ordered(current)) {
+    for (const entry of orderInputs(current)) {
       if (!preparable(entry) || entry.dueAt > Date.now()) continue;
-      if (isFollowupInput(entry) && !(entry.state === 'browser' && entry.followupPermit) && !(await claimableFollowupPermit(entry, current))) continue;
+      if (isDeferredFollowup(entry) && !(entry.state === 'browser' && entry.followupPermit) && !(await claimableFollowupPermit(entry, current))) continue;
       if (!(await browserInputAllowed(entry))) continue;
       try {
         const conversationId = await target(entry);
@@ -790,18 +856,22 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     const current = await load();
     const entry = current.find((row) => row.id === id);
     if (!entry || !preparable(entry) || (entry.state === 'browser' && !requiresAuthorization) || entry.dueAt > Date.now() || !owner) return null;
-    const followupPermit = isFollowupInput(entry) ? entry.state === 'browser' ? entry.followupPermit : await claimableFollowupPermit(entry, current) : undefined;
-    if (isFollowupInput(entry) && !followupPermit) return null;
+    const followupPermit = entry.state === 'browser' ? entry.followupPermit : isDeferredFollowup(entry)
+      ? await claimableFollowupPermit(entry, current)
+      : isImmediateUserInput(entry) && entry.sessionId
+        ? await validateFollowupPermit(entry, conversationId => authorityHooks.recoveryAllowed?.(conversationId) === true)
+        : undefined;
+    if (isDeferredFollowup(entry) && !followupPermit) return null;
     if (await target(entry) !== conversationId) return null;
     if (!(await browserInputAllowed(entry))) return null;
     if (entry.purpose === 'decision' && !decisionWaiters.has(id)) return null;
     if (entry.projectId) await resolveAvailableProjectDirectory(entry.projectId);
     if (entry.sessionId) {
       if (current.some((row) => row.id !== id && row.sessionId === entry.sessionId && ['browser', 'tool'].includes(row.state))) return null;
-      const first = ordered(current).find((row) => row.sessionId === entry.sessionId && row.state === 'queued' && isFollowupInput(row) === isFollowupInput(entry) && row.dueAt <= Date.now());
+      const first = orderInputs(current).find((row) => row.sessionId === entry.sessionId && row.state === 'queued' && isDeferredFollowup(row) === isDeferredFollowup(entry) && row.dueAt <= Date.now());
       // Follow-ups were already elected by claimableFollowupPermit with live
       // transport eligibility. Direct messages retain their separate FIFO.
-      if (entry.state === 'queued' && !isFollowupInput(entry) && first !== entry) return null;
+      if (entry.state === 'queued' && !isDeferredFollowup(entry) && first !== entry) return null;
     }
     // The completion appendix is mandatory text too: budget it before optional AGENTS.md,
     // then freeze the complete message once. A repeated claim keeps those exact bytes.
@@ -814,9 +884,12 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
       ? finishInstruction(settings.finishLeadMinutes) : '';
     const suffix = instruction && !entry.text.includes(instruction) ? '\n\n' + instruction : '';
     let claimed: InputEntry;
-    try { claimed = await prepare({ ...entry, ...(followupPermit ? { followupPermit } : {}),
-      ...(entry.transportIntent === 'tool' ? { transportIntent: 'browser' } : {}),
-      state: 'browser', owner, conversationId, offeredAt: entry.offeredAt ?? Date.now(), requiresAuthorization }, suffix); }
+    try {
+      claimed = await prepare({ ...entry,
+        ...(followupPermit ? { followupPermit } : {}),
+        ...(entry.transportIntent === 'tool' ? { transportIntent: 'browser' } : {}), state: 'browser', owner,
+        conversationId, offeredAt: entry.offeredAt ?? Date.now(), requiresAuthorization }, suffix);
+    }
     catch (error) {
       // A never-handed-out oversized legacy row needs a visible terminal result,
       // not an endless series of browser claims. Existing claims keep their receipt.
@@ -902,6 +975,16 @@ export function acknowledgeBrowserInput(id: string, owner: string, conversationI
       ...(messageId ? { messageId } : {}), deliveredAt: Date.now() };
     await transition(current, current.map((row) => row === entry ? acknowledged : row),
       entry.state !== 'cancelled' && !entry.sessionId && entry.automation && deliveredConversation && entry.purpose !== 'decision' ? [acknowledged] : [], 'after-send');
+    if (acknowledged.purpose !== 'decision' && deliveredConversation && acknowledged.deliveredSessionId && acknowledged.automationSource) {
+      try {
+        await deliveryHooks?.consumeAutomationObligation?.(deliveredConversation, acknowledged.deliveredSessionId, acknowledged.automationSource);
+      } catch (error) {
+        // Delivery is already durable and may already have reached ChatGPT. The outbox row keeps
+        // the exact source as a crash fence, so a secondary Goal tombstone failure must not turn
+        // a proven input receipt into an ambiguous browser send.
+        logWarn(`input ${id}: could not durably consume the superseded automatic reply — ${String(error)}`);
+      }
+    }
     logInfo(`input ${id}: browser acknowledged after ${Math.max(0, Date.now() - entry.createdAt)} ms`);
     await publishHistory();
     return true;
@@ -921,8 +1004,17 @@ export function acknowledgeToolInput(sessionId: string | null | undefined, conve
     if ((await getSession(sessionId))?.conversationId !== conversationId) return;
     const current = await load();
     const next = current.map(entry => toolInputReceipt(entry, sessionId, conversationId, startedAt));
-    if (!next.some((entry, index) => entry !== current[index])) return;
+    const receipts = next.filter((entry, index) => entry !== current[index] && entry.state === 'sent');
+    if (!receipts.length) return;
     await commit(next);
+    for (const entry of receipts) {
+      if (!entry.automationSource) continue;
+      try {
+        await deliveryHooks?.consumeAutomationObligation?.(conversationId, sessionId, entry.automationSource);
+      } catch (error) {
+        logWarn(`input ${entry.id}: could not durably consume the superseded automatic reply — ${String(error)}`);
+      }
+    }
     for (const entry of next) if (terminal(entry)) offered.delete(entry.id);
     await publishHistory();
   });
@@ -943,6 +1035,8 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
     const current = await load();
     // A claimed browser send owns this session until its send outcome is known.
     if (current.some((entry) => entry.sessionId === sessionId && entry.state === 'browser')) return batch;
+    const head = orderInputs(current).find(row => row.sessionId === sessionId && isDeferredFollowup(row) &&
+      ['queued', 'tool'].includes(row.state) && !terminal(toolInputReceipt(row, sessionId, conversationId, startedAt)));
     const delivered: string[] = [];
     let inputTaken = false;
     let payloadBytes = Buffer.byteLength(TOOL_INPUT_HEADER);
@@ -958,6 +1052,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
       if (received !== entry) return received;
       if (payloadFull || (inputTaken && (entry.mode === 'finish' || entry.finishOwner)) || (entry.finishOwner && entry.createdAt >= startedAt)) return entry;
       if (entry.mode === 'finish' && !finishBoundary) return entry;
+      if (entry.mode === 'finish' && entry !== head) return entry;
       // After-turn tasks own a future browser turn; they cannot block an explicit
       // Current-turn message from the next tool response. Their own FIFO is unchanged.
       if ((entry.state === 'queued' && (entry.mode === 'finish' || entry.mode === 'auto')) || entry.state === 'tool') {
@@ -981,7 +1076,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
       return entry;
     };
     const next: InputEntry[] = [];
-    for (const entry of ordered(current).sort((a, b) => Number(a.mode === 'finish' || !!a.finishOwner) - Number(b.mode === 'finish' || !!b.finishOwner))) next.push(await prepareEntry(entry));
+    for (const entry of orderInputs(current).sort((a, b) => Number(a.mode === 'finish' || !!a.finishOwner) - Number(b.mode === 'finish' || !!b.finishOwner))) next.push(await prepareEntry(entry));
     if (next.some((entry, index) => entry !== current[index])) {
       const automated = next.filter((entry) => entry.state === 'tool' && entry.automation && current.some((row) => row.id === entry.id && row.state === 'queued'));
       await transition(current, next, automated, 'before-send');

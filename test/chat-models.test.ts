@@ -1,4 +1,5 @@
 import { REASONING_EFFORTS } from '../src/shared/session.js';
+import { chatModelSelection } from '../src/shared/chat-models.js';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { getChatModels, requestChatModels, pendingChatModelRequest, observeChatModels, resetChatModelsForTests, configureChatModelDiscovery, startChatModelDiscovery, restoreChatModels } from '../src/main/chat-models.js';
 const saved = vi.hoisted(() => ({ value: null as unknown }));
@@ -7,6 +8,14 @@ const models = [{ id: 'gpt-example', label: 'GPT Example', efforts: ['none', 'me
 beforeEach(() => { resetChatModelsForTests(); saved.value = null; vi.useFakeTimers(); });
 afterEach(() => vi.useRealTimers());
 describe('durable observed ChatGPT model catalog', () => {
+  it('rejects blank or padded persisted model names instead of normalizing malformed authority', () => {
+    expect(chatModelSelection({ model: ' ', reasoningEffort: null })).toBeNull();
+    expect(chatModelSelection({ model: ' GPT-5.6 Sol ', reasoningEffort: 'high' })).toBeNull();
+    expect(chatModelSelection({ model: 'GPT-5.6 Sol', reasoningEffort: 'future' })).toBeNull();
+    expect(chatModelSelection({ model: 'GPT-5.6 Sol', reasoningEffort: 'high' })).toEqual({
+      model: 'GPT-5.6 Sol', reasoningEffort: 'high'
+    });
+  });
   it('restores successful choices after restart without restoring browser opening authority', async () => {
     requestChatModels(); observeChatModels({ nonce: pendingChatModelRequest()!.nonce, models });
     resetChatModelsForTests(); await restoreChatModels();

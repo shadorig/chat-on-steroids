@@ -29,6 +29,7 @@ import type {
   TurnOutcome
 } from '../../shared/session.js';
 import { estimateTokens, originTitle } from '../../shared/session.js';
+import type { AutomationSourceBoundary } from '../../shared/automation-source.js';
 import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { redactCredentialText } from '../redaction.js';
@@ -48,6 +49,7 @@ import {
   findSessionByConversation,
   getSession,
   readAsset,
+  readCanonicalAssistantMessage,
   readEvents,
   readRecentEvents,
   indexedSessions,
@@ -67,6 +69,7 @@ import {
 } from './correlation.js';
 import { resumeOpeningChat } from './resume-gate.js';
 import { summarizeToolCall } from './summarize.js';
+import { projectTurnEnd, projectTurnReopen, projectTurnStart } from './turn-lifecycle.js';
 
 interface LiveConversation {
   conversationId: string;
@@ -1396,21 +1399,31 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       ...(input.endsActivity === true ? { endsActivity: true as const } : {})
     };
 
-    await appendEvent(sessionId, {
-      time: input.startedAt,
-      source: 'mcp',
-      kind: 'tool_call',
-      call,
-      ...(eventAgent ? { agent: eventAgent } : {}),
-      ...(target.turnId ? { turnId: target.turnId } : {})
+    // Correct the immutable lifecycle boundary before filing the evidence that disproves it.
+    // Keeping the journal causal here means every consumer sees the same story directly:
+    // failed end -> app-authored same-turn reopen -> fresh exact work. Chronology/presentation
+    // code must never have to move a tool call across the corrective boundary after the fact.
+    const reopenedTurnId = await serializeObservations(target.conversationId ?? sessionId, async () => {
+      const reopened = await reopenFalselyEndedTurn(
+        sessionId,
+        target.conversationId,
+        input.requestId ?? null,
+        input.startedAt,
+        eventAgent
+      );
+      // The correction and the exact evidence that proves it are one journal-publication
+      // transaction. Releasing the conversation lock between these appends lets a browser
+      // terminal land in the middle and recreate the impossible story we are correcting.
+      await appendEvent(sessionId, {
+        time: input.startedAt,
+        source: 'mcp',
+        kind: 'tool_call',
+        call,
+        ...(eventAgent ? { agent: eventAgent } : {}),
+        ...(target.turnId ?? reopened ? { turnId: (target.turnId ?? reopened)! } : {})
+      });
+      return reopened;
     });
-    const reopenedTurnId = await reopenFalselyEndedTurn(
-      sessionId,
-      target.conversationId,
-      input.requestId ?? null,
-      input.startedAt,
-      eventAgent
-    );
     notifyChanged();
     try {
       const filed = await getSession(sessionId);
@@ -1438,6 +1451,19 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
     logWarn(`session recorder could not store a tool call: ${(err as Error).message}`);
     return null;
   }
+}
+
+/** A fresh exact observation can disprove a failed view, including after reload/restart. */
+async function reopenThinkingFailure(sessionId: string, live: LiveConversation | undefined, at: number,
+  owner?: string): Promise<string | null> {
+  if (!live || live.turnId) return null;
+  const [boundary] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] });
+  if (live.turnId || boundary?.kind !== 'turn_end' || boundary.reason !== 'thinking_failed' ||
+      !boundary.turnId || (owner && boundary.turnId !== owner) || at <= boundary.time) return null;
+  await appendEvent(sessionId, { source: 'app', time: at, kind: 'turn_start', turnId: boundary.turnId,
+    detail: 'fresh work resumed the same turn after its native view failed' });
+  projectTurnReopen(live, boundary.turnId, live.lastTurnStartedAt ?? at);
+  return boundary.turnId;
 }
 
 /**
@@ -1469,6 +1495,11 @@ async function reopenFalselyEndedTurn(
   if (!conversationId || !requestId) return null;
   const live = conversations.get(conversationId);
   if (!live || live.sessionId !== sessionId) return null;
+  const failed = await reopenThinkingFailure(sessionId, live, startedAt);
+  if (failed) {
+    live.turnRequestIds.add(requestId);
+    return failed;
+  }
   if (live.turnStartedAt !== null) {
     live.turnRequestIds.add(requestId);
     return null;
@@ -1491,13 +1522,7 @@ async function reopenFalselyEndedTurn(
     detail: 'the same ChatGPT request kept calling tools after the page reported this turn completed',
     ...(agent ? { agent } : {})
   });
-  live.endedTurn = null;
-  live.knownTurnEnds.delete(ended.turnId);
-  live.openTurns.add(ended.turnId);
-  live.turnId = ended.turnId;
-  live.turnStartedAt = ended.startedAt ?? startedAt;
-  live.lastTurnOutcome = null;
-  live.turnRequestIds = new Set(ended.requestIds);
+  projectTurnReopen(live, ended.turnId, ended.startedAt ?? startedAt, ended.requestIds);
   logInfo(
     `session ${sessionId} reopened turn ${ended.turnId} — request ${requestId} kept calling tools after the page reported it completed`
   );
@@ -1661,8 +1686,8 @@ export interface ChatObservation {
   /** Internal React conversation id used only to cross-check the URL conversation id. */
   fiberConversationId?: string;
   outcome?: TurnOutcome;
-  /** Native Thinking failed after 30s ignoring delayed activity, then 5m listening. */
-  reason?: 'thinking_failed';
+  /** Provider/app machine reason. Recovery timing belongs to the main-process recovery lease. */
+  reason?: 'thinking_failed' | 'no_visible_progress';
   detail?: string;
   /** Browser terminal proof; app-owned Goal policy is applied only after this is durable. */
   goalEligible?: boolean;
@@ -1793,7 +1818,7 @@ export function recordChatObservations(
   sessionId: string | null;
   stored: number;
   activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string };
-  goalCandidates: Array<{ replyId: string; turnId: string; eventSeq: number }>;
+  goalCandidates: Array<{ replyId: string; turnId: string; source: AutomationSourceBoundary; eventSeq: number }>;
 }> {
   const hasEvidence = observations.some((item) => item.kind === 'tool_evidence');
   const ownership = hasEvidence ? recordObservationEvidence(conversationId, observations) : null;
@@ -1801,11 +1826,16 @@ export function recordChatObservations(
   // work below rethrows it to the journal owner, which retains the batch for its normal retry.
   void ownership?.catch(() => undefined);
   const transcript = hasEvidence ? observations.filter((item) => item.kind !== 'tool_evidence') : observations;
-  const prior = observationChains.get(conversationId) ?? Promise.resolve();
-  const work = prior.then(async () => {
+  return serializeObservations(conversationId, async () => {
     await ownership;
     return recordChatObservationsNow(conversationId, transcript, agent);
   });
+}
+
+/** Transcript and MCP lifecycle changes share the same per-conversation publication order. */
+function serializeObservations<T>(conversationId: string, action: () => Promise<T>): Promise<T> {
+  const prior = observationChains.get(conversationId) ?? Promise.resolve();
+  const work = prior.then(action);
   const tracked = work.then(
     () => undefined,
     () => undefined
@@ -1897,7 +1927,7 @@ async function recordChatObservationsNow(
   sessionId: string | null;
   stored: number;
   activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string };
-  goalCandidates: Array<{ replyId: string; turnId: string; eventSeq: number }>;
+  goalCandidates: Array<{ replyId: string; turnId: string; source: AutomationSourceBoundary; eventSeq: number }>;
 }> {
   const activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string } = { meaningful: false, working: false, terminal: false };
   if (!recordingEnabled()) return { sessionId: null, stored: 0, activity, goalCandidates: [] };
@@ -1933,7 +1963,7 @@ async function recordChatObservationsNow(
   const live = conversations.get(conversationId);
   let stored = 0;
   let recoveredGoalSeen = false;
-  const goalCandidates: Array<{ replyId: string; turnId: string; eventSeq: number }> = [];
+  const goalCandidates: Array<{ replyId: string; turnId: string; source: AutomationSourceBoundary; eventSeq: number }> = [];
   // Reload can lose or replace the page's turn id. The canonical message store keeps
   // the first exact owner of that stable assistant message through every revision.
   // Decide recovery from its committed result, never the replacement page's hint.
@@ -2005,6 +2035,26 @@ async function recordChatObservationsNow(
           uncertainTurnStartedAt !== null &&
           item.time >= uncertainTurnStartedAt;
         const goalEligible = item.goalEligible === true || recoveredGoalEligible;
+        const previousAssistant = await readCanonicalAssistantMessage(sessionId, {
+          messageId: item.messageId,
+          ...(item.providerMessageId ? { providerMessageId: item.providerMessageId } : {})
+        });
+        const candidateTurn = item.turnId ?? previousAssistant?.turnId ?? null;
+        const [boundaryBeforeEvidence] = candidateTurn && !live?.turnId
+          ? await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] }) : [];
+        const contentWillChange = !previousAssistant || previousAssistant.text !== (item.text ?? '') ||
+          previousAssistant.state !== state || previousAssistant.final !== (state === 'final');
+        const canReopenFailedView = contentWillChange && candidateTurn && live && !live.turnId &&
+          boundaryBeforeEvidence?.kind === 'turn_end' && boundaryBeforeEvidence.reason === 'thinking_failed' &&
+          boundaryBeforeEvidence.turnId === candidateTurn && item.time > boundaryBeforeEvidence.time;
+        // The correction belongs before the evidence that proves it. A native final is exact only
+        // when it carries the provider message identity; an interim is work only while the page
+        // reports it as active. Old transcript hydration therefore cannot reopen a failed turn.
+        const reopenedBeforeEvidence = canReopenFailedView &&
+          ((state === 'final' && !!item.providerMessageId && runningToolCalls(conversationId) === 0) ||
+            (state !== 'final' && item.activeNow === true))
+          ? await reopenThinkingFailure(sessionId, live, item.time, candidateTurn)
+          : null;
         const written = await upsertMessageEvent(sessionId, {
           ...base,
           kind: 'assistant_message',
@@ -2025,13 +2075,13 @@ async function recordChatObservationsNow(
         // DOM after restart cannot renew work, nor can an old message borrow a
         // newer page turn. Preserve the revision while using its canonical owner
         // and the recorder's terminal boundary to decide activity.
-        const [uncertainEnd] = state !== 'final' && item.activeNow === true && canonicalTurn && !live?.turnId
-          ? await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] }) : [];
+        const uncertainEnd = reopenedBeforeEvidence ? boundaryBeforeEvidence : canonicalTurn && !live?.turnId
+          ? (await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] }))[0] : undefined;
         // A fresh exact interim can resume an uncertain failure without inventing
         // a new user turn. Old messages and explicit completed/stopped turns cannot.
         const resumedUncertainTurn = uncertainEnd?.kind === 'turn_end' && uncertainEnd.turnId === canonicalTurn &&
           uncertainEnd.outcome !== 'completed' && uncertainEnd.outcome !== 'stopped' && item.time > uncertainEnd.time;
-        const workingActivity = state !== 'final' && item.activeNow === true &&
+        const workingActivity = written.contentChanged && state !== 'final' && item.activeNow === true &&
           (!canonicalTurn || canonicalTurn === live?.turnId || resumedUncertainTurn) &&
           !(live?.turnStartedAt === null && (live.lastTurnOutcome === 'stopped' || live.lastTurnOutcome === 'completed'));
         if (state === 'final' && written.event.kind === 'assistant_message' && canonicalTurn && recoverableTurns.has(canonicalTurn) &&
@@ -2046,9 +2096,17 @@ async function recordChatObservationsNow(
           state === 'final' &&
           written.event.messageId
         ) {
+          const goalTurnId = written.event.turnId ?? `reply:${written.event.messageId}`.slice(0, 200);
           goalCandidates.push({
             replyId: written.event.messageId,
-            turnId: written.event.turnId ?? `reply:${written.event.messageId}`.slice(0, 200),
+            turnId: goalTurnId,
+            // Provider pages can expose a stable final message after the page-local turn id is
+            // already gone. In that case the stable final itself is the exact automation source
+            // boundary. It is durable, unique and shared by every replay of this observation;
+            // delivery never has to rediscover intent from whatever turn happens to be live later.
+            source: canonicalTurn
+              ? { kind: 'turn', turnId: canonicalTurn }
+              : { kind: 'reply', messageId: written.event.messageId },
             eventSeq: written.event.origin ?? written.event.seq
           });
         }
@@ -2059,6 +2117,25 @@ async function recordChatObservationsNow(
           recoveredGoalSeen = true;
         }
         if (!written.changed) continue;
+        if (state === 'final' && written.event.kind === 'assistant_message' && written.event.providerMessageId && canonicalTurn &&
+            reopenedBeforeEvidence === canonicalTurn && live) {
+          // `turn_end` is an immutable observation in the append-only journal, not a mutable
+          // verdict row. Stronger later evidence therefore reopens the same logical turn before
+          // closing it again. Keep that A/end/A/end story even when the first fresh evidence is
+          // already the exact native final; otherwise every lifecycle fold has to special-case
+          // two consecutive terminal observations for one turn.
+          // `canReopenFailedView` already proved a semantic transition (text, state or finality)
+          // before the upsert. An identical body becoming the exact native final is therefore
+          // just as terminal as a final whose prose changed; `contentChanged` deliberately says
+          // nothing about lifecycle state and must not gate this close.
+          await appendEvent(sessionId, { ...base, kind: 'turn_end', turnId: canonicalTurn, outcome: 'completed',
+            detail: 'the exact native final completed the turn after its failed view was superseded' });
+          projectTurnEnd(live, canonicalTurn, 'completed', item.time);
+          activity.endedTurnId = canonicalTurn;
+          activity.terminal = true;
+          activity.meaningful = true;
+        }
+        if (workingActivity && reopenedBeforeEvidence === canonicalTurn) activity.terminal = false;
         if (terminalActivity || workingActivity) { activity.meaningful = true; activity.at = Math.max(activity.at ?? 0, item.time); }
         if (terminalActivity) activity.terminal = true;
         if (workingActivity) activity.working = true;
@@ -2066,14 +2143,24 @@ async function recordChatObservationsNow(
       }
       case 'page_tool': {
         const newlyObserved = !!live && !!item.messageId && !live.pageTools.has(item.messageId);
+        const reopenedBeforeEvidence = newlyObserved && item.turnId
+          ? await reopenThinkingFailure(sessionId, live, item.time, item.turnId)
+          : null;
         const written = await recordPageTool(sessionId, live, item, base);
         if (!written) continue;
+        if (reopenedBeforeEvidence) {
+          activity.terminal = false;
+          activity.working = true;
+          activity.meaningful = true;
+          activity.at = Math.max(activity.at ?? 0, item.time);
+        }
         if (newlyObserved && item.turnId === live?.turnId && live.turnStartedAt !== null && item.time >= live.turnStartedAt) {
           activity.toolStartedAt = Math.max(activity.toolStartedAt ?? 0, item.time);
         }
         break;
       }
       case 'chat_error': {
+        if (item.reason === 'thinking_failed' && !item.turnId) continue;
         // Documents identify rendered nodes, not a shared notice: remounts, duplicate
         // tabs and journal retries can all report the same problem. Coalesce a short
         // burst here, inside the conversation's serialized writer, using committed history
@@ -2082,12 +2169,16 @@ async function recordChatObservationsNow(
         const text = (item.text ?? '').replace(/\s+/g, ' ').trim();
         const recent = await readRecentEvents(sessionId, 32, { kinds: ['chat_error'], maxBytes: 256 * 1024 });
         if (recent.some(event => event.kind === 'chat_error' &&
-            Math.abs(item.time - event.time) <= 30_000 &&
+            (Math.abs(item.time - event.time) <= 30_000 ||
+              (item.reason === 'thinking_failed' && event.reason === item.reason && event.turnId === item.turnId)) &&
             (item.blocking === true || (event.turnId ?? '') === (item.turnId ?? '')) &&
             event.message.text.replace(/\s+/g, ' ').trim() === text)) continue;
         await appendEvent(sessionId, {
           ...base,
           kind: 'chat_error',
+          ...(item.reason ? { reason: item.reason } : {}),
+          ...(typeof item.recoverable === 'boolean' ? { recoverable: item.recoverable } : {}),
+          ...(typeof item.blocking === 'boolean' ? { blocking: item.blocking } : {}),
           message: await storeText(sessionId, item.text ?? '', 2000)
         });
         activity.meaningful = true; activity.at = Math.max(activity.at ?? 0, item.time);
@@ -2109,15 +2200,9 @@ async function recordChatObservationsNow(
         // Commit before publishing the lifecycle projection. If append rejects, the same
         // browser event remains eligible for its normal at-least-once retry.
         if (live) {
-          live.knownTurnStarts.add(item.turnId);
           // Turn lifecycle is presentation/recovery state only in 1.8. It is never consulted
           // for MCP ownership, so a replayed journal timestamp cannot misattribute a call.
-          live.turnStartedAt = item.time;
-          live.turnId = item.turnId;
-          live.openTurns.add(item.turnId);
-          // A page-authored start is a new send; whatever end came before it is settled.
-          live.turnRequestIds = new Set<string>();
-          live.endedTurn = null;
+          projectTurnStart(live, item.turnId, item.time);
         }
         activity.meaningful = true; activity.at = Math.max(activity.at ?? 0, item.time);
         activity.working = true;
@@ -2128,6 +2213,10 @@ async function recordChatObservationsNow(
         // the turn it names, but it must not tear down a newer active generation.
         if (!item.turnId) continue;
         if (live?.knownTurnEnds.has(item.turnId)) continue;
+        if (live?.turnId === item.turnId) {
+          const [latest] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
+          if (latest?.kind === 'turn_start' && latest.source === 'app' && latest.turnId === item.turnId && latest.time >= item.time) continue;
+        }
         await appendEvent(sessionId, {
           ...base,
           kind: 'turn_end',
@@ -2137,24 +2226,8 @@ async function recordChatObservationsNow(
         });
         // As above, durable journal state owns idempotency; in-memory state follows it.
         if (live) {
-          const endedStartedAt = live.turnId === item.turnId ? live.turnStartedAt : null;
-          if (live.turnId === item.turnId) activity.endedTurnId = item.turnId;
-          live.knownTurnEnds.add(item.turnId);
-          live.openTurns.delete(item.turnId);
-          live.lastTurnOutcome = item.outcome ?? 'unknown';
-          live.lastTurnStartedAt = endedStartedAt;
-          // Only a completed end can be proven false by a later call: it is the one verdict
-          // Goal acts on, and the one a reloaded page fabricates. A stop is the user's own
-          // decision and the failure outcomes already belong to recovery.
-          live.endedTurn =
-            live.turnId === item.turnId && item.outcome === 'completed'
-              ? { turnId: item.turnId, startedAt: endedStartedAt, endedAt: item.time, requestIds: live.turnRequestIds }
-              : null;
-          live.turnRequestIds = new Set<string>();
-          if (live.turnId === item.turnId) {
-            live.turnStartedAt = null;
-            live.turnId = null;
-          }
+          const projected = projectTurnEnd(live, item.turnId, item.outcome ?? 'unknown', item.time);
+          if (projected.current) activity.endedTurnId = item.turnId;
         }
         if (item.outcome !== 'unknown') {
           activity.meaningful = true;
@@ -2176,7 +2249,13 @@ async function recordChatObservationsNow(
       ]) : [[], []];
   // Repair a previously recorded false reopen only from its durable A/end/A
   // lineage and an exact native final. A page-authored new start is new work.
-  const [lastBoundary, priorBoundary] = recoveredFinal?.native && latestWork && latestWork.seq >= recoveredFinal.seq
+  // readRecentEvents() returns chronological order. For a durable false reopen the two newest
+  // lifecycle rows are therefore [the end that was disproved, the app-authored reopen]. The old
+  // chronology implementation happened to rank starts before ends inside one same-id group, which
+  // made the reverse destructuring below appear to work; same-turn reopen segments now preserve
+  // the journal order explicitly, so name the pair by its actual order instead of relying on that
+  // presentation accident.
+  const [priorBoundary, lastBoundary] = recoveredFinal?.native && latestWork && latestWork.seq >= recoveredFinal.seq
     ? await readRecentEvents(sessionId, 2, { kinds: ['turn_start', 'turn_end'] }) : [];
   const nativeReopen = recoveredFinal?.native && lastBoundary?.kind === 'turn_start' && lastBoundary.source === 'app' &&
     lastBoundary.turnId === recoveredFinal.turnId && priorBoundary?.kind === 'turn_end' &&
@@ -2191,15 +2270,8 @@ async function recordChatObservationsNow(
       ...(agent ? { agent } : {})
     });
     // Commit before publishing, preserving the same late-tool evidence as an explicit end.
-    live.openTurns.delete(turnId);
-    live.knownTurnEnds.add(turnId);
-    live.lastTurnOutcome = 'completed';
-    live.lastTurnStartedAt = live.turnStartedAt;
     // Native message time may be its creation time, long before this final was observed.
-    live.endedTurn = { turnId, startedAt: live.turnStartedAt, endedAt: Date.now(), requestIds: live.turnRequestIds };
-    live.turnRequestIds = new Set<string>();
-    live.turnStartedAt = null;
-    live.turnId = null;
+    projectTurnEnd(live, turnId, 'completed', Date.now());
     activity.meaningful = true;
     activity.at = Math.max(activity.at ?? 0, time);
     activity.terminal = true;

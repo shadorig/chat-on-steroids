@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import zhCN from '../src/renderer/locales/zh-CN.json';
@@ -159,5 +160,30 @@ describe('Chinese app interface', () => {
       expect([...translation.matchAll(/\{\d+\}/g)].map(match => match[0]).sort(), key)
         .toEqual([...key.matchAll(/\{\d+\}/g)].map(match => match[0]).sort());
     }
+  });
+
+  it('covers every literal renderer translation call', () => {
+    const sources: string[] = [];
+    const walk = (directory: string): void => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const file = path.join(directory, entry.name);
+        if (entry.isDirectory()) walk(file);
+        else if (entry.isFile() && file.endsWith('.ts')) sources.push(file);
+      }
+    };
+    walk('src/renderer');
+
+    const missing = new Set<string>();
+    for (const file of sources) {
+      const source = readFileSync(file, 'utf8');
+      for (const match of source.matchAll(/\bt\(\s*(?:'((?:\\.|[^'\\])*)'|"((?:\\.|[^"\\])*)")/g)) {
+        const raw = match[1] ?? match[2] ?? '';
+        const text = raw
+          .replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t')
+          .replace(/\\(['"\\])/g, '$1');
+        if (/[a-zA-Z]{2}/.test(text) && !Object.hasOwn(zhCN, text)) missing.add(text);
+      }
+    }
+    expect([...missing].sort()).toEqual([]);
   });
 });

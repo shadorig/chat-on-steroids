@@ -191,6 +191,26 @@ export function inFlightToolCalls(conversationId: string | null = null): number 
 }
 
 /**
+ * Exact-owned work still executing or landing in the recorder; anonymous calls grant no chat authority.
+ * `startedAfter` narrows liveness authority to work that could belong to the current turn segment.
+ */
+export function exactInFlightToolCalls(
+  conversationId: string,
+  options: { startedAfter?: number } = {}
+): number {
+  const seen = new Set<CallContext>();
+  for (const call of running) seen.add(call);
+  for (const call of settling) seen.add(call);
+  let count = 0;
+  for (const call of seen) {
+    if (call.caller.conversationId !== conversationId) continue;
+    if (options.startedAfter !== undefined && call.startedAt < options.startedAfter) continue;
+    count += 1;
+  }
+  return count;
+}
+
+/**
  * Keeps a finished call observable while its record is still being written.
  *
  * The unidentified path does not await its own recorder: the append may still spend a grace

@@ -72,4 +72,10 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
 // 15 — Goal activity now distinguishes configured from currently effective switch state, recovered
 // continuation pickup carries exact source-turn identity/busy deferral, and pre-Send withdrawal has
 // an explicit failure reason. A 14 companion silently drops or misreads those fields.
-export const BRIDGE_PROTOCOL = 15;
+// 16 — replacement-chat Send checkpoints are exact command/document-owned actions rather than
+// independent destination booleans. A 15 peer neither carries the owner fields reliably nor can
+// distinguish claim/arm/release as one exclusive operation, so mixed versions must fail loudly.
+// 17 — source-chat Send checkpoints use the same exclusive claim/arm/release action vocabulary as
+// replacement-chat checkpoints. A 16 page can otherwise present contradictory source booleans to
+// a newer background worker after extension reload, so mixed documents are rejected explicitly.
+export const BRIDGE_PROTOCOL = 17;

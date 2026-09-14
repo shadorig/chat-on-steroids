@@ -8,8 +8,9 @@ right now, and how did the last one end?** This is the inventory of the evidence
 gives, where it is read, and what each signal is worth. It exists so a later fix can be built on a
 signal that already exists rather than on new machinery.
 
-The rule this file is written to defend: **a turn is finished only when the page says so. Silence
-is not completion.**
+The rule this file is written to defend: **silence is not completion.** A page terminal signal is
+durable evidence, but it is not allowed to erase stronger exact evidence that the same server turn
+continued. Corrections are represented by later journal events rather than rewriting history.
 
 ---
 
@@ -39,6 +40,25 @@ conservative: an unexplained stop stays `unknown`, never "the model hit its limi
 | `interrupted` | ChatGPT marked the turn interrupted | no |
 | `stalled` | no visible progress for `STALL_MS` (ten minutes) | no |
 | `unknown` | the conversation was released mid-turn, or stopped for a reason it did not give | no — **this is the reload shape** |
+
+### Lifecycle correction invariant
+
+`turn_end` is immutable once appended. It means “the recorder accepted this terminal observation at
+this point in the evidence stream,” not “no later evidence can ever supersede this observation.” If
+an exact same-turn MCP call, page-tool observation, interim native revision or exact native final
+later proves that a failed/prematurely-completed view was not the logical end, the recorder appends:
+
+```text
+turn_start A
+turn_end   A failed/completed-observation
+turn_start A source=app   // stronger evidence reopened the same logical turn
+turn_end   A completed    // when the real terminal is later proven
+```
+
+The old `turn_end` remains history. It is never deleted or revised into `completed`. Every lifecycle
+fold and the shared chronological projection must understand the app-authored same-id reopen as a
+new bounded segment. This makes restart/replay deterministic and keeps the renderer, Goal and
+recovery readers from inventing different meanings for “terminal.”
 
 ---
 
@@ -434,6 +454,13 @@ The DOM adapter only classifies and reports. It never reloads the page. The app 
 recoverable transport error only when the observation names the exact conversation and the page's
 live local generation. The same app-owned recovery queue also handles a missing agent tab and a
 chat whose open turn produced no page or tool activity for two minutes.
+
+`thinking_failed` follows the same ownership rule. The page emits the machine-coded failed terminal
+observation; the main process owns the recovery lease. That lease is explicitly one of active work,
+failed-view awaiting a browser refresh, or failed-view listening after the browser has confirmed the
+refresh. The confirmation starts the listening window. Fresh exact work replaces the failed-view
+lease with ordinary active work. The browser does not independently count a second recovery grace,
+and English error text is presentation rather than runtime authority.
 
 The extension then scans Chrome's actual `chatgpt.com` tabs immediately before acting:
 

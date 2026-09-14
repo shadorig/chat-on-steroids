@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   emptyEvidence,
+  exactInFlightToolCalls,
+  holdWhileSettling,
   inFlightToolCalls,
   runningToolCalls,
   settlingToolCalls,
@@ -55,8 +57,10 @@ describe('local calls still running', () => {
     const own = callFrom('conversation-a');
     await whileRunning(own, () => {
       expect(inFlightToolCalls('conversation-a')).toBe(1);
+      expect(exactInFlightToolCalls('conversation-a')).toBe(1);
     });
     expect(inFlightToolCalls('conversation-a')).toBe(0);
+    expect(exactInFlightToolCalls('conversation-a')).toBe(0);
   });
 
   it('charges a call whose chat is not yet known to every chat', async () => {
@@ -70,7 +74,29 @@ describe('local calls still running', () => {
       expect(inFlightToolCalls(null)).toBe(1);
       expect(runningToolCalls('conversation-a')).toBe(1);
       expect(settlingToolCalls('conversation-a')).toBe(0);
+      // Conservative unknown ownership can block broad safety gates, but it is never exact
+      // evidence that one named chat was still working across a terminal observation.
+      expect(exactInFlightToolCalls('conversation-a')).toBe(0);
     });
+  });
+
+  it('keeps exact ownership through recorder settling, then makes it historical immediately', async () => {
+    const own = callFrom('conversation-a');
+    let release = (): void => {};
+    const landing = new Promise<void>((resolve) => { release = resolve; });
+    holdWhileSettling(own, landing);
+
+    // This is the terminal-race window: the handler may already be done, but its exact-owned
+    // result is still crossing the recorder boundary and therefore still belongs to this turn.
+    expect(runningToolCalls('conversation-a')).toBe(0);
+    expect(settlingToolCalls('conversation-a')).toBe(1);
+    expect(exactInFlightToolCalls('conversation-a')).toBe(1);
+
+    release();
+    await landing;
+    await Promise.resolve();
+    expect(settlingToolCalls('conversation-a')).toBe(0);
+    expect(exactInFlightToolCalls('conversation-a')).toBe(0);
   });
 
   it('follows a call whose chat is identified part-way through it', async () => {

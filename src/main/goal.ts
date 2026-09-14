@@ -52,9 +52,23 @@ import { getConfig } from './config.js';
 import { writeDurableNow, writeDurableSoon } from './durable.js';
 import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
-import { getSession, readEvents, readHandoff, readRecentEvents } from './session/store.js';
+import {
+  findSessionByConversation,
+  getSession,
+  latestCompletedAutomationSourceBoundary,
+  readCanonicalAssistantMessage,
+  readEvents,
+  readHandoff,
+  readRecentEvents
+} from './session/store.js';
 import { foldProgress } from '../shared/session.js';
 import { isAstraModel, isProModel, supportsAfterTurnLoop } from '../shared/chat-models.js';
+import {
+  automationSourceBoundaryEquals,
+  automationSourceBoundaryFromLegacy,
+  parseAutomationSourceBoundary,
+  type AutomationSourceBoundary
+} from '../shared/automation-source.js';
 import {
   recoveryGrantSchema,
   deferRecoveryGrant,
@@ -415,20 +429,78 @@ function notifyGoalChange(): void { for (const listener of goalListeners) listen
  * genuinely newer replies. A handled row is retained so history never replays on its own;
  * only an explicit later activation may turn that exact tombstone into a fresh pickup.
  */
-interface GoalReplyObligation {
+interface GoalReplyBase {
   /** Recovery-derived continuation authority. Normal final replies need no recovery proof. */
   recovery?: RecoveryGrant;
   conversationId: string;
   sessionId: string;
   replyId: string;
-  turnId: string;
+  /** Goal/browser generation key. May be a local turn id or a stable `reply:<messageId>` key. */
+  generationId: string;
   eventSeq: number;
   /** When this app froze the decision. The row's whole lifetime is measured from here. */
   acceptedAt: number;
-  state: 'pending' | 'handled';
 }
 
+/**
+ * Runtime Goal ledger.
+ *
+ * Pending means executable authority and therefore always carries the exact source boundary.
+ * A source-less row can exist only as a handled legacy tombstone: retaining its old generation
+ * prevents historical replay, while making it impossible to execute or re-arm until migration
+ * resolves that legacy identity into the current turn-or-reply boundary model.
+ */
+type GoalReplyObligation =
+  | (GoalReplyBase & { source: AutomationSourceBoundary; state: 'pending' })
+  | (GoalReplyBase & { source: AutomationSourceBoundary | null; state: 'handled' });
+
 const goalReplies = new Map<string, GoalReplyObligation>();
+interface GoalReplyPublication {
+  promise: Promise<void>;
+  release: () => void;
+}
+/**
+ * Immediate durable reply transitions serialize per conversation. Unrelated conversations remain
+ * concurrent, while executable pending authority stays hidden until the current publication has
+ * either crossed fsync or rolled back. Acquisition installs its marker before waking the caller,
+ * so multiple waiters on one older publication cannot all publish provisional successor rows.
+ */
+const goalReplyPublications = new Map<string, GoalReplyPublication>();
+
+async function goalReplyAfterPublications(conversationId: string): Promise<GoalReplyObligation | null> {
+  for (;;) {
+    const publication = goalReplyPublications.get(conversationId);
+    if (!publication) return goalReplies.get(conversationId) ?? null;
+    await publication.promise;
+  }
+}
+
+async function beginGoalReplyPublication(conversationId: string): Promise<() => void> {
+  for (;;) {
+    const previous = goalReplyPublications.get(conversationId);
+    if (previous) {
+      await previous.promise;
+      continue;
+    }
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => { release = resolve; });
+    const publication = { promise, release };
+    // No await separates the empty check from this install. In JavaScript's run-to-completion
+    // model, the first awakened waiter therefore owns the next publication before another waiter
+    // can observe the lane as idle.
+    goalReplyPublications.set(conversationId, publication);
+    return () => {
+      if (goalReplyPublications.get(conversationId) === publication) goalReplyPublications.delete(conversationId);
+      release();
+    };
+  }
+}
+/** Legacy pending rows temporarily fail closed until startup migration proves their source. */
+const legacyPendingSourceResolution = new Set<string>();
+/** Only pre-v4 rows may have their missing structured source reconstructed from legacy identity. */
+const legacySourceResolution = new Set<string>();
+/** Restore normalized an older/malformed representation that should converge on the next barrier. */
+let goalRepliesNeedRewrite = false;
 
 /**
  * How long one reply may wait for its Goal decision, and how many chats may be waiting.
@@ -446,40 +518,59 @@ const goalReplies = new Map<string, GoalReplyObligation>();
 const GOAL_REPLY_TTL_MS = 12 * 60 * 60_000;
 const MAX_GOAL_REPLIES = 200;
 
-/** Retires expired pickups and caps the stable-final ledger to its newest conversations. */
-function boundGoalReplies(now: number): void {
-  for (const reply of goalReplies.values()) {
+function cloneGoalReply(reply: GoalReplyObligation): GoalReplyObligation {
+  return {
+    ...reply,
+    ...(reply.source ? { source: { ...reply.source } } : {}),
+    ...(reply.recovery ? { recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } } : {})
+  } as GoalReplyObligation;
+}
+
+/** Pure durable projection: retire expired pickups and cap to the newest conversations. */
+function boundedGoalReplies(replies: Iterable<GoalReplyObligation>, now: number): GoalReplyObligation[] {
+  const bounded: GoalReplyObligation[] = [];
+  for (const reply of replies) {
     // Expiry revokes automatic pickup authority; it does not erase the exact final assistant
     // identity. A later deliberate On may re-arm that tombstone, while leaving it handled here
     // prevents a stale page or watchdog from collecting it on its own.
-    if (reply.state === 'pending' && now - reply.acceptedAt >= GOAL_REPLY_TTL_MS) reply.state = 'handled';
+    bounded.push(reply.state === 'pending' && now - reply.acceptedAt >= GOAL_REPLY_TTL_MS
+      ? cloneGoalReply({ ...reply, state: 'handled' } as GoalReplyObligation)
+      : cloneGoalReply(reply));
   }
-  if (goalReplies.size <= MAX_GOAL_REPLIES) return;
-  const oldestFirst = [...goalReplies.values()].sort((a, b) => a.acceptedAt - b.acceptedAt);
-  for (const reply of oldestFirst.slice(0, goalReplies.size - MAX_GOAL_REPLIES)) {
-    goalReplies.delete(reply.conversationId);
-  }
+  if (bounded.length <= MAX_GOAL_REPLIES) return bounded;
+  bounded.sort((a, b) => a.acceptedAt - b.acceptedAt);
+  return bounded.slice(bounded.length - MAX_GOAL_REPLIES);
+}
+
+/** Process projection follows the same bound after a successful/delayed durable publication. */
+function pruneGoalReplies(now: number): void {
+  const bounded = boundedGoalReplies(goalReplies.values(), now);
+  goalReplies.clear();
+  for (const reply of bounded) goalReplies.set(reply.conversationId, reply);
 }
 export const GOAL_REPLIES_STATE = 'goal-replies';
 
 export interface GoalRepliesSnapshot {
-  version: 2;
+  version: 4;
   savedAt: number;
   replies: GoalReplyObligation[];
 }
 export type StoredGoalRepliesSnapshot = GoalRepliesSnapshot | {
-  version: 1;
+  version: 1 | 2 | 3;
   savedAt: number;
-  replies: GoalReplyObligation[];
+  replies: Array<Omit<GoalReplyBase, 'generationId'> & {
+    turnId: string;
+    sourceTurnId?: string | null;
+    state: 'pending' | 'handled';
+  }>;
 };
 
 export function snapshotGoalReplies(): GoalRepliesSnapshot {
-  boundGoalReplies(Date.now());
+  const savedAt = Date.now();
   return {
-    version: 2,
-    savedAt: Date.now(),
-    replies: [...goalReplies.values()].map((reply) => ({ ...reply,
-      ...(reply.recovery ? { recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } } : {}) }))
+    version: 4,
+    savedAt,
+    replies: boundedGoalReplies(goalReplies.values(), savedAt)
   };
 }
 
@@ -505,21 +596,36 @@ function migrateRecoveryGrant(raw: unknown): RecoveryGrant | undefined {
 
 export function restoreGoalReplies(snapshot: StoredGoalRepliesSnapshot | null): void {
   goalReplies.clear();
-  if (!snapshot || (snapshot.version !== 1 && snapshot.version !== 2) || !Array.isArray(snapshot.replies)) return;
+  legacyPendingSourceResolution.clear();
+  legacySourceResolution.clear();
+  goalRepliesNeedRewrite = false;
+  if (!snapshot || ![1, 2, 3, 4].includes(snapshot.version) || !Array.isArray(snapshot.replies)) return;
+  goalRepliesNeedRewrite = snapshot.version !== 4;
   for (const raw of snapshot.replies) {
-    const legacy = raw as GoalReplyObligation & { continuationBoundary?: unknown; silenceSourceTurnId?: string; silencePro?: boolean; listenUntil?: number };
+    const legacy = raw as Omit<GoalReplyBase, 'generationId'> & {
+      generationId?: unknown;
+      turnId?: unknown;
+      source?: unknown;
+      sourceTurnId?: string | null;
+      state: 'pending' | 'handled';
+      continuationBoundary?: unknown;
+      silenceSourceTurnId?: string;
+      silencePro?: boolean;
+      listenUntil?: number;
+    };
     if (
       !raw ||
       !/^[0-9a-z-]{8,256}$/i.test(raw.conversationId) ||
       !raw.sessionId ||
       !raw.replyId ||
-      !raw.turnId ||
       !Number.isSafeInteger(raw.eventSeq) ||
       raw.eventSeq < 1 ||
       !Number.isSafeInteger(raw.acceptedAt) ||
       raw.acceptedAt <= 0 ||
       (raw.state !== 'pending' && raw.state !== 'handled')
     ) continue;
+    const generationId = snapshot.version === 4 ? legacy.generationId : legacy.turnId;
+    if (typeof generationId !== 'string' || generationId.length === 0) continue;
     const migratedRecovery = migrateRecoveryGrant(raw.recovery ?? legacy.continuationBoundary);
     const shippedRecovery: RecoveryGrant | undefined = !migratedRecovery && legacy.silenceSourceTurnId ? {
       proof: {
@@ -532,21 +638,95 @@ export function restoreGoalReplies(snapshot: StoredGoalRepliesSnapshot | null): 
       },
       ...(Number.isSafeInteger(legacy.listenUntil) && legacy.listenUntil! > 0 ? { notBefore: legacy.listenUntil } : {})
     } : undefined;
+    const recovery = migratedRecovery ?? shippedRecovery;
+    const source = snapshot.version === 4
+      ? parseAutomationSourceBoundary(legacy.source)
+      : automationSourceBoundaryFromLegacy(
+          typeof legacy.sourceTurnId === 'string' && legacy.sourceTurnId
+            ? legacy.sourceTurnId
+            : recovery?.proof.turnId ?? (!generationId.startsWith('reply:') ? generationId : null)
+        );
+    if (
+      snapshot.version === 4 &&
+      !source &&
+      (legacy.source !== null || raw.state === 'pending')
+    ) goalRepliesNeedRewrite = true;
+    if (!source && snapshot.version !== 4) {
+      legacySourceResolution.add(raw.conversationId);
+      if (raw.state === 'pending') legacyPendingSourceResolution.add(raw.conversationId);
+    }
     goalReplies.set(raw.conversationId, {
       conversationId: raw.conversationId,
       sessionId: String(raw.sessionId).slice(0, 200),
       replyId: String(raw.replyId).slice(0, 200),
-      turnId: String(raw.turnId).slice(0, 200),
-      ...((migratedRecovery ?? shippedRecovery) ? { recovery: migratedRecovery ?? shippedRecovery } : {}),
+      source,
+      generationId: generationId.slice(0, 200),
+      ...(recovery ? { recovery } : {}),
       eventSeq: raw.eventSeq,
       acceptedAt: raw.acceptedAt,
-      state: raw.state
-    });
+      // A source-less historical row is retained only as a non-executable tombstone until the
+      // session store is available to prove its source below.
+      state: source ? raw.state : 'handled'
+    } as GoalReplyObligation);
   }
-  boundGoalReplies(Date.now());
+  pruneGoalReplies(Date.now());
+}
+
+/**
+ * One-time upgrade of pre-source-boundary reply rows after the session store is available.
+ * Runtime policy never guesses from a bounded transcript tail: an exact old turn/recovery identity
+ * becomes a turn boundary; an exact stable assistant id becomes its canonical turn when known or
+ * remains a reply boundary when that page-local turn identity no longer exists.
+ */
+export async function migrateLegacyGoalRepliesNow(): Promise<void> {
+  let changed = goalRepliesNeedRewrite;
+  for (const [conversationId, held] of [...goalReplies]) {
+    if (held.source) {
+      legacySourceResolution.delete(conversationId);
+      legacyPendingSourceResolution.delete(conversationId);
+      continue;
+    }
+    // A malformed current-schema row is not legacy authority. Keep its tombstone inert instead
+    // of manufacturing a source from redundant display/generation fields that v4 no longer owns.
+    if (!legacySourceResolution.has(conversationId)) continue;
+    let source: AutomationSourceBoundary | null = held.recovery?.proof.turnId
+      ? { kind: 'turn', turnId: held.recovery.proof.turnId }
+      : !held.generationId.startsWith('reply:')
+        ? { kind: 'turn', turnId: held.generationId }
+        : null;
+    if (!source && held.generationId.startsWith('reply:')) {
+      const messageId = held.generationId.slice('reply:'.length);
+      const canonical = await readCanonicalAssistantMessage(held.sessionId, { messageId });
+      source = canonical?.turnId ? { kind: 'turn', turnId: canonical.turnId } : { kind: 'reply', messageId };
+    }
+    if (source) {
+      goalReplies.set(conversationId, {
+        ...held,
+        source,
+        state: legacyPendingSourceResolution.has(conversationId) ? 'pending' : 'handled'
+      });
+    } else {
+      // An automatic continuation whose source cannot be proven after migration must never become
+      // executable merely because a later page happens to resemble the old transcript.
+      goalReplies.set(conversationId, { ...held, source: null, state: 'handled' });
+    }
+    legacySourceResolution.delete(conversationId);
+    legacyPendingSourceResolution.delete(conversationId);
+    changed = true;
+  }
+  // `boundGoalReplies()` may have capped source-less legacy rows before migration could inspect
+  // them. No unresolved legacy authority survives this pass, so do not retain orphaned ids in
+  // the temporary migration set for the lifetime of the process.
+  legacySourceResolution.clear();
+  legacyPendingSourceResolution.clear();
+  if (changed) {
+    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    goalRepliesNeedRewrite = false;
+  }
 }
 
 function persistGoalRepliesSoon(): void {
+  pruneGoalReplies(Date.now());
   writeDurableSoon(GOAL_REPLIES_STATE, snapshotGoalReplies());
 }
 
@@ -568,16 +748,25 @@ export function goalDraftBusy(conversationId: string): boolean {
   return draft.stage === 'sending' || draft.stage === 'answering';
 }
 
-export function goalPendingReplyFor(
-  conversationId: string
-): Pick<GoalReplyObligation, 'replyId' | 'turnId' | 'eventSeq' | 'acceptedAt' | 'recovery'> | null {
+export interface GoalPendingReply {
+  replyId: string;
+  source: AutomationSourceBoundary;
+  /** Browser protocol generation key; kept as `turnId` on the wire for protocol compatibility. */
+  turnId: string;
+  eventSeq: number;
+  acceptedAt: number;
+  recovery?: RecoveryGrant;
+}
+
+export function goalPendingReplyFor(conversationId: string): GoalPendingReply | null {
+  if (goalReplyPublications.has(conversationId)) return null;
   const reply = goalReplies.get(conversationId);
   // Expiry is read here as well as pruned on write, because the ledger is only pruned when
   // something writes to it. A chat reopened after the window must not be offered work the
   // next prune would have thrown away.
   if (reply && Date.now() - reply.acceptedAt >= GOAL_REPLY_TTL_MS) return null;
   return reply?.state === 'pending'
-    ? { replyId: reply.replyId, turnId: reply.turnId, eventSeq: reply.eventSeq, acceptedAt: reply.acceptedAt,
+    ? { replyId: reply.replyId, source: { ...reply.source }, turnId: reply.generationId, eventSeq: reply.eventSeq, acceptedAt: reply.acceptedAt,
       ...(reply.recovery ? { recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } } : {}) }
     : null;
 }
@@ -595,6 +784,7 @@ export function pendingGoalReplies(
 ): Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number }> {
   const owed: Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number }> = [];
   for (const reply of goalReplies.values()) {
+    if (goalReplyPublications.has(reply.conversationId)) continue;
     if (reply.state !== 'pending' || now - reply.acceptedAt >= GOAL_REPLY_TTL_MS) continue;
     owed.push({
       conversationId: reply.conversationId,
@@ -612,24 +802,17 @@ export async function acceptGoalReplyNow(input: {
   conversationId: string;
   sessionId: string;
   replyId: string;
+  source?: AutomationSourceBoundary;
   turnId: string;
   eventSeq: number;
   blocked: boolean;
   current?: () => boolean;
 }): Promise<boolean> {
+  let current = await goalReplyAfterPublications(input.conversationId);
   if (await requiresFinishOnlyContinuation(input.sessionId, input.conversationId)) return false;
   if (input.recovery && !await validateRecoveryProof(input.sessionId, input.recovery.proof)) return false;
-  const current = goalReplies.get(input.conversationId);
   if (current?.replyId === input.replyId) return true;
   if (current && current.eventSeq > input.eventSeq) return false;
-  const provisionalUpgrade = Boolean(
-    current &&
-      current.eventSeq === 0 &&
-      current.turnId === input.turnId &&
-      current.replyId === `turn:${input.turnId}`.slice(0, 200)
-  );
-  const before = current ? { ...current } : null;
-  const bounded = snapshotGoalReplies().replies;
   const active =
     !input.blocked &&
     getConfig().sessions.record &&
@@ -637,40 +820,98 @@ export async function acceptGoalReplyNow(input: {
     await goalKeyPresent(goalSwitchFor(input.conversationId).mode);
   if (input.current && !input.current()) return false;
   if (input.recovery && !await validateRecoveryProof(input.sessionId, input.recovery.proof)) return false;
-  goalReplies.set(input.conversationId, {
-    conversationId: input.conversationId,
-    sessionId: input.sessionId,
-    replyId: input.replyId.slice(0, 200),
-    turnId: input.turnId.slice(0, 200),
-    ...(input.recovery ? { recovery: { ...input.recovery, proof: { ...input.recovery.proof } } } : {}),
-    eventSeq: input.eventSeq,
-    // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
-    // stable assistant id. The later id strengthens that same row; it must not re-evaluate
-    // policy or reopen a decision the page already acknowledged in the meantime.
-    acceptedAt: provisionalUpgrade ? current!.acceptedAt : Date.now(),
-    state: provisionalUpgrade ? current!.state : active ? 'pending' : 'handled'
-  });
-  try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-  } catch (error) {
-    // The rejected write is one whole revision, so the rollback is too: the row this accept
-    // added and the expired rows it pruned go back together, leaving the ledger exactly as the
-    // decision found it.
-    goalReplies.clear();
-    for (const reply of bounded) goalReplies.set(reply.conversationId, reply);
-    if (before) goalReplies.set(input.conversationId, before);
-    else goalReplies.delete(input.conversationId);
-    persistGoalRepliesSoon();
-    throw error;
+  let canonicalSource: AutomationSourceBoundary | null = null;
+  if (!input.recovery && !input.source && input.turnId.startsWith('reply:')) {
+    const canonical = await readCanonicalAssistantMessage(input.sessionId, { messageId: input.replyId });
+    canonicalSource = canonical?.turnId
+      ? { kind: 'turn', turnId: canonical.turnId }
+      : { kind: 'reply', messageId: input.replyId };
   }
-  return true;
+  // Validation above may cross an earlier publication. Acquire this conversation's publication
+  // lane and re-read immediately before constructing the generation that can become authoritative.
+  const finishPublication = await beginGoalReplyPublication(input.conversationId);
+  try {
+    current = goalReplies.get(input.conversationId) ?? null;
+    if (current?.replyId === input.replyId) return true;
+    if (current && current.eventSeq > input.eventSeq) return false;
+    if (input.current && !input.current()) return false;
+    const provisionalUpgrade = Boolean(
+      current &&
+      current.eventSeq === 0 &&
+      current.generationId === input.turnId &&
+      current.replyId === `turn:${input.turnId}`.slice(0, 200)
+    );
+    const before = current ? cloneGoalReply(current) : null;
+    const candidateSource: AutomationSourceBoundary | null = input.recovery?.proof.turnId
+      ? { kind: 'turn', turnId: input.recovery.proof.turnId }
+      : input.source ?? canonicalSource ??
+        (!input.turnId.startsWith('reply:') ? { kind: 'turn', turnId: input.turnId } : current?.source ?? null);
+    const source = candidateSource ? parseAutomationSourceBoundary(candidateSource) : null;
+    const executable = active && !!source;
+    const next = {
+      conversationId: input.conversationId,
+      sessionId: input.sessionId,
+      replyId: input.replyId.slice(0, 200),
+      source: source ? { ...source } : null,
+      generationId: input.turnId.slice(0, 200),
+      ...(input.recovery ? { recovery: { ...input.recovery, proof: { ...input.recovery.proof } } } : {}),
+      eventSeq: input.eventSeq,
+      // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
+      // stable assistant id. The later id strengthens that same row; it must not re-evaluate
+      // policy or reopen a decision the page already acknowledged in the meantime.
+      acceptedAt: provisionalUpgrade ? current!.acceptedAt : Date.now(),
+      state: provisionalUpgrade ? current!.state : executable ? 'pending' : 'handled'
+    } as GoalReplyObligation;
+    goalReplies.set(input.conversationId, next);
+    try {
+      const snapshot = snapshotGoalReplies();
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshot);
+      if (goalReplies.get(input.conversationId) === next) pruneGoalReplies(snapshot.savedAt);
+    } catch (error) {
+      // Snapshot construction is pure, so a rejected write only needs to undo this row. Unrelated
+      // concurrent obligations were never pruned or rewritten by preparing the failed revision.
+      if (goalReplies.get(input.conversationId) === next) {
+        if (before) goalReplies.set(input.conversationId, before);
+        else goalReplies.delete(input.conversationId);
+      }
+      persistGoalRepliesSoon();
+      throw error;
+    }
+    return true;
+  } finally {
+    finishPublication();
+  }
 }
 
 function handleGoalReply(conversationId: string, turnId?: string): void {
   const reply = goalReplies.get(conversationId);
-  if (!reply || reply.state !== 'pending' || (turnId && reply.turnId !== turnId)) return;
-  reply.state = 'handled';
+  if (!reply || reply.state !== 'pending' || (turnId && reply.generationId !== turnId)) return;
+  goalReplies.set(conversationId, { ...reply, state: 'handled' });
   persistGoalRepliesSoon();
+}
+
+/** A user send spends the same completed/recovery source as Goal, leaving its tombstone handled. */
+export async function consumeGoalReplyForInputNow(
+  conversationId: string,
+  sessionId: string,
+  source: AutomationSourceBoundary
+): Promise<void> {
+  await deactivateGoalReplyMatchingNow(conversationId, (reply) =>
+    reply.sessionId === sessionId &&
+    reply.state === 'pending' &&
+    automationSourceBoundaryEquals(reply.source, source)
+  );
+}
+
+/** Exact pending source exposed to the outbox after any in-flight authority admission settles. */
+export async function goalPendingSourceForInput(
+  conversationId: string,
+  sessionId: string
+): Promise<AutomationSourceBoundary | null> {
+  const reply = await goalReplyAfterPublications(conversationId);
+  if (!reply || reply.sessionId !== sessionId || reply.state !== 'pending' ||
+      Date.now() - reply.acceptedAt >= GOAL_REPLY_TTL_MS) return null;
+  return { ...reply.source };
 }
 
 /** Durable state file for per-chat Goal objectives. */
@@ -1245,62 +1486,139 @@ export function retireGoalDraftsFor(conversationId: string): boolean {
  * old row leaves the reply safely retryable but can never let the now-revoked text reach the
  * composer. A later page simply drafts it again from the same durable reply identity.
  */
-export async function setGoalReplyActiveNow(conversationId: string, active: boolean): Promise<boolean> {
-  const before = goalReplies.get(conversationId);
+function retireGoalDraft(conversationId: string): boolean {
   const draft = drafts.get(conversationId);
-  if (draft) {
-    draft.acknowledged = true;
-    draft.abort?.abort();
-    if (draft.settledAt === 0) draft.settledAt = Date.now();
-    draft.text = '';
-    draft.reply = '';
-    drafts.delete(conversationId);
-  }
-  if (!before) return Boolean(draft);
-
-  const previous = { ...before };
-  before.state = active && !before.recovery ? 'pending' : 'handled';
-  // A deliberate On is a new pickup episode for the same stable final reply. It gets the
-  // recovery schedule from now, not from when that answer happened under an Off switch.
-  if (active && !before.recovery) before.acceptedAt = Math.max(Date.now(), previous.acceptedAt + 1);
-  try {
-    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
-  } catch (error) {
-    goalReplies.set(conversationId, previous);
-    persistGoalRepliesSoon();
-    throw error;
-  }
+  if (!draft) return false;
+  draft.acknowledged = true;
+  draft.abort?.abort();
+  if (draft.settledAt === 0) draft.settledAt = Date.now();
+  draft.text = '';
+  draft.reply = '';
+  drafts.delete(conversationId);
   return true;
+}
+
+async function deactivateGoalReplyMatchingNow(
+  conversationId: string,
+  matches?: (reply: GoalReplyObligation) => boolean
+): Promise<boolean> {
+  const finishPublication = await beginGoalReplyPublication(conversationId);
+  try {
+    const before = goalReplies.get(conversationId);
+    if (matches && (!before || !matches(before))) return false;
+    const retiredDraft = retireGoalDraft(conversationId);
+    if (!before) return retiredDraft;
+    const next: GoalReplyObligation = { ...before, state: 'handled' };
+    goalReplies.set(conversationId, next);
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      if (goalReplies.get(conversationId) === next) goalReplies.set(conversationId, before);
+      persistGoalRepliesSoon();
+      throw error;
+    }
+    return true;
+  } finally {
+    finishPublication();
+  }
+}
+
+/** Durably closes this chat's automatic pickup and retires any in-flight provider draft. */
+export async function deactivateGoalReplyNow(conversationId: string): Promise<boolean> {
+  return deactivateGoalReplyMatchingNow(conversationId);
+}
+
+/**
+ * Re-arms the newest stable ordinary final only while the exact caller fence is still current.
+ * Recovery-derived obligations are one-shot tombstones and can never be re-armed by a switch.
+ */
+export async function tryActivateGoalReplyNow(
+  conversationId: string,
+  stillCurrent: () => boolean = () => true
+): Promise<boolean> {
+  const before = await goalReplyAfterPublications(conversationId);
+  if (!stillCurrent()) return false;
+  if (before?.recovery) {
+    return deactivateGoalReplyMatchingNow(conversationId, (reply) =>
+      reply.replyId === before.replyId &&
+      reply.generationId === before.generationId &&
+      reply.eventSeq === before.eventSeq &&
+      !!reply.recovery
+    );
+  }
+  if (!before?.source) return false;
+  const source = before.source;
+  const session = await findSessionByConversation(conversationId, { requireUnique: true });
+  const newestCompletedSource = session && !session.activeTurnId
+    ? await latestCompletedAutomationSourceBoundary(session.id) : null;
+  if (!stillCurrent() || session?.activeTurnId || !goalArmedFor(conversationId)) return false;
+  // Rearm only the newest stable completed source this tombstone actually names. A canonical
+  // final is itself a terminal fact even when a cold/reloaded page did not replay its lifecycle
+  // end. A newer turn/user boundary or any non-completed terminal wins immediately.
+  if (!automationSourceBoundaryEquals(newestCompletedSource, source)) return false;
+  const finishPublication = await beginGoalReplyPublication(conversationId);
+  try {
+    if (!stillCurrent() || goalReplies.get(conversationId) !== before) return false;
+    retireGoalDraft(conversationId);
+    // A deliberate On is a new pickup episode for the same stable final reply. It gets a new
+    // pickup lifetime rather than inheriting the timestamp from when that answer arrived Off.
+    const next: GoalReplyObligation = {
+      ...before,
+      source: { ...source },
+      state: 'pending',
+      acceptedAt: Math.max(Date.now(), before.acceptedAt + 1)
+    };
+    goalReplies.set(conversationId, next);
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      if (goalReplies.get(conversationId) === next) goalReplies.set(conversationId, before);
+      persistGoalRepliesSoon();
+      throw error;
+    }
+    return true;
+  } finally {
+    finishPublication();
+  }
 }
 
 /** A recovery continuation is a tombstone after revocation; a later On may never re-arm it. */
 export async function withdrawRecoveryGoalReplyNow(conversationId: string, replyId: string): Promise<void> {
-  const reply = goalReplies.get(conversationId);
-  if (!reply || reply.replyId !== replyId || !reply.recovery) return;
-  await setGoalReplyActiveNow(conversationId, false);
+  await deactivateGoalReplyMatchingNow(conversationId, (reply) => reply.replyId === replyId && !!reply.recovery);
 }
 
 /** Native busy after refresh defers this exact ticket; it never earns another ticket. */
 export async function deferRecoveryGoalReplyNow(conversationId: string, turnId: string): Promise<boolean> {
-  const reply = goalReplies.get(conversationId);
-  if (!reply || reply.state !== 'pending' || reply.turnId !== turnId || !reply.recovery) return false;
-  if ((reply.recovery.notBefore ?? 0) > Date.now()) return true;
-  const previous = { ...reply, recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } };
-  const next = { ...reply, recovery: deferRecoveryGrant(reply.recovery) };
-  goalReplies.set(conversationId, next);
-  try { await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies()); }
-  catch (error) {
-    if (goalReplies.get(conversationId) === next) goalReplies.set(conversationId, previous);
-    persistGoalRepliesSoon();
-    throw error;
+  const finishPublication = await beginGoalReplyPublication(conversationId);
+  try {
+    const reply = goalReplies.get(conversationId);
+    if (!reply || reply.state !== 'pending' || reply.generationId !== turnId || !reply.recovery) return false;
+    if ((reply.recovery.notBefore ?? 0) > Date.now()) return true;
+    const previous = { ...reply, recovery: { ...reply.recovery, proof: { ...reply.recovery.proof } } };
+    const next = { ...reply, recovery: deferRecoveryGrant(reply.recovery) };
+    goalReplies.set(conversationId, next);
+    try {
+      await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+    } catch (error) {
+      if (goalReplies.get(conversationId) === next) goalReplies.set(conversationId, previous);
+      persistGoalRepliesSoon();
+      throw error;
+    }
+    return goalReplies.get(conversationId) === next;
+  } finally {
+    finishPublication();
   }
-  return goalReplies.get(conversationId) === next;
 }
 
 export function resetGoalStateForTests(): void {
+  for (const publication of goalReplyPublications.values()) publication.release();
+  goalReplyPublications.clear();
   for (const draft of drafts.values()) draft.abort?.abort();
   drafts.clear();
   goalReplies.clear();
+  legacySourceResolution.clear();
+  legacyPendingSourceResolution.clear();
+  goalRepliesNeedRewrite = false;
   goalObjectives.clear();
   goalSwitches.clear();
   goalSwitchWrites = Promise.resolve();

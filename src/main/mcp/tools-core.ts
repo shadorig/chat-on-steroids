@@ -161,6 +161,8 @@ const MAX_DIR_ENTRIES = 200;
 const MAX_GLOB_MATCHES = 20;
 /** Files a single `read` call may touch after every path and glob is expanded. */
 const MAX_READ_TARGETS = 40;
+const MAX_READ_IMAGES = 4;
+const MAX_READ_IMAGE_BASE64_CHARS = 12 * 1024 * 1024;
 /** Entries a glob walk will look at before giving up on the pattern. */
 const GLOB_SCAN_LIMIT = 5_000;
 
@@ -186,13 +188,13 @@ const excludeFolderPattern = z
 
 const unifiedExecOutputSchema = z
   .object({
-    chunk_id: z.string().optional().describe('Chunk identifier included when the response reports one.'),
-    wall_time_seconds: z.number().describe('Elapsed wall time spent waiting for output in seconds.'),
-    exit_code: z.number().optional().describe('Process exit code when the command finished during this call.'),
+    chunk_id: z.string().optional().describe('Output chunk identifier.'),
+    wall_time_seconds: z.number().describe('Seconds spent waiting for output.'),
+    exit_code: z.number().optional().describe('Exit code if the command finished.'),
     session_id: z
       .number()
       .optional()
-      .describe('Session identifier to pass to write_stdin when the process is still running.'),
+      .describe('Session id for write_stdin while the process is running.'),
     original_token_count: z.number().optional().describe('Approximate token count before output truncation.'),
     output: z.string().describe('Command output text, possibly truncated.')
   })
@@ -277,7 +279,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           'Paths may contain * ? and ** and are expanded here. Every result starts with a header giving size, timestamps and line count. ' +
           `The line-number prefix is display metadata, not file content — strip it before quoting text into apply_patch. ` +
           `start_line/end_line apply to every file the call resolves to; a path may instead carry its own range as path:12-40 or path:12, so several ranges of one file fit in one call. A typical 1,500-line source file fits in the default read: do not pre-paginate it. ` +
-          `Batch related paths in one call; only continue from a line when the returned header says more lines follow. The aggregate payload remains bounded at about ${formatBytes(MAX_READ_BYTES)}.`,
+          `Batch related paths in one call; only continue from a line when the returned header says more lines follow. Text is bounded at about ${formatBytes(MAX_READ_BYTES)}; images have a separate ${MAX_READ_IMAGES}-image, ${MAX_READ_IMAGE_BASE64_CHARS.toLocaleString('en-US')}-base64-character budget and view_image's per-file validation.`,
         inputSchema: z
           .object({
             paths: z
@@ -367,6 +369,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const sections: string[] = [];
           const images: Array<{ data: string; mimeType: string }> = [];
           let remaining = MAX_READ_BYTES;
+          let imageBase64Chars = 0;
           let failures = 0;
           let successes = 0;
 
@@ -383,12 +386,15 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                 startLine: target.range ? target.range.start : start_line,
                 endLine: target.range ? target.range.end : end_line,
                 maxBytes: Math.min(max_bytes ?? DEFAULT_READ_BYTES, remaining),
-                aggregateBytes: remaining
+                imageBase64Chars: images.length < MAX_READ_IMAGES ? MAX_READ_IMAGE_BASE64_CHARS - imageBase64Chars : 0
               });
               remaining -= section.bytes;
               successes++;
               sections.push(section.text);
-              if (section.image) images.push(section.image);
+              if (section.image) {
+                images.push(section.image);
+                imageBase64Chars += section.image.data.length;
+              }
             } catch (err) {
               failures++;
               // One stale or missing path must not destroy the useful reads. The requested
@@ -664,7 +670,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               });
             }
           }),
-        outputSchema: unifiedExecOutputSchema
+        outputSchema: unifiedExecOutputSchema,
+        supplementalContext: true
       })),
       async (input) =>
         reg.guarded('command', 'exec_command', async () => {
@@ -915,7 +922,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             max_output_tokens: unsignedIntegerNumber.optional().describe(MAX_OUTPUT_TOKENS_DESCRIPTION)
           })
           .strict(),
-        outputSchema: unifiedExecOutputSchema
+        outputSchema: unifiedExecOutputSchema,
+        supplementalContext: true
       })),
       async (input) =>
         reg.guarded('command', 'write_stdin', async () => {
@@ -1103,7 +1111,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
  * handing back a worker the prime was already told was finished.
  */
 async function measureSleepingWorkers(caller: Caller): Promise<void> {
-  for (const info of swarmStateForCaller(caller).agents) {
+  const state = swarmStateForCaller(caller);
+  if (state.agents.length === 0) return;
+  for (const info of state.agents) {
     if (info.role !== 'worker' || info.state !== 'sleeping' || !info.conversationId) continue;
     const summary = await findSessionByConversation(info.conversationId, { requireUnique: true }).catch(() => null);
     if (summary) noteAgentContextTokens(info.conversationId, summary.contextTokens);
@@ -1132,6 +1142,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         'Run ChatGPT workers. Omit model and reasoning_effort unless the user explicitly requests an override; app settings supply their defaults automatically. Do not ask the user to choose these settings before spawning. Reuse a suitable sleeping worker with message before spawn; spawn creates fresh worker chats for new parallel work. Sleeping/terminal workers stay in this prime conversation’s durable history. ' +
         'message: prime→worker or worker→prime; messaging a sleeping worker revives that exact existing chat when a slot is free. Replies arrive on later tool results, so never poll. ' +
         'status shows this prime’s full worker history, including sleeping/revivable and terminal/non-revivable workers, even while no run is active. finish reports a worker result and normally puts it to sleep.',
+      supplementalContext: true,
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
         context: z
@@ -1428,6 +1439,10 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         const status = statusForCaller(caller);
         const me = status.self;
         const state = status.state;
+        if (!me) return {
+          content: [{ type: 'text' as const, text: 'No workers or retained worker history belong to this conversation. Use agents action=spawn if the task needs workers.' }],
+          structuredContent: { action: 'status', run_id: null, self: null, agents: [], free_worker_slots: status.freeWorkerSlots }
+        };
         const failed = state.agents.filter((info) => info.state === 'failed');
         // The word the model reads here is the whole answer to "may I use this worker again".
         // A sleeping worker is not a spent one, and calling it finished in this table is what
@@ -2109,7 +2124,7 @@ interface ReadOneOptions {
   startLine?: number;
   endLine?: number;
   maxBytes: number;
-  aggregateBytes: number;
+  imageBase64Chars: number;
 }
 
 interface ReadTarget {
@@ -2232,21 +2247,21 @@ async function readOne(
     // decoded identically. `view_image` still exists in its own right: it is Codex's tool, with
     // Codex's name, schema and errors, and this branch is only `read` continuing to answer "what
     // is at this path" for a path that happens to be a picture.
-    // Do not inherit the 64 KiB text-section default: ordinary screenshots are not text.
-    // The enclosing read call still has a 512 KiB aggregate wire budget, and the base64
-    // representation—not merely the smaller compressed file—is what consumes it.
+    // Text and image representations have separate aggregate bounds. An ordinary screenshot
+    // must not fail solely because it is larger than the text budget. Still charge base64,
+    // not just compressed file bytes, and refuse an exhausted image batch before decoding.
+    if (options.imageBase64Chars <= 0) throw new Error('Read image output cap reached; read remaining images in another call or use view_image.');
     const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
     logInfo(`tool read image ${resolved.virtual} (${formatBytes(image.bytes)})`);
     const text = `--- ${resolved.virtual} — ${formatBytes(image.bytes)} ${image.mimeType} ---`;
-    const responseBytes = Buffer.byteLength(text, 'utf8') + image.base64.length;
-    if (responseBytes > options.aggregateBytes) {
+    if (image.base64.length > options.imageBase64Chars) {
       throw new Error(
-        `Image response would exceed read's ${formatBytes(MAX_READ_BYTES)} aggregate output cap; use view_image for this file.`
+        `Read image output cap reached (${MAX_READ_IMAGE_BASE64_CHARS.toLocaleString('en-US')} base64 characters per call); read remaining images in another call or use view_image.`
       );
     }
     return {
       text,
-      bytes: responseBytes,
+      bytes: Buffer.byteLength(text, 'utf8'),
       image: { data: image.base64, mimeType: image.mimeType }
     };
   }

@@ -25,7 +25,7 @@ vi.mock('electron', () => ({
 
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
-const { initDurableStore } = await import('../src/main/durable.js');
+const { initDurableStore, readDurable } = await import('../src/main/durable.js');
 const { appendEvent, createSession, observeSessionModel, initSessionStore, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
@@ -150,20 +150,371 @@ it('rolls back a failed recovery revocation and keeps the successful tombstone i
     await expect(goal.withdrawRecoveryGoalReplyNow(conversationId, 'silence:old')).rejects.toThrow('revocation write failed');
     expect(goal.goalPendingReplyFor(conversationId)).not.toBeNull();
     await goal.withdrawRecoveryGoalReplyNow(conversationId, 'silence:old');
-    await goal.setGoalReplyActiveNow(conversationId, true);
+    await goal.tryActivateGoalReplyNow(conversationId);
     expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
     expect(goal.goalViewFor(conversationId)).toBeNull();
   } finally { spy.mockRestore(); }
 });
 
-it('writes proof-bearing Goal obligations under a new snapshot version while still reading shipped v1 state', async () => {
+it('does not let failed recovery deferral become a revocation rollback predecessor', async () => {
+  const conversationId = 'recovery-deferral-publication-fence';
+  const session = await createSession({ conversationId, title: 'Recovery deferral publication fence' });
+  goal.restoreGoalReplies({
+    version: 1,
+    savedAt: Date.now(),
+    replies: [{
+      conversationId,
+      sessionId: session.id,
+      replyId: 'silence:stable',
+      turnId: 'recovery-turn',
+      eventSeq: 1,
+      acceptedAt: Date.now(),
+      state: 'pending',
+      recovery: {
+        proof: {
+          kind: 'recovered-silence',
+          conversationId,
+          turnId: 'source-turn',
+          headSeq: 1,
+          mcpCallSeq: 1,
+          modelClass: 'pro'
+        }
+      }
+    }]
+  });
+
+  const durable = await import('../src/main/durable.js');
+  const write = durable.writeDurableNow;
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let goalWrites = 0;
+  const spy = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (name, value) => {
+    if (name !== goal.GOAL_REPLIES_STATE) return write(name, value);
+    goalWrites += 1;
+    if (goalWrites === 1) {
+      enter();
+      await gate;
+      throw new Error('deferral write failed');
+    }
+    if (goalWrites === 2) throw new Error('revocation write failed');
+    return write(name, value);
+  });
+
+  try {
+    const deferral = goal.deferRecoveryGoalReplyNow(conversationId, 'recovery-turn');
+    await entered;
+
+    let revocationSettled = false;
+    const revocation = goal.withdrawRecoveryGoalReplyNow(conversationId, 'silence:stable')
+      .finally(() => { revocationSettled = true; });
+    await Promise.resolve();
+    expect(revocationSettled).toBe(false);
+
+    release();
+    await expect(deferral).rejects.toThrow('deferral write failed');
+    await expect(revocation).rejects.toThrow('revocation write failed');
+    expect(goal.snapshotGoalReplies().replies).toContainEqual(
+      expect.objectContaining({
+        conversationId,
+        replyId: 'silence:stable',
+        state: 'pending',
+        recovery: expect.not.objectContaining({ notBefore: expect.any(Number) })
+      })
+    );
+  } finally {
+    release();
+    spy.mockRestore();
+    await durable.flushDurable();
+  }
+});
+
+it('serializes callers that were already waiting on the same older Goal publication', async () => {
+  const conversationId = 'goal-publication-waiter-serialization';
+  const session = await createSession({ conversationId, title: 'Goal publication waiter serialization' });
+  goal.restoreGoalReplies({
+    version: 1,
+    savedAt: Date.now(),
+    replies: [{
+      conversationId,
+      sessionId: session.id,
+      replyId: 'silence:stable',
+      turnId: 'recovery-turn',
+      eventSeq: 1,
+      acceptedAt: Date.now(),
+      state: 'pending',
+      recovery: {
+        proof: {
+          kind: 'recovered-silence',
+          conversationId,
+          turnId: 'source-turn',
+          headSeq: 1,
+          mcpCallSeq: 1,
+          modelClass: 'pro'
+        }
+      }
+    }]
+  });
+
+  const durable = await import('../src/main/durable.js');
+  const write = durable.writeDurableNow;
+  let enterFirst!: () => void;
+  let releaseFirst!: () => void;
+  const firstEntered = new Promise<void>((resolve) => { enterFirst = resolve; });
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let enterSecond!: () => void;
+  let releaseSecond!: () => void;
+  const secondEntered = new Promise<void>((resolve) => { enterSecond = resolve; });
+  const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  let goalWrites = 0;
+  const spy = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (name, value) => {
+    if (name !== goal.GOAL_REPLIES_STATE) return write(name, value);
+    goalWrites += 1;
+    if (goalWrites === 1) {
+      enterFirst();
+      await firstGate;
+      throw new Error('first deferral failed');
+    }
+    if (goalWrites === 2) {
+      enterSecond();
+      await secondGate;
+      throw new Error('second deferral failed');
+    }
+    throw new Error('revocation failed');
+  });
+
+  try {
+    const firstDeferral = goal.deferRecoveryGoalReplyNow(conversationId, 'recovery-turn');
+    await firstEntered;
+
+    const secondDeferral = goal.deferRecoveryGoalReplyNow(conversationId, 'recovery-turn');
+    const secondDeferralResult = secondDeferral.then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (error: unknown) => ({ status: 'rejected' as const, error })
+    );
+    const revocation = goal.withdrawRecoveryGoalReplyNow(conversationId, 'silence:stable');
+    const revocationResult = revocation.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, error })
+    );
+
+    releaseFirst();
+    await expect(firstDeferral).rejects.toThrow('first deferral failed');
+    await secondEntered;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(goalWrites).toBe(2);
+
+    releaseSecond();
+    const deferred = await secondDeferralResult;
+    expect(deferred.status).toBe('rejected');
+    if (deferred.status === 'rejected') expect(deferred.error).toEqual(expect.objectContaining({ message: 'second deferral failed' }));
+    const revoked = await revocationResult;
+    expect(revoked.status).toBe('rejected');
+    if (revoked.status === 'rejected') expect(revoked.error).toEqual(expect.objectContaining({ message: 'revocation failed' }));
+    expect(goal.snapshotGoalReplies().replies).toContainEqual(
+      expect.objectContaining({
+        conversationId,
+        replyId: 'silence:stable',
+        state: 'pending',
+        recovery: expect.not.objectContaining({ notBefore: expect.any(Number) })
+      })
+    );
+  } finally {
+    releaseFirst();
+    releaseSecond();
+    spy.mockRestore();
+    await durable.flushDurable();
+  }
+});
+
+it('writes source-turn-bearing Goal obligations under a new snapshot version while still reading shipped v1 state', async () => {
   const conversationId = 'goal-recovery-snapshot-version';
   const session = await createSession({ conversationId, title: 'Snapshot version' });
   goal.restoreGoalReplies({ version: 1, savedAt: Date.now(), replies: [{ conversationId, sessionId: session.id,
     replyId: 'legacy-final', turnId: 'legacy-turn', eventSeq: 1, acceptedAt: Date.now(), state: 'pending' }] });
   expect(goal.goalPendingReplyFor(conversationId)?.replyId).toBe('legacy-final');
-  expect(goal.snapshotGoalReplies()).toMatchObject({ version: 2 });
+  expect(goal.snapshotGoalReplies()).toMatchObject({ version: 4 });
+  await goal.migrateLegacyGoalRepliesNow();
+  expect(await readDurable(goal.GOAL_REPLIES_STATE)).toMatchObject({ version: 4 });
 });
+
+it.each([
+  ['empty', { kind: 'turn', turnId: '' }],
+  ['whitespace', { kind: 'turn', turnId: '   ' }],
+  ['padded', { kind: 'reply', messageId: ' reply-id ' }],
+  ['overlong', { kind: 'turn', turnId: 't'.repeat(257) }],
+  ['extra-field', { kind: 'turn', turnId: 'same-turn', guessed: true }]
+] as const)('never reconstructs executable authority for a malformed current Goal source (%s)', async (_case, source) => {
+  const conversationId = `goal-malformed-current-source-${_case}`;
+  const session = await createSession({ conversationId, title: 'Malformed current Goal source' });
+  await appendEvent(session.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'same-turn' });
+  await appendEvent(session.id, { time: 2, source: 'extension', kind: 'turn_end', turnId: 'same-turn', outcome: 'completed' });
+
+  goal.restoreGoalReplies({
+    version: 4,
+    savedAt: Date.now(),
+    replies: [{
+      conversationId,
+      sessionId: session.id,
+      replyId: 'stable-final',
+      generationId: 'same-turn',
+      // Deliberately malformed current-schema authority. Legacy snapshots may be migrated from
+      // their old identity fields; a broken v4 row must fail closed instead of taking that path.
+      source,
+      eventSeq: 2,
+      acceptedAt: Date.now(),
+      state: 'pending'
+    }]
+  } as unknown as Parameters<typeof goal.restoreGoalReplies>[0]);
+
+  await goal.migrateLegacyGoalRepliesNow();
+  expect(goal.snapshotGoalReplies().replies).toContainEqual(
+    expect.objectContaining({ conversationId, source: null, state: 'handled' })
+  );
+  expect(await readDurable(goal.GOAL_REPLIES_STATE)).toMatchObject({
+    version: 4,
+    replies: [expect.objectContaining({ conversationId, source: null, state: 'handled' })]
+  });
+  expect(await goal.tryActivateGoalReplyNow(conversationId)).toBe(false);
+});
+
+
+it('does not expose pending Goal authority until its durable publication settles', async () => {
+  const conversationId = 'goal-pending-publication-barrier';
+  const session = await createSession({ conversationId, title: 'Goal pending publication barrier' });
+  const durable = await import('../src/main/durable.js');
+  const write = durable.writeDurableNow;
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const spy = vi.spyOn(durable, 'writeDurableNow')
+    .mockImplementationOnce(async (name, value) => {
+      enter();
+      await gate;
+      await write(name, value);
+    })
+    .mockImplementation(write);
+  try {
+    const admission = goal.acceptGoalReplyNow({
+      conversationId,
+      sessionId: session.id,
+      replyId: 'stable-final',
+      turnId: 'stable-turn',
+      eventSeq: 1,
+      blocked: false
+    });
+    await entered;
+
+    expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+    expect(goal.pendingGoalReplies()).not.toContainEqual(expect.objectContaining({ conversationId }));
+
+    let sourceSettled = false;
+    const source = goal.goalPendingSourceForInput(conversationId, session.id).then((value) => {
+      sourceSettled = true;
+      return value;
+    });
+    await Promise.resolve();
+    expect(sourceSettled).toBe(false);
+
+    let duplicateSettled = false;
+    const duplicate = goal.acceptGoalReplyNow({
+      conversationId,
+      sessionId: session.id,
+      replyId: 'stable-final',
+      turnId: 'stable-turn',
+      eventSeq: 1,
+      blocked: false
+    }).then((accepted) => {
+      duplicateSettled = true;
+      return accepted;
+    });
+    await Promise.resolve();
+    expect(duplicateSettled).toBe(false);
+
+    release();
+    await expect(admission).resolves.toBe(true);
+    await expect(duplicate).resolves.toBe(true);
+    await expect(source).resolves.toEqual({ kind: 'turn', turnId: 'stable-turn' });
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({
+      replyId: 'stable-final',
+      source: { kind: 'turn', turnId: 'stable-turn' },
+      turnId: 'stable-turn'
+    });
+  } finally {
+    release();
+    spy.mockRestore();
+  }
+});
+
+it.each([
+  ['succeeds', 'succeeds', 'handled'],
+  ['fails', 'succeeds', 'handled'],
+  ['succeeds', 'fails', 'pending'],
+  ['fails', 'fails', 'handled']
+] as const)(
+  'keeps Goal publication/revocation rollback fail-closed when publication %s and revocation %s',
+  async (publicationOutcome, revocationOutcome, finalState) => {
+    const conversationId = `goal-publication-revocation-${publicationOutcome}-${revocationOutcome}`;
+    const session = await createSession({ conversationId, title: 'Goal publication/revocation ordering' });
+    await appendEvent(session.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'stable-turn' });
+    await appendEvent(session.id, { time: 2, source: 'extension', kind: 'turn_end', turnId: 'stable-turn', outcome: 'completed' });
+    await goal.acceptGoalReplyNow({
+      conversationId,
+      sessionId: session.id,
+      replyId: 'stable-final',
+      turnId: 'stable-turn',
+      eventSeq: 2,
+      blocked: false
+    });
+    await goal.deactivateGoalReplyNow(conversationId);
+
+    const durable = await import('../src/main/durable.js');
+    const write = durable.writeDurableNow;
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let goalWrites = 0;
+    const spy = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (name, value) => {
+      if (name !== goal.GOAL_REPLIES_STATE) return write(name, value);
+      goalWrites += 1;
+      if (goalWrites === 1) {
+        enter();
+        await gate;
+        if (publicationOutcome === 'fails') throw new Error('pending publication failed');
+      } else if (goalWrites === 2 && revocationOutcome === 'fails') {
+        throw new Error('revocation failed');
+      }
+      return write(name, value);
+    });
+
+    try {
+      const publication = goal.tryActivateGoalReplyNow(conversationId);
+      await entered;
+      expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+
+      let revocationSettled = false;
+      const revocation = goal.deactivateGoalReplyNow(conversationId).finally(() => { revocationSettled = true; });
+      await Promise.resolve();
+      expect(revocationSettled).toBe(false);
+
+      release();
+      const [published, revoked] = await Promise.allSettled([publication, revocation]);
+      expect(published.status).toBe(publicationOutcome === 'succeeds' ? 'fulfilled' : 'rejected');
+      expect(revoked.status).toBe(revocationOutcome === 'succeeds' ? 'fulfilled' : 'rejected');
+      expect(goal.snapshotGoalReplies().replies).toContainEqual(
+        expect.objectContaining({ conversationId, state: finalState })
+      );
+      expect(goal.goalPendingReplyFor(conversationId) !== null).toBe(finalState === 'pending');
+    } finally {
+      release();
+      spy.mockRestore();
+      await durable.flushDurable();
+    }
+  }
+);
 
 it('projects the driver for each mode and preserves the active draft identity', async () => {
   const config = defaultConfig();
@@ -1642,6 +1993,7 @@ describe('a chat driven towards a specific goal', () => {
 
     expect(goal.goalPendingReplyFor('c-reply-stable')).toEqual({
       replyId: 'assistant-message-stable',
+      source: { kind: 'turn', turnId: 'g-before-reload' },
       turnId: 'g-before-reload',
       eventSeq: 12,
       acceptedAt: expect.any(Number)
@@ -1687,7 +2039,7 @@ describe('a chat driven towards a specific goal', () => {
     expect(goal.snapshotGoalReplies().replies).toContainEqual(
       expect.objectContaining({
         replyId: 'assistant-stable-provisional-upgrade',
-        turnId,
+        generationId: turnId,
         eventSeq: 12,
         state: 'handled'
       })
@@ -1735,9 +2087,12 @@ describe('a chat driven towards a specific goal', () => {
 
   it('durably cancels a pending ticket on Off and re-arms that stable final on On', async () => {
     const conversationId = 'c-reply-switch-rearm';
+    const session = await createSession({ conversationId });
+    await appendEvent(session.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 'g-switch-rearm' });
+    await appendEvent(session.id, { time: 2, source: 'extension', kind: 'turn_end', turnId: 'g-switch-rearm', outcome: 'completed' });
     await goal.acceptGoalReplyNow({
       conversationId,
-      sessionId: 'session-reply-switch-rearm',
+      sessionId: session.id,
       replyId: 'assistant-message-switch-rearm',
       turnId: 'g-switch-rearm',
       eventSeq: 14,
@@ -1748,7 +2103,7 @@ describe('a chat driven towards a specific goal', () => {
     });
     const firstPickupAt = goal.goalPendingReplyFor(conversationId)!.acceptedAt;
 
-    expect(await goal.setGoalReplyActiveNow(conversationId, false)).toBe(true);
+    expect(await goal.deactivateGoalReplyNow(conversationId)).toBe(true);
     expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
     const off = goal.snapshotGoalReplies();
     expect(off.replies).toContainEqual(
@@ -1760,7 +2115,7 @@ describe('a chat driven towards a specific goal', () => {
     goal.restoreGoalReplies(off);
     expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
 
-    expect(await goal.setGoalReplyActiveNow(conversationId, true)).toBe(true);
+    expect(await goal.tryActivateGoalReplyNow(conversationId)).toBe(true);
     expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({
       replyId: 'assistant-message-switch-rearm',
       turnId: 'g-switch-rearm'
@@ -1768,20 +2123,86 @@ describe('a chat driven towards a specific goal', () => {
     expect(goal.goalPendingReplyFor(conversationId)!.acceptedAt).toBeGreaterThan(firstPickupAt);
   });
 
+  it('re-arms a stable reply boundary after reload when its page turn id was lost', async () => {
+    const conversationId = 'c-reply-boundary-switch-rearm';
+    const replyId = 'assistant-reply-boundary-switch-rearm';
+    const session = await createSession({ conversationId });
+    await appendEvent(session.id, {
+      time: 2,
+      source: 'extension',
+      kind: 'assistant_message',
+      messageId: replyId,
+      message: { text: 'complete', truncated: false, chars: 8 },
+      state: 'final',
+      final: true,
+      goalEligible: true
+    });
+    await goal.acceptGoalReplyNow({
+      conversationId,
+      sessionId: session.id,
+      replyId,
+      turnId: `reply:${replyId}`,
+      eventSeq: 2,
+      blocked: false
+    });
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({
+      source: { kind: 'reply', messageId: replyId }
+    });
+
+    await goal.deactivateGoalReplyNow(conversationId);
+    const off = goal.snapshotGoalReplies();
+    goal.resetGoalStateForTests();
+    goal.restoreGoalReplies(off);
+
+    expect(await goal.tryActivateGoalReplyNow(conversationId)).toBe(true);
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({
+      replyId,
+      source: { kind: 'reply', messageId: replyId },
+      turnId: `reply:${replyId}`
+    });
+  });
+
+  it.each(['already-working', 'work-arrived-during-read'])('does not re-arm a handled reply when activation is %s', async scenario => {
+    const conversationId = `c-activation-${scenario}`;
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: `session-${scenario}`, replyId: 'old-final', turnId: 'old-turn', eventSeq: 14, blocked: false });
+    await goal.deactivateGoalReplyNow(conversationId);
+    const before = goal.snapshotGoalReplies().replies.find(row => row.conversationId === conversationId);
+    const current = vi.fn().mockReturnValue(false);
+    if (scenario === 'work-arrived-during-read') current.mockReturnValueOnce(true);
+    expect(await goal.tryActivateGoalReplyNow(conversationId, current)).toBe(false);
+    expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+    expect(goal.snapshotGoalReplies().replies.find(row => row.conversationId === conversationId)).toEqual(before);
+    expect(current).toHaveBeenCalledTimes(scenario === 'already-working' ? 1 : 2);
+  });
+
+  it.each(['user_message', 'turn_start'] as const)('does not re-arm an older final across a newer %s without active metadata', async kind => {
+    const conversationId = `activation-boundary-${kind}`;
+    const session = await createSession({ conversationId });
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'older-final', turnId: 'older-turn', eventSeq: 1, blocked: false });
+    await goal.deactivateGoalReplyNow(conversationId);
+    await appendEvent(session.id, { time: Date.now(), source: 'extension', turnId: 'new-turn',
+      ...(kind === 'user_message' ? { kind, message: { text: 'new request', chars: 11, truncated: false } } : { kind }) });
+    expect(await goal.tryActivateGoalReplyNow(conversationId)).toBe(false);
+    expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
+  });
+
   it('keeps an expired ticket as the stable-final tombstone a later On can re-arm', async () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-09-01T08:00:00Z'));
       const conversationId = 'c-reply-expired-rearm';
+      const session = await createSession({ conversationId });
+      await appendEvent(session.id, { time: Date.now() - 2, source: 'extension', kind: 'turn_start', turnId: 'g-expired-rearm' });
+      await appendEvent(session.id, { time: Date.now() - 1, source: 'extension', kind: 'turn_end', turnId: 'g-expired-rearm', outcome: 'completed' });
       await goal.acceptGoalReplyNow({
         conversationId,
-        sessionId: 'session-reply-expired-rearm',
+        sessionId: session.id,
         replyId: 'assistant-message-expired-rearm',
         turnId: 'g-expired-rearm',
         eventSeq: 15,
         blocked: false
       });
-      expect(await goal.setGoalReplyActiveNow(conversationId, false)).toBe(true);
+      expect(await goal.deactivateGoalReplyNow(conversationId)).toBe(true);
 
       vi.advanceTimersByTime(13 * 60 * 60_000);
       expect(goal.goalPendingReplyFor(conversationId)).toBeNull();
@@ -1791,7 +2212,7 @@ describe('a chat driven towards a specific goal', () => {
         expect.objectContaining({ conversationId, state: 'handled' })
       );
 
-      expect(await goal.setGoalReplyActiveNow(conversationId, true)).toBe(true);
+      expect(await goal.tryActivateGoalReplyNow(conversationId)).toBe(true);
       expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({
         replyId: 'assistant-message-expired-rearm',
         turnId: 'g-expired-rearm'

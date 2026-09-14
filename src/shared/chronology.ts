@@ -25,6 +25,8 @@
  * into ChatGPT are the same record, and they must not be able to disagree about its order.
  */
 
+import { projectTurnSegments } from './turn-segments.js';
+
 /** The minimum an entry needs to be placed. Both consumers' shapes satisfy it structurally. */
 export interface Chronological {
   seq: number;
@@ -82,24 +84,14 @@ function closing<T extends Chronological>(group: readonly T[]): T | null {
  */
 export function chronological<T extends Chronological>(entries: readonly T[]): T[] {
   const position = (entry: T): number => positionOf(entry);
-  const bySeq = [...entries].sort((a, b) => position(a) - position(b) || a.seq - b.seq);
-  // Only turns this window actually opened. A tail delivered from a cursor can hold events of
-  // a turn whose `turn_start` is far behind it, and a group with no anchor has no bounded
-  // extent — its members could be reordered past events that are not part of it at all. Those
-  // keep their seq position, which is the honest answer for a window that cannot see the turn.
-  const anchors = new Map<string, number>();
-  // Where each opened turn stops, so an event that names no turn can be told whether it
-  // happened inside one. A turn still running has no end and holds everything after it.
-  const ends = new Map<number, number>();
-  for (const entry of bySeq) {
-    if (entry.kind === 'turn_start' && entry.turnId && !anchors.has(entry.turnId)) {
-      anchors.set(entry.turnId, position(entry));
-    }
-    if (entry.kind === 'turn_end' && entry.turnId) {
-      const anchor = anchors.get(entry.turnId);
-      if (anchor !== undefined) ends.set(anchor, Math.max(ends.get(anchor) ?? 0, entry.time));
-    }
-  }
+  // Only turns this window actually opened are reorderable. A tail delivered from a cursor can
+  // contain a turn whose start is far behind it, so a group with no local segment anchor keeps
+  // append order. Corrective same-id reopens are projected once in the shared segment fold.
+  const projection = projectTurnSegments(entries);
+  const bySeq = projection.entries;
+  const ends = new Map(
+    projection.segments.flatMap(segment => segment.endTime === undefined ? [] : [[segment.anchor, segment.endTime] as const])
+  );
 
   // Position within a turn. The boundaries are the boundaries whatever their timestamps say:
   // a turn cannot begin after its own first observation or end before its last, and the times
@@ -140,11 +132,12 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
       const end = ends.get(activeAnchor);
       if (end === undefined || entry.time <= end) inferredAnchor = activeAnchor;
     }
-    const anchor = (entry.turnId ? anchors.get(entry.turnId) : inferredAnchor) ?? entryPosition;
+    const explicitSegment = projection.segmentByEntry.get(entry);
+    const anchor = explicitSegment?.anchor ?? inferredAnchor ?? entryPosition;
     const held = groups.get(anchor);
     if (held) held.push(entry);
     else groups.set(anchor, [entry]);
-    if (entry.kind === 'turn_start' && entry.turnId) pendingAnchor = anchors.get(entry.turnId);
+    if (entry.kind === 'turn_start' && explicitSegment) pendingAnchor = anchor;
   }
 
   const out: T[] = [];
