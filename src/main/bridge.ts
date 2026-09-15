@@ -85,6 +85,7 @@ import {
 import { logInfo, logWarn } from './logger.js';
 import {
   closeConversation,
+  liveConversationFor,
   liveConversations,
   noteChatOrigin,
   recordAgentMessage,
@@ -105,7 +106,7 @@ import {
   readSessionPlan,
   listUsageSessions,
   readRecentEvents,
-  readTurnStartContext,
+  readCurrentTurnAuthority,
   readActivityEvents,
   sessionDurableModifiedAt
 } from './session/store.js';
@@ -394,7 +395,7 @@ export interface BridgeCommand {
   projectEntry?: { id: string; sourceConversationId: string };
   kind: 'open-chat' | 'stop-turn';
   turnId?: string;
-  userMessageId?: string;
+  openingUserMessageId?: string;
   /**
    * Why this chat is being opened.
    *
@@ -686,17 +687,42 @@ const OBSERVATION_KINDS = new Set([
   'page_tool',
   'turn_start',
   'turn_end',
+  'recording_gap',
   'chat_error',
   // Not stored as transcript content. These request records populate the exact
   // requestId -> conversationId correlation registry.
   'tool_evidence'
 ]);
 const OUTCOMES = new Set(['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown']);
+const RECORDING_GAP_REASONS = new Set([
+  'invalid_lifecycle_identity',
+  'invalid_observation_identity',
+  'page_queue_overflow',
+  'worker_journal_overflow',
+  'observation_too_large',
+  'bridge_rejected_observation'
+]);
+const RECORDING_GAP_LOST_KINDS = new Set([
+  'model_selection',
+  'conversation_title',
+  'user_message',
+  'assistant_message',
+  'page_tool',
+  'progress',
+  'turn_start',
+  'turn_end',
+  'chat_error',
+  'tool_evidence',
+  'recording_gap',
+  'unknown'
+]);
 const MAX_OBSERVATIONS = 200;
 /** Connector requests accepted from one turn. Far above any real turn's call count. */
 const MAX_CALL_EVIDENCE = 200;
 /** The shape of a tool name we are willing to match a recorded call against. */
 const TOOL_NAME = /^[a-z0-9_.-]{1,64}$/i;
+/** Opaque provider/local observation ids are bounded but never rewritten or truncated. */
+const MAX_OBSERVATION_ID_CHARS = 256;
 
 /**
  * Rebuilds the per-call evidence the page reported, field by field.
@@ -721,6 +747,11 @@ const TOOL_NAME = /^[a-z0-9_.-]{1,64}$/i;
  *   evidence window, so the call was filed under Unattributed activity while the page had
  *   been able to name its owner the whole time.
  */
+function parseOpaqueObservationId(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_OBSERVATION_ID_CHARS) return undefined;
+  return /[\u0000-\u001f\u007f]/.test(value) ? undefined : value;
+}
+
 function parseCallEvidence(input: unknown, untooled = false): PageCallEvidence[] {
   if (!Array.isArray(input)) return [];
   const out: PageCallEvidence[] = [];
@@ -730,7 +761,7 @@ function parseCallEvidence(input: unknown, untooled = false): PageCallEvidence[]
     if (!raw || typeof raw !== 'object') continue;
     const item = raw as Record<string, unknown>;
     const tool = typeof item['tool'] === 'string' && TOOL_NAME.test(item['tool']) ? item['tool'] : '';
-    const messageId = typeof item['messageId'] === 'string' ? item['messageId'].slice(0, 120) : '';
+    const messageId = parseOpaqueObservationId(item['messageId']) ?? '';
     const bare = untooled && typeof item['requestId'] === 'string';
     if ((!tool && !bare) || !messageId) continue;
     if (seen.has(messageId)) {
@@ -801,12 +832,70 @@ function parseObservations(input: unknown): ChatObservation[] {
         /^image\/[a-z0-9.+-]{1,80}$/i.test(file.mimeType) && Number.isSafeInteger(file.size) && file.size >= 0 && file.size <= 512 * 1024 * 1024)
         .map(file => ({ id: file.id, name: file.name, size: file.size, mimeType: file.mimeType }));
     }
-    if (typeof item['messageId'] === 'string') observation.messageId = item['messageId'].slice(0, 100);
+    const messageId = parseOpaqueObservationId(item['messageId']);
+    if (messageId) observation.messageId = messageId;
     if (kind === 'assistant_message' && typeof item['providerMessageId'] === 'string' &&
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item['providerMessageId'])) {
       observation.providerMessageId = item['providerMessageId'];
     }
-    if (typeof item['turnId'] === 'string') observation.turnId = item['turnId'].slice(0, 100);
+    const turnId = parseOpaqueObservationId(item['turnId']);
+    if (turnId) observation.turnId = turnId;
+    if ((kind === 'user_message' || kind === 'assistant_message' || kind === 'page_tool') && !messageId) {
+      out.push({
+        kind: 'recording_gap',
+        time: observation.time,
+        gapReason: 'invalid_observation_identity',
+        lostKinds: { [kind]: 1 },
+        ...(turnId ? { affectedTurnId: turnId } : {}),
+        detail: 'A browser observation could not be stored because its stable message identity was missing or invalid.'
+      });
+      continue;
+    }
+    if (kind === 'turn_start') {
+      const openingUserMessageId = parseOpaqueObservationId(item['openingUserMessageId']);
+      // Protocol 18 starts are self-contained. Historical protocol-17 rows remain readable from
+      // the durable store; current browser traffic cannot create another identity-less start.
+      // Preserve the row's exact chronological position as an inert integrity gap rather than
+      // partially acknowledging its neighbors and posting a displaced marker later.
+      if (!turnId || !openingUserMessageId) {
+        out.push({
+          kind: 'recording_gap',
+          time: observation.time,
+          gapReason: 'invalid_lifecycle_identity',
+          lostKinds: { turn_start: 1 },
+          ...(turnId ? { affectedTurnId: turnId } : {}),
+          detail: 'A browser lifecycle observation could not be verified because its turn identity was incomplete or invalid.'
+        });
+        continue;
+      }
+      observation.openingUserMessageId = openingUserMessageId;
+    }
+    if (kind === 'turn_end' && !turnId) {
+      out.push({
+        kind: 'recording_gap',
+        time: observation.time,
+        gapReason: 'invalid_lifecycle_identity',
+        lostKinds: { turn_end: 1 },
+        detail: 'A browser lifecycle observation could not be verified because its turn identity was incomplete or invalid.'
+      });
+      continue;
+    }
+    if (kind === 'recording_gap') {
+      observation.gapReason = typeof item['reason'] === 'string' && RECORDING_GAP_REASONS.has(item['reason'])
+        ? item['reason'] as ChatObservation['gapReason']
+        : 'bridge_rejected_observation';
+      const lostKinds = item['lostKinds'];
+      if (lostKinds && typeof lostKinds === 'object' && !Array.isArray(lostKinds)) {
+        const parsed: NonNullable<ChatObservation['lostKinds']> = {};
+        for (const [lostKind, rawCount] of Object.entries(lostKinds as Record<string, unknown>)) {
+          if (!RECORDING_GAP_LOST_KINDS.has(lostKind) || !Number.isSafeInteger(rawCount) || Number(rawCount) <= 0) continue;
+          parsed[lostKind as keyof typeof parsed] = Math.min(1_000_000, Number(rawCount));
+        }
+        if (Object.keys(parsed).length > 0) observation.lostKinds = parsed;
+      }
+      const affectedTurnId = parseOpaqueObservationId(item['affectedTurnId']);
+      if (affectedTurnId) observation.affectedTurnId = affectedTurnId;
+    }
     if (typeof item['renderedHtml'] === 'string') observation.renderedHtml = item['renderedHtml'].slice(0, 120_000);
     if (item['state'] === 'streaming' || item['state'] === 'final') observation.state = item['state'];
     if (typeof item['fiberConversationId'] === 'string') {
@@ -964,6 +1053,7 @@ export type SessionControlsView = {
   queueAtFinish?: boolean;
   canInject?: boolean;
   canSendDirectly?: boolean;
+  canStop?: boolean;
   finishWaiting?: boolean;
   stopPending?: boolean;
   goalDraft?: Pick<import('./goal.js').GoalDraftView, 'stage' | 'model' | 'text' | 'error'> | null;
@@ -990,16 +1080,28 @@ export async function sessionControlsFor(sessionId: string): Promise<SessionCont
   // A persisted start is history, not proof that the provider is still generating.
   // Reuse the recorder's process-local observation (or an exact attributed running
   // tool) so opening old recordings after restart cannot resurrect Stop/Working.
-  const live = liveConversations().find(entry => entry.conversationId === id && entry.sessionId === sessionId);
+  const live = liveConversationFor(id, sessionId);
   const activityExpiry = sessionActivityExpiresAt(session);
   const stopping = commands.some(c => c.spec.type === 'stop' && c.spec.sessionId === sessionId && c.spec.turnId === session.activeTurnId);
   const activeTurnId = session.activeTurnId &&
     (stopping || runningToolCalls(id) > 0 || (activityExpiry !== undefined ? activityExpiry !== null && activityExpiry > Date.now() :
-      live?.activeTurnId === session.activeTurnId)) ? session.activeTurnId : null;
+      live?.activeTurn?.id === session.activeTurnId)) ? session.activeTurnId : null;
+  let canStop = false;
+  if (activeTurnId) {
+    if (live?.activeTurn?.id === activeTurnId) {
+      // A queued Stop is durable intent, not authority. New contradictory/damaged evidence can
+      // leave that intent pending while native Stop is no longer executable.
+      canStop = live.activeTurn.integrity === 'intact' && live.activeTurn.opening.status === 'exact';
+    } else {
+      const authority = await readCurrentTurnAuthority(sessionId, activeTurnId);
+      canStop = authority.status === 'found' && authority.context.integrity === 'intact' &&
+        authority.context.opening.status === 'exact';
+    }
+  }
   const finishHeld = !blocked && await sessionFinishHeld(sessionId, activeTurnId, id);
   const draft = goalViewFor(id);
   const inputPolicy = await sessionInputPolicy(sessionId, sessionInputActivity(session));
-  return { sessionId, plan: await readSessionPlan(sessionId), conversationId: id, activeTurnId, finishHeld,
+  return { sessionId, plan: await readSessionPlan(sessionId), conversationId: id, activeTurnId, finishHeld, canStop,
     queueAtFinish: !blocked && inputPolicy.queueAtFinish, canInject: !blocked && inputPolicy.canInject,
     canSendDirectly: !blocked && !!inputPolicy.directTurn,
     finishGoalDraft: getSessionFinishDraft(sessionId, activeTurnId),
@@ -1016,7 +1118,10 @@ export async function sessionControlsFor(sessionId: string): Promise<SessionCont
 /** One absolute budget includes opening an absent tab and native hydration. */
 export const STOP_COMMAND_TIMEOUT_MS = 120_000;
 async function stopUserAnchor(sessionId: string, turnId: string): Promise<string | undefined> {
-  return (await readTurnStartContext(sessionId, turnId))?.userMessageId ?? undefined;
+  const reconciled = await readCurrentTurnAuthority(sessionId, turnId);
+  return reconciled.status === 'found' && reconciled.context.opening.status === 'exact'
+    ? reconciled.context.opening.messageId
+    : undefined;
 }
 /** Stop is a request against one exact live turn, never a predicted final boundary. */
 export async function stopSessionTurn(sessionId: string, expectedTurnId: string): Promise<SessionControlsView> {
@@ -1026,22 +1131,37 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
     if (latest?.conversationId !== id || latest.activeTurnId !== expectedTurnId || !expectedTurnId ||
         await conversationWasSuperseded(id) || (await sessionControlsFor(sessionId)).activeTurnId !== expectedTurnId) throw new Error('active_turn_changed');
   };
+  // Resolve exact browser authority before mutating session policy. A damaged/unanchored turn
+  // must make Stop unavailable rather than disabling automation or cancelling continuation state.
+  const openingUserMessageId = await stopUserAnchor(sessionId, expectedTurnId);
   await assertCurrent();
-  await setSessionAutomation(sessionId, 'off');
-  await assertCurrent();
-  if (continuationForSession(sessionId)) { await cancelResumeNow(sessionId); await assertCurrent(); }
-  const userMessageId = await stopUserAnchor(sessionId, expectedTurnId);
-  await assertCurrent();
+  if (!openingUserMessageId) throw new Error('active_turn_identity_unavailable');
   const alreadyQueued = commands.some(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId && entry.spec.turnId === expectedTurnId);
-  const command = await queue({ type: 'stop', sessionId, conversationId: id, turnId: expectedTurnId, ...(userMessageId ? { userMessageId } : {}) });
+  const command = await queue({
+    type: 'stop',
+    sessionId,
+    conversationId: id,
+    turnId: expectedTurnId,
+    openingUserMessageId
+  });
+  if (command.spec.type !== 'stop') throw new Error('stop_request_not_durable');
+  const stopSpec = command.spec;
   try {
     // Admission is already durable. Lease before exposing it through /status so a restart cannot
     // turn a stop request the app acknowledged into an unowned queued row.
     if (!commands.includes(command) || (command.claimedAt === null && !await persistCommandLease(command, null, Date.now())))
       throw new Error('stop_request_not_durable');
-    await assertCurrent();
+    if (!await stopCommandCurrent(stopSpec)) throw new Error('active_turn_changed');
+    // Policy mutation is a consequence of this durable, still-current Stop intent. Re-check the
+    // exact identity after every await so a successor turn never inherits execution authority.
+    await setSessionAutomation(sessionId, 'off');
+    if (!await stopCommandCurrent(stopSpec)) throw new Error('active_turn_changed');
+    if (continuationForSession(sessionId)) {
+      await cancelResumeNow(sessionId);
+      if (!await stopCommandCurrent(stopSpec)) throw new Error('active_turn_changed');
+    }
     await releaseSessionFinish(sessionId, expectedTurnId, 'stop');
-    await assertCurrent();
+    if (!await stopCommandCurrent(stopSpec)) throw new Error('active_turn_changed');
   } catch (error) { await retire(command, 'stop request could not be saved or its turn changed'); throw error; }
   armDeadline(command);
   invalidateRecoveryContinuationsBestEffort(sessionId, id);
@@ -1056,17 +1176,25 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
     await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
       current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested && commands.includes(command) &&
         Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS &&
-        liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
+        liveConversationFor(id, sessionId)?.activeTurn?.id === expectedTurnId
     });
   }
   return sessionControlsFor(sessionId);
 }
 async function stopCommandCurrent(spec: Extract<CommandSpec, { type: 'stop' }>): Promise<boolean> {
   const session = await getSession(spec.sessionId);
-  return Boolean(session?.conversationId === spec.conversationId && session.activeTurnId === spec.turnId &&
-    !await conversationWasSuperseded(spec.conversationId));
+  if (session?.conversationId !== spec.conversationId || session.activeTurnId !== spec.turnId ||
+      await conversationWasSuperseded(spec.conversationId)) return false;
+  const live = liveConversationFor(spec.conversationId, spec.sessionId);
+  if (live?.activeTurn?.id === spec.turnId) {
+    return live.activeTurn.integrity === 'intact' && live.activeTurn.opening.status === 'exact' &&
+      live.activeTurn.opening.messageId === spec.openingUserMessageId;
+  }
+  const reconciled = await readCurrentTurnAuthority(spec.sessionId, spec.turnId);
+  return reconciled.status === 'found' && reconciled.context.opening.status === 'exact' &&
+    reconciled.context.opening.messageId === spec.openingUserMessageId;
 }
-function stopRequestedFor(conversationId: string, turnId = liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId): boolean {
+function stopRequestedFor(conversationId: string, turnId: string | null | undefined = liveConversationFor(conversationId)?.activeTurn?.id): boolean {
   return commands.some(command => command.spec.type === 'stop' && command.spec.conversationId === conversationId &&
     (!turnId || command.spec.turnId === turnId) && Date.now() - command.createdAt < STOP_COMMAND_TIMEOUT_MS);
 }
@@ -1258,8 +1386,8 @@ function goalActiveFor(id: string): boolean {
  * result, so mid-tool-call is already mid-turn here.
  */
 function chatIsWorking(conversationId: string): boolean {
-  const current = liveConversations().find((entry) => entry.conversationId === conversationId);
-  return Boolean(current && (current.generating || current.activeTurnId));
+  const current = liveConversationFor(conversationId);
+  return Boolean(current?.activeTurn);
 }
 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -1759,7 +1887,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // Publish that boundary to the existing wake channel instead of waiting for
       // the extension's idle maintenance poll. Claims still recheck exact state.
       if (!superseded && result.activity.terminal) wakeBrowserWork();
-      return json(res, 200, { sessionId: result.sessionId, stored: result.stored }, origin);
+      return json(res, 200, {
+        sessionId: result.sessionId,
+        stored: result.stored
+      }, origin);
     } finally {
       observationWritesInFlight -= 1;
     }
@@ -1782,10 +1913,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // page's own open turn, or this app's standing definition of a chat that is working —
       // an attributed call or current-turn observation inside the silence window.
       const lease = turnActivityByConversation.get(id);
+      const live = liveConversationFor(id);
       const working =
-        liveConversations().some(
-          (entry) => entry.conversationId === id && (entry.generating || Boolean(entry.activeTurnId))
-        ) || (!!lease && activityLeaseDeadline(lease) > Date.now());
+        Boolean(live?.activeTurn) || (!!lease && activityLeaseDeadline(lease) > Date.now());
       await closeConversation(id);
       // A browser tab closing is not evidence that the server-side ChatGPT turn has stopped.
       // In particular, after a swarm ends the retired-worker lease is the only authority fence
@@ -1866,16 +1996,40 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     };
     // Every open ChatGPT tab polls this for its own conversation every few seconds, so
     // this is the app's primary first-hand evidence of which chats exist right now.
-    let live = liveConversations().find((entry) => entry.conversationId === id);
+    let live = liveConversationFor(id);
     if (!live) {
       // `/activity` itself proves that this ChatGPT page is still open. After an app restart
       // the durable session can keep receiving exact MCP calls while the recorder's live map
       // is empty; returning an empty feed here leaves Overwrite stale forever. Reattach only
       // when a durable session already exists, so a random poll cannot manufacture history.
       await restoreRecordedConversation(id);
-      live = liveConversations().find((entry) => entry.conversationId === id);
+      live = liveConversationFor(id);
     }
     if (!live) {
+      const detachedGoal = await goalView();
+      const detachedSuperseded = superseded || await conversationWasSuperseded(id);
+      // `recordedSession` was read before several awaits above. Compact & Resume can move that
+      // exact local session to another ChatGPT conversation while this old page request is in
+      // flight. A no-live result is therefore not automatically an ordinary unattached page:
+      // revalidate the durable owner before publishing any session-derived capability.
+      if (detachedSuperseded || recordedSession) {
+        const currentRecordedSession = recordedSession ? await getSession(recordedSession.id) : null;
+        if (detachedSuperseded || (recordedSession && currentRecordedSession?.conversationId !== id)) {
+          return json(
+            res,
+            200,
+            {
+              sessionId: null,
+              entries: [],
+              stream: [],
+              userAnchors: [],
+              bootstrapMessageId: null,
+              nextSince: Number.isFinite(since) ? Math.max(0, since) : 0
+            },
+            origin
+          );
+        }
+      }
       return json(
         res,
         200,
@@ -1888,7 +2042,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           nextSince: Number.isFinite(since) ? Math.max(0, since) : 0,
           job: null,
           progress: conversationProgress(id),
-          goal: await goalView(),
+          goal: detachedGoal,
           ...(goalFencedChat(id) || superseded
             ? {
                 // Worker conversations are never Compact & Resume sources. Keep the page's
@@ -1917,11 +2071,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
     }
     const summary = await getSession(live.sessionId);
-    const activityExpiry = summary ? sessionActivityExpiresAt(summary) : undefined;
-    const hasActivityDeadline = activityExpiry !== undefined;
-    const activityCurrent = runningToolCalls(id) > 0 || (activityExpiry !== null && activityExpiry !== undefined && activityExpiry > Date.now());
-    const pendingStop = !superseded && summary?.conversationId === id && summary.activeTurnId === live.activeTurnId && stopRequestedFor(id, live.activeTurnId)
-      ? commands.find(command => command.spec.type === 'stop' && command.spec.sessionId === live!.sessionId && command.spec.turnId === live!.activeTurnId) : undefined;
     if (!automaticCompactionAllowed(summary)) await cancelAutomaticResumesNow(live.sessionId);
     // Worker chats and user-blocked chats alike: neither may auto-compact — see goalBlockReason.
     const workerBlocked = goalFencedChat(id);
@@ -2030,6 +2179,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           ];
         case 'chat_error':
           return [{ ...base, kind: 'chat_error', text: event.message.text }];
+        case 'recording_gap':
+          return [{
+            ...base,
+            kind: 'recording_gap',
+            reason: event.reason,
+            detail: event.detail ?? '',
+            lostKinds: event.lostKinds ?? null,
+            affectedTurnId: event.affectedTurnId ?? null
+          }];
         case 'turn_start':
           return [{ ...base, kind: 'turn_start' }];
         case 'turn_end':
@@ -2097,17 +2255,72 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           ]
         : []
     );
+    // Finish every asynchronous response projection before deciding which lifecycle identity a
+    // replacement document may adopt. A turn can end, a newer one can start, or Compact & Resume
+    // can move the session while any of the reads above are awaiting disk/provider state. Exact
+    // adoption authority therefore comes from one final durable read plus a synchronous live-map
+    // recheck, with no await between this point and publication.
+    const activityGoal = await goalView();
+    const revival = await pendingBrowserRevival();
+    const latestSummary = await getSession(live.sessionId);
+    const responseLive = liveConversationFor(id, live.sessionId);
+    // Do not project any session-wide destination rows into an old in-flight request after A -> B.
+    // The session survives the rebind, so reads assembled above can already contain B's activity.
+    // Without a conversation-scoped activity boundary there is nothing safe to salvage for A.
+    const responseSummary = latestSummary?.conversationId === id && responseLive ? latestSummary : null;
+    if (!responseSummary || !responseLive) {
+      return json(
+        res,
+        200,
+        {
+          sessionId: null,
+          generating: false,
+          tokens: 0,
+          entries: [],
+          stream: [],
+          userAnchors: [],
+          nextSince: requestedSince,
+          bootstrapMessageId: null
+        },
+        origin
+      );
+    }
+
+    const activityExpiry = sessionActivityExpiresAt(responseSummary);
+    const timedActivity = typeof activityExpiry === 'number';
+    const activeTools = runningToolCalls(id);
+    const activityCurrent = activeTools > 0 ||
+      (timedActivity && activityExpiry > Date.now());
+    const sameOpenTurn = !!responseLive.activeTurn && responseSummary.activeTurnId === responseLive.activeTurn.id;
+    const pendingStop = sameOpenTurn &&
+      stopRequestedFor(id, responseLive.activeTurn!.id)
+      ? commands.find(command => command.spec.type === 'stop' && command.spec.sessionId === responseLive.sessionId &&
+          command.spec.turnId === responseLive.activeTurn!.id)
+      : undefined;
+    const stopOpeningUserMessageId = pendingStop?.spec.type === 'stop' ? pendingStop.spec.openingUserMessageId : null;
+    const opening = sameOpenTurn ? responseLive.activeTurn!.opening : null;
+    const stopConsistent = !pendingStop ||
+      (opening?.status === 'exact' && opening.messageId === stopOpeningUserMessageId);
+    const turnLive = sameOpenTurn && Boolean(activityExpiry === undefined || activityCurrent || pendingStop);
+    const adoption = sameOpenTurn && responseLive.activeTurn!.integrity === 'intact' && opening?.status === 'exact' && stopConsistent &&
+      (activityExpiry !== null || activeTools > 0 || pendingStop)
+      ? { openingUserMessageId: opening.messageId }
+      : null;
+    const trackedTurn = sameOpenTurn
+      ? { id: responseLive.activeTurn!.id, live: turnLive, adoption }
+      : null;
+
     return json(
       res,
       200,
       {
-        sessionId: live.sessionId,
-        generating: hasActivityDeadline ? activityCurrent && live.generating : live.generating,
+        sessionId: responseLive.sessionId,
+        generating: trackedTurn?.live === true,
         // What the *currently attached* chat is carrying, not what the local session has
         // accumulated over its whole life. A session that has been compacted keeps its
         // history and its identity across the move, so a meter reading the lifetime figure
         // would come back full the moment the replacement chat opened and compact it again.
-        tokens: summary?.contextTokens ?? 0,
+        tokens: responseSummary?.contextTokens ?? 0,
         // What the composer's meter fills against. Sent from here rather than worked out in the
         // page so that the bar someone is watching and the threshold that acts are the same
         // number. The trigger itself is the app's — see considerAutomaticCompaction — and the
@@ -2119,18 +2332,18 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // different conversation, while the continuation transaction only knows how to move a
         // run's prime binding, so a worker that compacted would be stranded in B while the
         // broker still authorised A.
-        context: contextView(!workerBlocked && !superseded && automaticCompactionAllowed(summary)),
+        context: contextView(!workerBlocked && !superseded && automaticCompactionAllowed(responseSummary)),
         // This chat was opened by the app, so its first user message is not the user's —
         // it is the handoff brief or the worker bootstrap this app typed. The page uses
         // it to fold that message away. Read off the session record rather than remembered
         // in the tab, so it still holds after a reload, days later.
         // Session origin survives A -> B. The atomic rebind records which handoff
         // became this current chat; a desktop-origin session can therefore be resumed.
-        bootstrap: summary?.conversationId === id && summary.lastCommittedResumeHandoffId
-          ? 'resume' : summary?.origin?.kind ?? null,
+        bootstrap: responseSummary?.conversationId === id && responseSummary.lastCommittedResumeHandoffId
+          ? 'resume' : responseSummary?.origin?.kind ?? null,
         // Which worker this chat is, for the page's fold of the bootstrap. From the durable
         // origin, so a reloaded worker tab — which no longer holds its command — still knows.
-        bootstrapAgent: summary?.origin?.kind === 'worker' ? summary.origin.agentId ?? null : null,
+        bootstrapAgent: responseSummary?.origin?.kind === 'worker' ? responseSummary.origin.agentId ?? null : null,
         bootstrapMessageId,
         entries,
         stream,
@@ -2144,7 +2357,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // The goal loop: whether it is on, whether it *can* be on, and whatever draft this
         // chat currently has in flight. The draft's text grows on this feed, which is what
         // the panel above the composer streams — there is no second connection to hold open.
-        goal: await goalView(),
+        goal: activityGoal,
         // Local calls still executing for *this chat*. ChatGPT-native compaction waits for
         // this to reach zero after interrupting the turn, so the handoff is written about a
         // settled machine rather than one mid-edit. Recorder-only attribution settling is
@@ -2157,16 +2370,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // history; unknown ownership is conservatively projected onto every chat until that
         // attribution finishes, but this number never gates the compaction prompt.
         settlingTools: settlingToolCalls(live.conversationId),
-        // The generation this chat currently has open, if it has one. A content script that
-        // has just been reloaded into a turn already in flight adopts this instead of
-        // minting a second id for the same run. See liveConversations().
-        activeTurnId: hasActivityDeadline && !activityCurrent && !pendingStop ? null : live.activeTurnId ?? null,
-        ...(pendingStop?.spec.type === 'stop' ? { stopTurn: { turnId: pendingStop.spec.turnId, userMessageId: pendingStop.spec.userMessageId ?? null } } : {}),
+        // One tracked-turn object prevents a durable-but-non-adoptable turn from collapsing into
+        // absence. Liveness and replacement-document adoption remain independent capabilities.
+        turn: trackedTurn,
         // A revival names an existing worker conversation. The extension, which alone can
         // inspect Chrome's real tab set, routes it to that tab before it considers opening one.
         // Returning the same inert id here makes a live page the fast path; /status remains the
         // service-worker/restart path. Redeem is still the exclusive ownership boundary.
-        revival: await pendingBrowserRevival(),
+        revival,
         // Recovery only. A placement is normally collected by the `/compact` reply that
         // produced it; this is where it is still found if that reply never reached the page —
         // a navigation, a dropped socket — so a lost response becomes a correctly placed tab
@@ -2414,7 +2625,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         origin
       );
     }
-    const live = liveConversations().find((entry) => entry.conversationId === id);
+    const live = liveConversationFor(id);
     const known = live ? null : await findSessionByConversation(id, { requireUnique: true });
     const sessionId = live?.sessionId ?? known?.id ?? null;
     if (!sessionId) {
@@ -2719,7 +2930,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // old and this is the request that spends somebody's OpenRouter credit.
     if (!goalActiveFor(id)) return json(res, 409, { error: 'goal_disabled' }, origin);
     if (!(await goalKeyPresent(goalModeFor(id)))) return json(res, 409, { error: 'no_api_key' }, origin);
-    const live = liveConversations().find((entry) => entry.conversationId === id);
+    const live = liveConversationFor(id);
     const known = live ? null : await findSessionByConversation(id, { requireUnique: true });
     const sessionId = live?.sessionId ?? known?.id ?? null;
     if (!sessionId) {
@@ -3702,8 +3913,8 @@ async function wakeQueuedStoppedWorkers(ids: readonly string[], runId: string): 
  * its last write is hours old.
  */
 async function durableQuiescence(conversationId: string, now: number): Promise<DurableQuiescence> {
-  const live = liveConversations().find((entry) => entry.conversationId === conversationId);
-  if (live?.generating) return { quiescent: false, ended: false, lastOutcome: null };
+  const live = liveConversationFor(conversationId);
+  if (live?.activeTurn) return { quiescent: false, ended: false, lastOutcome: null };
   const summary = await findSessionByConversation(conversationId, {
     requireUnique: true
   });
@@ -4919,7 +5130,7 @@ export function sessionInputActivity(summary: SessionSummary): InputActivity {
   const mcpWindow = grant?.sessionId === summary.id && isActiveTurnActivity(grant) && grant.evidence === 'exact-mcp' &&
     (!summary.activeTurnId || summary.activeTurnId === grant.turnId) && grant.expiresAt > Date.now();
   const exact = !!mcpWindow || runningToolProgress(id) !== null ||
-    liveConversations().some(row => row.sessionId === summary.id && row.conversationId === id && !!row.activeTurnId);
+    Boolean(liveConversationFor(id, summary.id)?.activeTurn);
   return { exact, model: grant?.sessionId === summary.id && (grant.turnId === summary.activeTurnId || mcpWindow) ? grant.model : 'unknown',
     ...(exact && (summary.activeTurnId || (mcpWindow && grant?.turnId)) ? { turnId: summary.activeTurnId || grant!.turnId! } : {}),
     possible: exact || runningToolCalls(id) > 0 ||
@@ -5339,8 +5550,8 @@ let unattributedIncident: UnattributedIncident | null = null;
  * back in the queue, or the one failure this path exists for would be recorded as handled and
  * never tried again.
  *
- * `endedTurns` is how many turns the chat had already finished when this repair was filed, and
- * one more of them is what retires the entry: the broken turn is over. Without that, this map
+ * `terminalRevision` is the monotonic terminal boundary reserved when this repair was filed, and
+ * one later terminal boundary is what retires the entry. Without that, this map
  * would be permanent conversation state, and one repaired turn that never makes another tool
  * call would block every later broken turn in the same chat.
  *
@@ -5354,7 +5565,7 @@ let unattributedIncident: UnattributedIncident | null = null;
 interface Repair {
   /** Stable local owner; the browser action is valid only while this session is still here. */
   sessionId: string;
-  endedTurns: number;
+  terminalRevision: number;
   state: 'queued' | 'handed' | 'done';
   /** Stable identity of the failure/inactivity episode. A new activity stamp mints a new one. */
   episode: string;
@@ -5399,8 +5610,8 @@ const lastBrowserRecoveryAt = new Map<string, number>();
  * Every message the user sends buys the chat one reload for an error ChatGPT shows during the
  * answer, and exactly one: a second reload of the same broken turn is the same repair that
  * already failed, and it costs the turn another answer to find that out again. The budget is
- * keyed to the turn itself — the running generation, or the count of finished turns when none
- * is running — so it is released by the next turn the chat starts, not by a count that the
+ * keyed to the turn itself through its terminal state, so it is released by the next turn the
+ * chat starts, not by the broken turn's own terminal transition or by a process-local counter that
  * failed turn's own end may already have moved past (that is how a prime went unreloaded on
  * 2026-09-02: its turn had failed ten seconds before the reload landed and the charge fell on
  * the turn that started fifteen minutes later).
@@ -5415,9 +5626,11 @@ const lastBrowserRecoveryAt = new Map<string, number>();
  */
 const turnRepairSpent = new Map<string, { sessionId: string; turnKey: string }>();
 
-/** The identity of the turn a chat is on right now, for the error reload's budget. */
-function turnKeyFor(live: { activeTurnId: string | null; endedTurns: number } | undefined): string {
-  return live?.activeTurnId ?? `ended:${live?.endedTurns ?? 0}`;
+/** The logical turn a chat is on right now, preserved across that turn's own terminal boundary. */
+function turnKeyFor(
+  live: { activeTurn: { id: string } | null; lastTurn: { id: string | null } | null; terminalRevision: number } | null | undefined
+): string {
+  return live?.activeTurn?.id ?? live?.lastTurn?.id ?? `terminal:${live?.terminalRevision ?? 0}`;
 }
 
 /**
@@ -5457,7 +5670,7 @@ function queueBrowserRecovery(
   sessionId: string,
   episode: string,
   reason: Repair['reason'],
-  endedTurns = 0,
+  terminalRevision = 0,
   now = Date.now()
 ): boolean {
   // A blocked chat is one the user took this app's hands off, and every repair here is a hand
@@ -5475,7 +5688,7 @@ function queueBrowserRecovery(
     // Read against the turn the chat is on *now*: the release in retireSpentRepairs runs on
     // the browser's pass, and an error on the next turn can arrive before that pass does.
     const spent = turnRepairSpent.get(conversationId);
-    const live = liveConversations().find((entry) => entry.conversationId === conversationId);
+    const live = liveConversationFor(conversationId);
     if (spent && turnKeyFor(live) === spent.turnKey) return false;
     if (spent) turnRepairSpent.delete(conversationId);
   }
@@ -5511,7 +5724,7 @@ function queueBrowserRecovery(
       : Math.max(now, (lastBrowserRecoveryAt.get(conversationId) ?? 0) + BROWSER_RECOVERY_COOLDOWN_MS);
   const repair: Repair = {
     sessionId,
-    endedTurns,
+    terminalRevision,
     state: 'queued',
     episode,
     reason,
@@ -5570,7 +5783,15 @@ async function noteRecoveryObservations(
   conversationId: string,
   sessionId: string | null,
   observations: readonly ChatObservation[],
-  activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string }
+  activity: {
+    meaningful: boolean;
+    working: boolean;
+    terminal: boolean;
+    at?: number;
+    toolStartedAt?: number;
+    endedTurnId?: string;
+    endedSegmentStartedAt?: number;
+  }
 ): Promise<void> {
   // The recorder owns idempotency. Raw batches may contain a historical user row or turn_start
   // beside a newly accepted title, so inferring activity from `stored > 0` re-armed completed
@@ -5612,7 +5833,7 @@ async function noteRecoveryObservations(
     // A current-turn interim can push an existing deadline; historical transcript/page rows
     // never enter this verdict and therefore cannot keep a confirmed reload alive.
     if (sessionId && !activity.terminal && (activity.working || turnActivityByConversation.has(conversationId))) {
-      const liveTurn = liveConversations().find(entry => entry.conversationId === conversationId && entry.sessionId === sessionId)?.activeTurnId;
+      const liveTurn = liveConversationFor(conversationId, sessionId)?.activeTurn?.id;
       const previous = turnActivityByConversation.get(conversationId);
       const [sourceBoundary] = !previous && !liveTurn && activity.working
         ? await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] }) : [];
@@ -5668,12 +5889,10 @@ async function noteRecoveryObservations(
   // Historical exact MCP work wholly before the terminal is part of the completed turn and must
   // not keep the lease alive. A call that lands after a premature terminal reopens the same turn
   // durably in the recorder before its tool_call row is written.
-  const terminalTurnStart = activity.endedTurnId && sessionId
-    ? (await readTurnStartContext(sessionId, activity.endedTurnId))?.startedAt
-    : undefined;
   const mcpTerminal = !thinkingFailed && terminalGrant && isActiveTurnActivity(terminalGrant) && terminalGrant.turnId &&
     activity.endedTurnId === terminalGrant.turnId && sessionId && activity.terminal && lastEnd !== 'stopped' &&
-    terminalTurnStart !== undefined && exactInFlightToolCalls(conversationId, { startedAfter: terminalTurnStart }) > 0;
+    activity.endedSegmentStartedAt !== undefined &&
+    exactInFlightToolCalls(conversationId, { startedAfter: activity.endedSegmentStartedAt }) > 0;
   if (mcpTerminal && terminalGrant && isActiveTurnActivity(terminalGrant) && turnActivityLeaseCurrent(conversationId, terminalGrant)) {
     terminalGrant = publishTurnActivityLease(conversationId, {
       phase: 'active',
@@ -5735,11 +5954,14 @@ async function noteRecoveryObservations(
     // later. Counting the open turn as spent makes the next end after it the first that means
     // anything: a turn the chat actually got through, which is the one fact that says the page
     // recovered without help.
-    const live = liveConversations().find((entry) => entry.conversationId === conversationId);
-    const endedTurns = (live?.endedTurns ?? 0) + (live?.activeTurnId ? 1 : 0);
+    const live = liveConversationFor(conversationId);
+    // The repair belongs to the broken turn itself. If it is still open, reserve the next
+    // terminal epoch now so that its own imminent end does not retire the repair; only a later
+    // completed boundary proves the chat progressed beyond the incident.
+    const terminalRevision = (live?.terminalRevision ?? 0) + (live?.activeTurn ? 1 : 0);
     if (
       sessionId &&
-      queueBrowserRecovery(conversationId, sessionId, episode, 'assistant-error', endedTurns, now)
+      queueBrowserRecovery(conversationId, sessionId, episode, 'assistant-error', terminalRevision, now)
     ) {
       logInfo(`bridge: assistant transport failure — asking the browser to recover ${conversationId}`);
     }
@@ -6362,7 +6584,7 @@ async function queueMissingTab(conversationId: string, working: boolean, now = D
  */
 function repairCandidates(
   now = Date.now()
-): Array<{ conversationId: string; sessionId: string; endedTurns: number }> {
+): Array<{ conversationId: string; sessionId: string; terminalRevision: number }> {
   // Deliberately read-only. `inspectSilentChats` is the ledger's sole owner and runs every
   // thirty seconds, forgetting each expired grant once its turn is closed or its one reload is
   // spent. A second expiry clock here used to delete a grant whose reload had been carried out
@@ -6375,7 +6597,7 @@ function repairCandidates(
   // an identity failure without itself creating a silence-reload episode. A reload-generated
   // turn_start therefore cannot re-arm ordinary recovery, while a genuinely open page can still
   // be one of the exact chats whose request-id join may have failed.
-  for (const entry of live.values()) if (entry.activeTurnId) candidates.add(entry.conversationId);
+  for (const entry of live.values()) if (entry.activeTurn) candidates.add(entry.conversationId);
   return [...candidates].flatMap((conversationId) => {
     const sessionId =
       live.get(conversationId)?.sessionId ?? turnActivityByConversation.get(conversationId)?.sessionId ?? null;
@@ -6384,7 +6606,7 @@ function repairCandidates(
           {
             conversationId,
             sessionId,
-            endedTurns: live.get(conversationId)?.endedTurns ?? 0
+            terminalRevision: live.get(conversationId)?.terminalRevision ?? 0
           }
         ]
       : [];
@@ -6422,7 +6644,7 @@ function retireSpentRepairs(): void {
     // than a turn, and keep the activity-driven lifecycle above.
     if (!TURN_SCOPED_REPAIRS.has(repair.reason)) continue;
     const entry = live.get(conversationId);
-    if (entry && entry.endedTurns > repair.endedTurns) repairsInFlight.delete(conversationId);
+    if (entry && entry.terminalRevision > repair.terminalRevision) repairsInFlight.delete(conversationId);
   }
   // The budget is released by the chat being on a different turn than the one it was charged
   // to — the user sent the next message — and by nothing else. Not by an attributed call: a
@@ -6576,7 +6798,7 @@ function noteCallAttribution(
 function pendingSuspects(
   incident: UnattributedIncident | null,
   now = Date.now()
-): Array<{ conversationId: string; sessionId: string; endedTurns: number }> {
+): Array<{ conversationId: string; sessionId: string; terminalRevision: number }> {
   return repairCandidates(now).filter(
     (entry) =>
       !incident?.proven.has(entry.conversationId) &&
@@ -6650,9 +6872,9 @@ function tickUnattributedIncident(): void {
         queueBrowserRecovery(
           target.conversationId,
           target.sessionId,
-          `unattributed:${target.endedTurns}`,
+          `unattributed:${target.terminalRevision}`,
           'unattributed',
-          target.endedTurns,
+          target.terminalRevision,
           now
         )
       ) {
@@ -6818,7 +7040,7 @@ async function confirmRepair(token: string, action: 'reloaded' | 'reopened' | nu
       if (repair.reason === 'assistant-error') {
         // Charged to the turn the chat is on when the reload lands, running or not, and
         // released when it is on another one — see turnRepairSpent.
-        const live = liveConversations().find((entry) => entry.conversationId === conversationId);
+        const live = liveConversationFor(conversationId);
         turnRepairSpent.set(conversationId, { sessionId: repair.sessionId, turnKey: turnKeyFor(live) });
       }
       await updateRepairProgress(
@@ -6879,7 +7101,7 @@ async function updateRepairProgress(conversationId: string, repair: Repair, text
   // collect, a missing tab — names none and is placed between turns.
   const turnId =
     repair.progress?.turnId ??
-    liveConversations().find((entry) => entry.conversationId === conversationId)?.activeTurnId ??
+    liveConversationFor(conversationId)?.activeTurn?.id ??
     null;
   const recorded = await recordProgress(sessionId, repair.progressId, text, anchor, turnId);
   if (recorded) repair.progress = { sessionId, ...recorded, text, turnId };
@@ -7291,7 +7513,18 @@ function revivalFor(agent: string, runId: string): WorkerRevival | null {
 function describe(command: Command, client: string | null, claimedSummary?: string): BridgeCommand {
   const spec = command.spec;
   const selection = spec.type === 'resume' ? continuationByToken(spec.token)?.requestedSelection : null;
-  if (spec.type === 'stop') return { id: command.id, kind: 'stop-turn', type: 'stop', text: '', agent: null, model: null, reasoningEffort: null, conversationId: spec.conversationId, turnId: spec.turnId, ...(spec.userMessageId ? { userMessageId: spec.userMessageId } : {}) };
+  if (spec.type === 'stop') return {
+    id: command.id,
+    kind: 'stop-turn',
+    type: 'stop',
+    text: '',
+    agent: null,
+    model: null,
+    reasoningEffort: null,
+    conversationId: spec.conversationId,
+    turnId: spec.turnId,
+    openingUserMessageId: spec.openingUserMessageId
+  };
   // A resume's claim is persisted by /commands/redeem before this renderer is called. A
   // command shown to app/UI code without a browser document still carries no brief at all.
   const text = spec.type === 'resume'
@@ -7614,11 +7847,23 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
 function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): CommandSpec | null {
   if (raw.type === 'stop') {
     const stop = raw as Partial<Extract<CommandSpec, { type: 'stop' }>>;
+    // Snapshot v5 renamed this durable identity to match Protocol 18. Accept the v1-v4 spelling
+    // while those short-lived Stop rows can still exist, but every rewritten snapshot is v5.
+    const legacyOpening = version <= 4
+      ? (raw as unknown as { userMessageId?: unknown }).userMessageId
+      : undefined;
+    const openingUserMessageId = stop.openingUserMessageId ?? legacyOpening;
     if (typeof stop.sessionId !== 'string' || !/^[a-z0-9-]{8,64}$/i.test(stop.sessionId) ||
         typeof stop.conversationId !== 'string' || !conversationId(stop.conversationId) ||
         typeof stop.turnId !== 'string' || !stop.turnId || stop.turnId.length > 256) return null;
-    if (stop.userMessageId !== undefined && (typeof stop.userMessageId !== 'string' || !stop.userMessageId || stop.userMessageId.length > 256)) return null;
-    return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId, ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}) };
+    if (typeof openingUserMessageId !== 'string' || !openingUserMessageId || openingUserMessageId.length > 256) return null;
+    return {
+      type: 'stop',
+      sessionId: stop.sessionId,
+      conversationId: stop.conversationId,
+      turnId: stop.turnId,
+      openingUserMessageId
+    };
   }
   if (
     version >= 3 &&
@@ -7692,7 +7937,7 @@ function restoredCommandSnapshot(
   now: number
 ): DurableCommandSnapshot {
   return {
-    version: 4,
+    version: 5,
     commands: plannedCommands.map(durableCommand),
     receipts: plannedReceipts
       .filter((receipt) => now - receipt.completedAt <= COMMAND_TTL_MS)
@@ -7713,7 +7958,7 @@ function planCommandRestore(
   now: number
 ): CommandRestorePlan | null {
   const version = saved.version;
-  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 || !Array.isArray(saved.commands)) return null;
+  if (version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5 || !Array.isArray(saved.commands)) return null;
 
   const plannedCommands = [...commands];
   const plannedReceipts = commandCoordinator.receipts

@@ -50,7 +50,7 @@
   //
   // So: publish a handle instead of a flag and let a replacement supersede a dead one. A
   // *healthy* incumbent still wins, so the ordinary static/recovery race is unchanged.
-  const RECORDER_VERSION = 11;
+  const RECORDER_VERSION = 12;
   const recorderHandle = {
     version: RECORDER_VERSION,
     healthy: () => false,
@@ -266,9 +266,8 @@
   let queueBytes = 0;
   /** Keep page-local outage buffering small enough that it cannot crash the ChatGPT tab. */
   const MAX_PAGE_QUEUE_BYTES = 8 * 1024 * 1024;
-  /** Page-local overflow markers, one per chat/agent bucket currently waiting for the worker. */
-  const queueGaps = new Map();
-  const queueGapKeys = new WeakMap();
+  /** A marker already offered to the worker is immutable; later loss must get its own chronology. */
+  const frozenQueueGaps = new WeakSet();
   let flushing = false;
   let flushWork = null;
 
@@ -408,15 +407,6 @@
   let quietTurn = null;
   let quietOutcome = null;
   /**
-   * Assistant sections that already had a completed-message action before this generation.
-   *
-   * Section ownership is deliberately stronger than remembering one HTMLElement. Retry can
-   * reuse an assistant section and React can remount its old Copy button as a new DOM node; node
-   * identity would call that stale action "fresh". Sampled from the previous observation, like
-   * baselineSections below, so a genuinely new section/action mounted on the same tick Stop first
-   * appears is not accidentally classified as history.
-   */
-  /**
    * The identity every event of the turn in flight carries.
    *
    * This is a *local* key — `g-<run>-<epoch>-<n>` — and not ChatGPT's `data-turn-id`, which is
@@ -450,26 +440,12 @@
   })();
   let turnId = null;
   let genCount = 0;
-  /**
-   * What the last activity pull said this chat has open in the app.
-   *
-   * Read once, at boot, by resumeOpenTurn(). Reloading a ChatGPT page in the middle of an
-   * assistant turn kills this script and every piece of state in it, `RUN_ID` included — and
-   * `RUN_ID` is the random per-document namespace that makes a generation id unique, so the
-   * new document cannot reconstruct the id the old one was using. Left alone it sees a stop
-   * button, finds no generation of its own, and opens a second one: one assistant run
-   * recorded as two, its progress and prose ids keyed off a name the first half never used,
-   * and the app's live-turn evidence reset underneath the calls still in flight. Session
-   * `2026-01-01-00000017` has that at seq 367/368.
-   *
-   * The app holds the durable half of that identity, so the new document asks for it before
-   * it observes anything.
-   */
-  let appActiveTurnId = null;
+  /** App-owned open turn, including independent liveness and replacement-document adoption authority. */
+  let trackedTurn = null;
   /**
    * When this document first saw ChatGPT generating a turn that nobody has recorded.
    *
-   * A reloaded document normally adopts the app's `activeTurnId`. When the app has none — the
+   * A reloaded document normally adopts the app's exact tracked-turn adoption authority. When the app has none — the
    * previous document never got its `turn_start` out before the reload, or the app was not
    * running when the message was sent — the page is the only witness: a rendered user message
    * and a Stop control that stays. Read once, that control is the hydration artifact described
@@ -497,35 +473,18 @@
    * A node, not an id, for the reason above: the node is the thing with a lifecycle. React
    * reparenting it keeps it; React replacing it is exactly the event that should force a
    * rebind, and an id that is reused across turns can signal neither.
-   */
+  */
   let genNode = null;
+  /** Exact pre-Send node that already crossed the exceptional same-node ownership proof. */
+  let preSendContinuationNode = null;
   /**
-   * Assistant sections already on screen when this generation began.
+   * Provider-owned marks for the exact assistant response immediately preceding a local Send.
    *
-   * Sampled from the *previous* observation, never from the DOM at the moment the stop
-   * button is first seen. By then ChatGPT has usually already mounted the new turn's
-   * section, so enumerating the page here files the generation's own section under "was
-   * already there" and the generation can then never bind to anything. That is not a
-   * theoretical ordering: it is the common one, and it costs exactly the fast tool turns
-   * whose activity this is all here to place.
-   */
-  let priorSections = new WeakSet();
-  /**
-   * What each of those sections said at that moment, as [node, mark] pairs.
-   *
-   * The evidence for the one case freshness cannot decide: ChatGPT writing a new turn into
-   * a section that already existed. A prior section whose text has changed since the
-   * generation began is demonstrably being written into now, which is a fact about the page
-   * rather than a timer expiring, and a timer is what this replaced — the old fallback took
-   * the newest assistant section after four seconds whether or not it had moved, which is
-   * false attribution with a delay on it.
-   */
-  let priorMarks = [];
-  /** Assistant sections present at the end of the last observation. See priorSections. */
-  let baselineSections = [];
-  /** Sections from the previous observation which already exposed a completed-message action. */
-  /** What the newest of those said then, so a reused section can prove it has moved. */
-  let baselineMarks = [];
+   * The one case freshness cannot decide is ChatGPT continuing the new answer in the same DOM
+   * node it used for the immediately preceding response. Older historical nodes are deliberately
+   * absent: their later mutations do not prove anything about this generation.
+  */
+  let preSendContinuationMarks = [];
   /**
    * Assistant section node → the local generation that finished writing into it.
    *
@@ -540,24 +499,12 @@
    * A hint, never an identity. Kept so a later reconciliation pass has something to line
    * the two models up by; bounded, because a tab left open all day would otherwise grow it.
    */
-  const pageTurnIds = new Map();
+  const providerTurnIdByLocalTurnId = new Map();
   let turnStartedAt = 0;
-  /**
-   * The open generation was adopted from the app and this document has not yet seen ChatGPT
-   * generating it.
-   *
-   * A document that watched the Stop control come and go has lifecycle evidence of its own,
-   * whether it opened the generation or adopted it. A reloaded document that has seen neither
-   * has none: only the app's word that a turn is open and whatever transcript ChatGPT
-   * committed before the reload. Live 2026-09-02: that transcript was interim prose of a turn
-   * still running, the Stop control had not come back yet, and the degraded DOM rule closed
-   * the adopted turn as completed four seconds in while the same request id went on calling
-   * tools for twenty-four minutes — after which Goal wrote the next user message against an
-   * answer that had never been given. So until this document sees the turn running, visible
-   * prose never closes it: only the page model, an error, a user stop, a new send or the stall
-   * budget may. See endOutcome.
-   */
-  let unwitnessedGeneration = false;
+  /** Whether this document has enough provider lifecycle evidence for degraded DOM completion. */
+  let providerLifecycleWitnessed = false;
+  /** Exact native user message whose Send opened the current local generation. */
+  let generationOpeningUserMessageId = null;
   let lastChangeAt = 0;
   let turnProgressRevision = 0; // Distinguish work received within the same millisecond.
   function noteTurnProgress(owner = turnId) {
@@ -566,8 +513,9 @@
     // can resume it. Keep the ordinary generation owner and activity clock.
     if (!generating && owner && lastTerminalObservation?.localTurnId === owner && lastTerminalObservation.reason === 'thinking_failed') {
       const pageTurn = lastTerminalObservation.pageTurn;
-      adoptOpenTurn(owner);
+      resumeCurrentTurn(owner);
       genNode = pageTurn?.node || null;
+      preSendContinuationNode = null;
     }
     lastChangeAt = Date.now();
     turnProgressRevision++;
@@ -785,20 +733,20 @@
     const text = sendText(CLF_DOM.composer()?.textContent);
     const attachmentNames = CLF_DOM.composerAttachmentNames();
     if (!text && !attachmentNames.length) return;
+    const transcriptGroups = CLF_DOM.transcriptGroups();
     let previousMessageId = null;
-    for (const message of CLF_DOM.messages()) {
+    for (const message of CLF_DOM.messages(transcriptGroups)) {
       if (userMessagePresent(message)) previousMessageId = message.id;
     }
     // The submitted question owns its before-state. Identity/route hydration may delay
     // observing that question until its whole answer is already on screen; a rolling
     // observation baseline would then misclassify the answer as pre-existing history.
-    const sections = assistantSections();
     userSendReceipt = {
       text,
       attachmentNames,
       conversationId: CLF_DOM.conversationId(),
       previousMessageId,
-      baseline: { sections, marks: sections.slice(-3).map(node => ({ node, mark: sectionMark(node) })) },
+      baseline: { continuationMarks: continuationMarks(transcriptGroups) },
       at: Date.now()
     };
   }
@@ -1071,6 +1019,160 @@
     return entry;
   }
 
+  const PAGE_RECORDING_GAP_KINDS = new Set([
+    'model_selection', 'conversation_title', 'user_message', 'assistant_message', 'page_tool', 'progress',
+    'turn_start', 'turn_end', 'chat_error', 'tool_evidence', 'recording_gap', 'unknown'
+  ]);
+
+  const pageQueueRouteKey = (entry) => JSON.stringify([
+    entry?.conversationId || null,
+    entry?.agent || null,
+    entry?.agentCommandId || null
+  ]);
+
+  function pageQueueLoss(entry) {
+    const event = entry?.event || {};
+    if (event.kind === 'recording_gap') {
+      const counts = {};
+      if (event.lostKinds && typeof event.lostKinds === 'object') {
+        for (const [kind, raw] of Object.entries(event.lostKinds)) {
+          if (PAGE_RECORDING_GAP_KINDS.has(kind) && Number.isSafeInteger(raw) && raw > 0) counts[kind] = raw;
+        }
+      }
+      return {
+        counts: Object.keys(counts).length ? counts : { unknown: 1 },
+        affectedTurnId: typeof event.affectedTurnId === 'string' && event.affectedTurnId ? event.affectedTurnId : null
+      };
+    }
+    const kind = PAGE_RECORDING_GAP_KINDS.has(event.kind) ? event.kind : 'unknown';
+    return {
+      counts: { [kind]: 1 },
+      affectedTurnId: typeof event.turnId === 'string' && event.turnId ? event.turnId : null
+    };
+  }
+
+  function isMutablePageQueueGap(entry, routeKey) {
+    return !!entry && !frozenQueueGaps.has(entry) && pageQueueRouteKey(entry) === routeKey &&
+      entry.event?.kind === 'recording_gap' && entry.event.reason === 'page_queue_overflow';
+  }
+
+  function mergePageQueueGap(gap, loss) {
+    const counts = { ...(gap.event.lostKinds || {}) };
+    for (const [kind, raw] of Object.entries(loss.counts)) counts[kind] = (Number(counts[kind]) || 0) + Number(raw);
+    const priorTurn = typeof gap.event.affectedTurnId === 'string' && gap.event.affectedTurnId ? gap.event.affectedTurnId : null;
+    gap.event.lostKinds = counts;
+    if (!priorTurn && Object.values(gap.event.lostKinds).reduce((sum, count) => sum + Number(count || 0), 0) ===
+        Object.values(loss.counts).reduce((sum, count) => sum + Number(count || 0), 0) && loss.affectedTurnId) {
+      gap.event.affectedTurnId = loss.affectedTurnId;
+    } else if (!loss.affectedTurnId || priorTurn !== loss.affectedTurnId) {
+      delete gap.event.affectedTurnId;
+    }
+    const detail = Object.entries(counts).map(([kind, count]) => `${count} ${kind}`).join(', ');
+    const total = Object.values(counts).reduce((sum, count) => sum + Number(count || 0), 0);
+    gap.event.detail = `${total} browser observation(s) (${detail}) were lost before the extension service worker accepted them because the page-local queue reached its limit.`;
+    accountQueueEntry(gap);
+  }
+
+  const pageQueueRouteNeighbor = (index, routeKey, step) => {
+    for (let at = index; at >= 0 && at < queue.length; at += step) {
+      if (pageQueueRouteKey(queue[at]) === routeKey) return { index: at, entry: queue[at] };
+    }
+    return null;
+  };
+
+  function recordPageQueueLoss(index, dropped) {
+    const routeKey = pageQueueRouteKey(dropped);
+    const loss = pageQueueLoss(dropped);
+    const left = pageQueueRouteNeighbor(index - 1, routeKey, -1);
+    const right = pageQueueRouteNeighbor(index, routeKey, 1);
+    if (isMutablePageQueueGap(left?.entry, routeKey)) {
+      mergePageQueueGap(left.entry, loss);
+      if (right && isMutablePageQueueGap(right.entry, routeKey)) {
+        mergePageQueueGap(left.entry, pageQueueLoss(right.entry));
+        removeQueueEntry(right.index);
+      }
+      return;
+    }
+    if (right && isMutablePageQueueGap(right.entry, routeKey)) {
+      if (Number.isFinite(dropped.event?.time)) {
+        right.entry.event.time = Math.min(Number(right.entry.event.time) || dropped.event.time, dropped.event.time);
+      }
+      mergePageQueueGap(right.entry, loss);
+      return;
+    }
+    const gap = {
+      conversationId: dropped.conversationId,
+      agent: dropped.agent,
+      agentCommandId: dropped.agentCommandId,
+      event: {
+        kind: 'recording_gap',
+        time: Number.isFinite(dropped.event?.time) ? dropped.event.time : Date.now(),
+        reason: 'page_queue_overflow',
+        lostKinds: {},
+        ...(loss.affectedTurnId ? { affectedTurnId: loss.affectedTurnId } : {})
+      }
+    };
+    queue.splice(Math.min(index, queue.length), 0, gap);
+    accountQueueEntry(gap);
+    mergePageQueueGap(gap, loss);
+  }
+
+  function collapsePageQueueGaps() {
+    const byRoute = new Map();
+    for (const entry of queue) {
+      if (entry?.event?.kind !== 'recording_gap') continue;
+      const routeKey = pageQueueRouteKey(entry);
+      let aggregate = byRoute.get(routeKey);
+      if (!aggregate) {
+        aggregate = {
+          source: entry,
+          time: Number.isFinite(entry.event.time) ? entry.event.time : Date.now(),
+          counts: {},
+          affectedTurnId: undefined,
+          scoped: true
+        };
+        byRoute.set(routeKey, aggregate);
+      }
+      const loss = pageQueueLoss(entry);
+      aggregate.time = Math.min(aggregate.time, Number.isFinite(entry.event.time) ? entry.event.time : aggregate.time);
+      for (const [kind, raw] of Object.entries(loss.counts)) {
+        aggregate.counts[kind] = (Number(aggregate.counts[kind]) || 0) + Number(raw);
+      }
+      if (aggregate.scoped) {
+        if (!loss.affectedTurnId) {
+          aggregate.scoped = false;
+          aggregate.affectedTurnId = undefined;
+        } else if (aggregate.affectedTurnId === undefined) {
+          aggregate.affectedTurnId = loss.affectedTurnId;
+        } else if (aggregate.affectedTurnId !== loss.affectedTurnId) {
+          aggregate.scoped = false;
+          aggregate.affectedTurnId = undefined;
+        }
+      }
+    }
+    const collapsed = [...byRoute.values()].map((aggregate) => {
+      const gap = {
+        conversationId: aggregate.source.conversationId,
+        agent: aggregate.source.agent,
+        agentCommandId: aggregate.source.agentCommandId,
+        event: {
+          kind: 'recording_gap',
+          time: aggregate.time,
+          reason: 'page_queue_overflow',
+          lostKinds: { ...aggregate.counts },
+          ...(aggregate.scoped && aggregate.affectedTurnId ? { affectedTurnId: aggregate.affectedTurnId } : {})
+        }
+      };
+      const detail = Object.entries(aggregate.counts).map(([kind, count]) => `${count} ${kind}`).join(', ');
+      const total = Object.values(aggregate.counts).reduce((sum, count) => sum + Number(count || 0), 0);
+      gap.event.detail = `${total} browser observation(s) (${detail}) were lost before the extension service worker accepted them because the page-local queue reached its limit; older loss regions for this route were conservatively combined.`;
+      return gap;
+    });
+    queue.splice(0, queue.length, ...collapsed);
+    queueBytes = 0;
+    for (const entry of queue) accountQueueEntry(entry);
+  }
+
   let documentReady = null;
 
   async function sendToWorker(message) {
@@ -1170,13 +1272,21 @@
       agentCommandId,
       event: { time: Date.now(), ...bounded }
     };
+    const queuedRoute = pageQueueRouteKey(queued);
+    if (!queue.some((entry) => pageQueueRouteKey(entry) === queuedRoute)) {
+      const routes = new Set(queue.map(pageQueueRouteKey));
+      if (routes.size >= 400) {
+        observed.blocked = 'page_queue_capacity';
+        throw new Error('page recording queue cannot preserve another independent route within its hard bound');
+      }
+    }
     // Streaming canonical messages replace their older unsent snapshot. Keeping every
     // revision multiplies one growing answer into quadratic memory during an outage.
     const messageId = typeof queued.event.messageId === 'string' ? queued.event.messageId : '';
     if (queued.event.kind === 'assistant_message' && messageId) {
       const prior = queue.findIndex(
         (entry) =>
-          !queueGapKeys.has(entry) &&
+          entry.event?.kind !== 'recording_gap' &&
           entry.conversationId === queued.conversationId &&
           entry.agent === queued.agent &&
           entry.event?.kind === 'assistant_message' &&
@@ -1197,41 +1307,15 @@
     // here made a long service-worker outage look like a complete transcript even though item
     // 401 had already erased item 1 before the durable journal ever saw it.
     while (queue.length > 400 || queueBytes > MAX_PAGE_QUEUE_BYTES) {
-      const index = queue.findIndex((entry) => !queueGapKeys.has(entry));
+      const index = queue.findIndex((entry) => entry.event?.kind !== 'recording_gap');
       if (index < 0) break;
       const dropped = removeQueueEntry(index);
-      const key = `${dropped.conversationId || ''}\u0000${dropped.agent || ''}\u0000${dropped.agentCommandId || ''}`;
-      let held = queueGaps.get(key);
-      if (!held) {
-        held = {
-          entry: {
-            conversationId: dropped.conversationId,
-            agent: dropped.agent,
-            agentCommandId: dropped.agentCommandId,
-            event: {
-              time: dropped.event.time,
-              kind: 'chat_error',
-              text: ''
-            }
-          },
-          count: 0,
-          kinds: Object.create(null)
-        };
-        queueGaps.set(key, held);
-        queueGapKeys.set(held.entry, key);
-        queue.splice(Math.min(index, queue.length), 0, held.entry);
-        accountQueueEntry(held.entry);
-      }
-      held.count += 1;
-      const kind = typeof dropped.event.kind === 'string' ? dropped.event.kind : 'observation';
-      held.kinds[kind] = (held.kinds[kind] || 0) + 1;
-      const detail = Object.entries(held.kinds)
-        .map(([name, count]) => `${count} ${name}`)
-        .join(', ');
-      held.entry.event.text =
-        `⚠ ${held.count} observation(s) (${detail}) were lost before the extension service worker accepted them ` +
-        'because the page-local queue hit its count or byte budget. This part of the history is incomplete.';
-      accountQueueEntry(held.entry);
+      recordPageQueueLoss(index, dropped);
+    }
+    if (queue.length > 400 || queueBytes > MAX_PAGE_QUEUE_BYTES) collapsePageQueueGaps();
+    if (queue.length > 400 || queueBytes > MAX_PAGE_QUEUE_BYTES) {
+      observed.blocked = 'page_queue_capacity';
+      throw new Error('page recording queue cannot preserve one loss marker per route within its hard bound');
     }
   }
 
@@ -1264,10 +1348,7 @@
       // arrive while the service worker is answering. If they overflow too, they need a
       // new marker; mutating one already in flight and then removing that batch would erase
       // losses the service worker never received.
-      for (const entry of batch) {
-        const gapKey = queueGapKeys.get(entry);
-        if (gapKey && queueGaps.get(gapKey)?.entry === entry) queueGaps.delete(gapKey);
-      }
+      for (const entry of batch) if (entry.event?.kind === 'recording_gap') frozenQueueGaps.add(entry);
       const reply = await ask({
         type: 'events',
         entries: batch,
@@ -1334,8 +1415,8 @@
   /**
    * Picks up a turn this conversation already had open, before anything is observed.
    *
-   * The one thing a reloaded document cannot work out for itself. See `adoptTurnId` for why
-   * the id has to come from the app, and note the ordering this depends on: the conversation
+   * The one thing a reloaded document cannot work out for itself. The adoptable turn therefore
+   * has to come from the app, and note the ordering this depends on: the conversation
    * is adopted and *bound* here, ahead of the first observation, so nothing this page load
    * emits is journalled without an id and then filed as unattributed while the binding
    * catches up.
@@ -1370,7 +1451,7 @@
    * same window the lifecycle already uses to discount ChatGPT's control flicker. Everything
    * after the first generation keeps using send receipts and durable anchors.
    */
-  function claimUnrecordedGeneration(nowGenerating, observedTurns) {
+  function claimUnrecordedGeneration(nowGenerating, observedTurns, renderedMessages = CLF_DOM.messages(observedTurns)) {
     // The provider's exact final outranks a stuck Stop control, including on a
     // fresh document with no local generation. Only the latest turn can veto:
     // an older answer must not hide the new question that follows it.
@@ -1382,14 +1463,14 @@
       genCount > 0 ||
       turnId ||
       resumeIdentityPending ||
-      appActiveTurnId ||
+      trackedTurn ||
       commandAttempt
     ) {
       unrecordedGeneratingSince = 0;
       return null;
     }
     let newest = null;
-    for (const message of CLF_DOM.messages()) {
+    for (const message of renderedMessages) {
       if (message.role === 'user' && message.id && message.text) newest = message.id;
     }
     if (!newest || newest === openedUserMessageId) {
@@ -1403,16 +1484,18 @@
     return Date.now() - unrecordedGeneratingSince >= TURN_SETTLE_MS ? newest : null;
   }
 
-  function adoptOpenTurn(open, questionId = null) {
-    if (!open || generating) return false;
-    seedResumeBaseline();
-    anchorAdoptedQuestion(questionId);
+  function activateKnownTurn(open, openingUserMessageId) {
+    if (!open || !openingUserMessageId || generating) return false;
+    generationOpeningUserMessageId = openingUserMessageId;
+    anchorAdoptedQuestion(openingUserMessageId);
     generating = true;
-    unwitnessedGeneration = true;
+    providerLifecycleWitnessed = false;
     turnId = open;
     genNode = null;
-    priorSections = new WeakSet(baselineSections);
-    priorMarks = baselineMarks;
+    preSendContinuationNode = null;
+    // A replacement/resumed document did not witness the pre-Send node state. It may use the
+    // exact response interval but never the same-node-above-opening exception.
+    preSendContinuationMarks = [];
     turnStartedAt = Date.now();
     noteTurnProgress();
     quietSince = 0;
@@ -1425,24 +1508,28 @@
     return true;
   }
 
+  /** Replacement-document reconciliation requires the complete Protocol-18 identity pair. */
+  function adoptTurn(identity) {
+    return activateKnownTurn(identity?.turnId, identity?.openingUserMessageId);
+  }
+
+  /** Same-document failed-view resumption may reuse only the exact identity it already held. */
+  function resumeCurrentTurn(open) {
+    if (!open || turnId !== open || !generationOpeningUserMessageId) return false;
+    return activateKnownTurn(open, generationOpeningUserMessageId);
+  }
+
   /**
    * The question the adopted turn is answering is, by construction, already asked.
    *
-   * A turn the app holds open was opened by a send, and the newest user message on the page
-   * *is* that send. Recording it as an anchor here says so, which closes the one race the
-   * durable anchor set cannot: a reload that lands between ChatGPT accepting the message and
-   * the app journalling it would otherwise find the message newest and unanchored, read the
-   * question as freshly asked, and end the very turn this document just adopted in order to
-   * keep. Only that one id, and only alongside an adoption — everything else on the page
-   * still has to be recognised from what the app actually holds.
+   * A modern turn start durably records this relationship. Never replace missing identity with
+   * "the newest rendered user": hydration, virtualization and a fast follow-up can all make that
+   * a different question. Legacy turns without the relation remain unanchored and therefore
+   * fail closed for assistant ownership until stronger evidence supplies it.
    */
   function anchorAdoptedQuestion(questionId = null) {
-    let newest = questionId;
-    for (const message of questionId ? [] : CLF_DOM.messages()) {
-      if (userMessagePresent(message)) newest = message.id;
-    }
-    if (newest && !userAnchorByMessage.has(newest)) {
-      userAnchorByMessage.set(newest, { seq: -1, time: Date.now(), messageId: newest });
+    if (questionId && !userAnchorByMessage.has(questionId)) {
+      userAnchorByMessage.set(questionId, { seq: -1, time: Date.now(), messageId: questionId });
     }
   }
 
@@ -1463,47 +1550,6 @@
   }
 
   /**
-   * Tells a resumed turn which of the sections on screen it did not write.
-   *
-   * `priorSections` is normally sampled from the previous observation, and on the first
-   * observation of a page load there is no previous one — so every section on screen looks
-   * new and the whole visible transcript would be treated as this generation's output.
-   * Seeding it from the DOM here fixes that, with the live turn's own sections deliberately
-   * left out: those are the ones still being written, and calling them history would publish
-   * a half-written answer as the answer.
-   */
-  function seedResumeBaseline() {
-    const turns = CLF_DOM.turns();
-    // The adopted turn's own section, when the page shows one: the newest assistant section,
-    // and only if it comes *after* the newest user message. A turn is the answer to the
-    // question that opened it, so a section above that question is a previous answer — one
-    // ChatGPT already finished, with the end-turn bit to prove it. Taking the newest section
-    // regardless is how the 2026-09-03 prime was closed "completed" nine seconds after every
-    // reload: the page came back showing only the question, the previous answer was bound to
-    // the adopted turn, its terminal message closed it, and the request went on calling tools
-    // behind a page that said the turn was over. With no section after the question, the
-    // adopted turn has no evidence on this page yet and stays open until one appears.
-    let newestUser = -1;
-    let newestAssistant = -1;
-    for (let index = 0; index < turns.length; index++) {
-      if (turns[index].role === 'user') newestUser = index;
-      else if (turns[index].role === 'assistant') newestAssistant = index;
-    }
-    const liveTurn = newestAssistant > newestUser ? turns[newestAssistant] : null;
-    const liveNodes = liveTurn ? liveTurn.nodes || [liveTurn.node] : [];
-    baselineSections = assistantSections(turns).filter((node) => liveNodes.indexOf(node) < 0);
-    baselineMarks = baselineSections.slice(-3).map((node) => ({ node, mark: sectionMark(node) }));
-  }
-
-  /**
-   * Forgets what belongs to the chat we just left.
-   *
-   * The observation queue is deliberately *not* cleared: every entry in it already
-   * carries the conversation it was observed in, so anything still waiting for the app
-   * is delivered to the right session rather than being thrown away because the tab
-   * moved on.
-   */
-  /**
    * Marks what is on screen right now as belonging to the chat this tab is leaving.
    *
    * Called on a genuine move from chat A to chat B, before anything is attributed to B.
@@ -1523,8 +1569,8 @@
    * is the behaviour that must not regress, since the first message of a fresh chat is the
    * one this whole pipeline exists to keep.
    */
-  function retireVisible(turns = CLF_DOM.turns()) {
-    for (const turn of turns) {
+  function retireVisible(groups = CLF_DOM.transcriptGroups()) {
+    for (const turn of groups) {
       if (!turn.id || !seenTurns.has(turn.id)) continue;
       for (const node of turn.nodes || [turn.node]) {
         if (node) staleNodes.add(node);
@@ -1569,6 +1615,8 @@
     pendingPresentation = null;
     userAnchorByMessage.clear();
     openedUserMessageId = null;
+    generationOpeningUserMessageId = null;
+    trackedTurn = null;
     entries = [];
     streamEntries = [];
     streamRequestTurnOwners.clear();
@@ -1619,11 +1667,10 @@
     quietTurn = null;
     quietOutcome = null;
     turnId = null;
+    providerLifecycleWitnessed = false;
     genNode = null;
-    priorSections = new WeakSet();
-    priorMarks = [];
-    baselineSections = [];
-    baselineMarks = [];
+    preSendContinuationNode = null;
+    preSendContinuationMarks = [];
     userStopped = false;
     stallReported = false;
     fiberTerminalMessageId = null;
@@ -1649,10 +1696,6 @@
   }
 
   const stoppedAppCommands = new Set();
-  function stopQuestionMatches(userMessageId) {
-    const users = CLF_DOM.messages().filter(message => message.role === 'user' && message.id);
-    return typeof userMessageId === 'string' && !!userMessageId && users.at(-1)?.id === userMessageId;
-  }
   async function stopAppTurn(request) {
     const expected = request?.turnId, target = request?.conversationId, commandId = request?.id;
     const heldEpoch = epoch;
@@ -1661,22 +1704,29 @@
     // Refresh the existing lifecycle owner from the current DOM before using its
     // native-turn mapping; a stale paint cache is not a reason to ignore Stop.
     observe();
-    const current = () => alive && epoch === heldEpoch && conversationId === target && CLF_DOM.conversationId() === target && turnId === expected;
-    if (!current()) return false;
+    const stillOwnsRequestedTurn = () => alive && epoch === heldEpoch && conversationId === target &&
+      CLF_DOM.conversationId() === target && turnId === expected;
+    if (!stillOwnsRequestedTurn()) return false;
     if (stoppedAppCommands.has(commandId)) {
       await ask({ type: 'stop_ack', id: commandId, client: RUN_ID, conversationId: target, turnId: expected, status: 'sent' });
       return true;
     }
-    const native = currentAssistantTurn();
-    const nativeId = pageTurnIds.get(expected);
-    const latestNative = () => CLF_DOM.turns().at(-1);
+    const native = latestAssistantGroup();
+    const nativeId = providerTurnIdByLocalTurnId.get(expected);
+    const latestNative = () => CLF_DOM.transcriptGroups().at(-1);
     if (!generating || !nativeId || native?.id !== nativeId || latestNative()?.id !== nativeId) return false;
     const reply = await ask({ type: 'stop_redeem', id: commandId, client: RUN_ID, conversationId: target });
     observe();
     const command = reply?.command;
     if (!reply?.ok || command?.type !== 'stop' || command.turnId !== expected || command.conversationId !== target) return false;
-    const canStop = () => current() && generating && (!unwitnessedGeneration || stopQuestionMatches(command.userMessageId)) && latestNative()?.role === 'assistant' &&
-      latestNative()?.id === nativeId && pageTurnIds.get(expected) === nativeId;
+    const commandOpeningUserMessageId = typeof command.openingUserMessageId === 'string' && command.openingUserMessageId
+      ? command.openingUserMessageId
+      : null;
+    if (!commandOpeningUserMessageId) return false;
+    const canStop = () => stillOwnsRequestedTurn() && generating &&
+      generationOpeningUserMessageId === commandOpeningUserMessageId &&
+      latestNative()?.role === 'assistant' &&
+      latestNative()?.id === nativeId && providerTurnIdByLocalTurnId.get(expected) === nativeId;
     // Concurrent redemptions may finish after the first click, before ChatGPT removes Stop.
     const stopped = stoppedAppCommands.has(commandId) || (canStop() && CLF_DOM.stopGeneration(canStop));
     if (stopped) {
@@ -1688,32 +1738,22 @@
     return stopped;
   }
 
-  function currentAssistantTurn(turns = CLF_DOM.turns()) {
-    for (let index = turns.length - 1; index >= 0; index--) {
-      if (turns[index].role === 'assistant') return turns[index];
+  function latestAssistantGroup(groups = CLF_DOM.transcriptGroups()) {
+    for (let index = groups.length - 1; index >= 0; index--) {
+      if (groups[index].role === 'assistant') return groups[index];
     }
     return null;
   }
 
-  /** The logical turn a given section node currently belongs to, or null once it is gone. */
-  function turnForNode(node, turns = CLF_DOM.turns()) {
+  /** The chronological transcript group a section node currently belongs to, or null once gone. */
+  function groupForNode(node, groups = CLF_DOM.transcriptGroups()) {
     if (!node) return null;
-    for (const turn of turns) {
-      for (const section of turn.nodes || [turn.node]) {
-        if (section === node) return turn;
+    for (const group of groups) {
+      for (const section of group.nodes || [group.node]) {
+        if (section === node) return group;
       }
     }
     return null;
-  }
-
-  /** Every assistant section on the page right now, in document order. */
-  function assistantSections(turns = CLF_DOM.turns()) {
-    const out = [];
-    for (const turn of turns) {
-      if (turn.role !== 'assistant') continue;
-      for (const section of turn.nodes || [turn.node]) if (section) out.push(section);
-    }
-    return out;
   }
 
   /**
@@ -1730,15 +1770,65 @@
     return CLF_DOM.sectionSignature(node);
   }
 
+  /** Stable provider assistant-message identities already visible in one Fiber response. */
+  function stableResponseMessageIds(turn) {
+    const descriptor = fiberTurnFor(turn);
+    if (!descriptor) return [];
+    const identities = new Set();
+    for (const message of descriptor.messages || []) {
+      if (message?.stable !== true || (message.role && message.role !== 'assistant')) continue;
+      const id = message && (message.rawMessageId || message.messageId);
+      if (typeof id === 'string' && id) identities.add(id);
+    }
+    return [...identities].sort();
+  }
+
+  function responseMessageIdentityReplaced(before, after) {
+    if (!before.length || !after.length) return false;
+    const held = new Set(before);
+    return after.every((id) => !held.has(id));
+  }
+
+  /**
+   * Provider-owned marks for exactly the assistant response immediately preceding a Send.
+   *
+   * React can keep writing a new response into those same nodes after the user message mounts.
+   * No older response is eligible for that exception: a mutation there may be deferred citation,
+   * media or formatting work and says nothing about the newly opened generation.
+   */
+  function continuationMarks(turns) {
+    const previous = turns.at(-1);
+    if (!previous || previous.role !== 'assistant') return [];
+    const responseMessageIds = stableResponseMessageIds(previous);
+    return (previous.nodes || [previous.node])
+      .filter(Boolean)
+      .map((node) => ({ node, mark: sectionMark(node), responseMessageIds }));
+  }
+
+  /**
+   * The exact rendered response interval for the current generation's durable question.
+   *
+   * Turn identity is local, but its question is ChatGPT's stable native user-message id. Once
+   * that exact row is visible, ownership ends at the next user row. Missing opening identity or
+   * missing hydration is an honest unknown and returns null; callers must not substitute DOM
+   * recency. A document that witnessed the Send may separately prove React kept writing into the
+   * exact same pre-Send node; ownedAssistantGroup() owns that narrow node-continuity
+   * exception without changing this transcript boundary.
+   */
+  function generationResponseWindow(groups = CLF_DOM.transcriptGroups()) {
+    return generationOpeningUserMessageId
+      ? CLF_DOM.responseWindowForOpeningMessage(groups, generationOpeningUserMessageId)
+      : null;
+  }
+
   /**
    * The assistant section this generation is writing into, or null while that is unknown.
    *
-   * Two kinds of evidence, and nothing else. A section that was not on the page before the
-   * generation began is this generation's — that is the ordinary case, and the reason the
-   * baseline has to come from the previous observation rather than from the DOM as it
-   * stands now. Otherwise, a section that *was* there but whose text has changed since is
-   * also this generation's, which covers ChatGPT continuing to write into an existing
-   * section.
+   * Normal ownership is structural: the newest assistant section inside the exact interval
+   * after this generation's opening user message and before the next user message. The sole
+   * exception is a local Send whose pre-Send sample proves React kept writing into the exact
+   * immediately preceding assistant node above that opening row. Adopted/recovered generations
+   * never receive that document-local privilege.
    *
    * Null is a real answer. The version this replaced took the newest assistant section
    * after four seconds regardless, and a turn whose section genuinely had not appeared yet
@@ -1746,29 +1836,50 @@
    * nothing for a turn is a gap; recording another turn's work under it is a lie, and the
    * whole point of this batch is that the local session log stops containing those.
    */
-  function generationTurn(turns = CLF_DOM.turns()) {
-    if (genNode) {
-      const held = turnForNode(genNode, turns);
+  function ownedAssistantGroup(groups = CLF_DOM.transcriptGroups(), responseWindow = generationResponseWindow(groups)) {
+    if (!responseWindow) return null;
+    const { openingIndex, responseGroups } = responseWindow;
+
+    // Once ordinary post-question geometry has established an owner, keep that exact node while
+    // it remains inside the response interval. React can temporarily move an older response to
+    // the end of the DOM; "newest assistant" is discovery, not permission to steal an already
+    // proven generation. The exceptional above-question owner is deliberately different: the
+    // moment a proper response mounts below the opening question, normal geometry outranks it.
+    if (genNode && !preSendContinuationNode) {
+      const held = groupForNode(genNode, responseGroups);
       if (held) return held;
-      genNode = null;
     }
-    const latest = currentAssistantTurn(turns);
-    if (!latest) return null;
-    // Any node of the logical turn, not just the first. ChatGPT splits one answer across
-    // sibling sections, and a new sibling appended to a section that was already there is
-    // still this generation writing.
-    for (const node of latest.nodes || [latest.node]) {
-      if (!node || priorSections.has(node)) continue;
-      genNode = node;
-      return latest;
+    const latestResponse = latestAssistantGroup(responseGroups);
+    if (latestResponse) {
+      const node = (latestResponse.nodes || [latestResponse.node]).find(Boolean) || null;
+      if (node) {
+        genNode = node;
+        preSendContinuationNode = null;
+      }
+      return node ? latestResponse : null;
     }
-    for (const held of priorMarks) {
-      if (!latest.nodes && held.node !== latest.node) continue;
-      if (latest.nodes && latest.nodes.indexOf(held.node) < 0) continue;
-      if (sectionMark(held.node) === held.mark) continue;
-      genNode = held.node;
-      return latest;
+
+    // The only ownership exception above the opening user row is exact node continuity from the
+    // immediately preceding response this same document sampled at Send. A remount is merely DOM
+    // novelty, and a mutation in any older response is unrelated historical work.
+    const candidate = preSendContinuationMarks.length > 0 ? groups[openingIndex - 1] : null;
+    if (candidate?.role === 'assistant') {
+      const nodes = candidate.nodes || [candidate.node];
+      if (preSendContinuationNode && nodes.includes(preSendContinuationNode)) return candidate;
+      const responseMessageIds = stableResponseMessageIds(candidate);
+      for (const held of preSendContinuationMarks) {
+        if (!nodes.includes(held.node) || sectionMark(held.node) === held.mark) continue;
+        // A page-owned mutation of the old response (late citations/media/formatting) is not a
+        // new generation. The above-question exception therefore requires the provider's stable
+        // response message identity to change as well as the exact pre-Send node to mutate.
+        if (!responseMessageIdentityReplaced(held.responseMessageIds, responseMessageIds)) continue;
+        genNode = held.node;
+        preSendContinuationNode = held.node;
+        return candidate;
+      }
     }
+    genNode = null;
+    preSendContinuationNode = null;
     return null;
   }
 
@@ -1812,9 +1923,8 @@
   function localErrorGeneration(error) {
     const section = sectionOf(error.node);
     // An in-turn error has a concrete section. Its page turn id is only a presentation hint:
-    // ChatGPT reuses those ids and CLF_DOM.turns() groups equal ids for tool-row accounting, so
-    // either one can join an old section to the current response. Only this exact section node
-    // may prove local generation ownership.
+    // ChatGPT reuses provider turn ids, so the id cannot prove local ownership even though
+    // adjacent same-id sections are folded for one response. Only this exact section node may.
     if (section) return localGenerationOfSection(section);
     // A top-level banner has no section/page-turn identity. Its node was stamped with the local
     // generation in which it first appeared, which is the one exact ownership fact it has.
@@ -1866,7 +1976,7 @@
     // old DOM rule remains there behind this capability check — for generations this
     // document has seen running. An adopted one it has not has no document-side evidence of
     // finishing at all, and its visible prose is whatever was committed before the reload.
-    // See unwitnessedGeneration. Pro can hide its Stop control while still thinking:
+    // See providerLifecycleWitnessed. Pro can hide its Stop control while still thinking:
     // it requires native end_turn even without Fiber. A closed picker supplies no current
     // model proof either; never treat that absence as proof of a non-Pro turn. Read the
     // existing passive picker authority, without opening it or trusting a cached selection.
@@ -1875,7 +1985,7 @@
     // Exact aliases match shared/chat-models.ts::isProModel (the extension is plain JS).
     const pro = /^(?:astra|gpt-?6-astra|gpt-?\d+(?:[.-]\d+)?-pro)$/.test(model) ||
       (/^(?:gpt-?6(?:\.0)?|gpt-?5\.6(?:-sol)?)$/.test(model) && selection?.reasoningEffort === 'pro');
-    if (!fiberPresent && !unwitnessedGeneration && model && !pro && answerText(turn).length > 0) return { outcome: 'completed' };
+    if (!fiberPresent && providerLifecycleWitnessed && model && !pro && answerText(turn).length > 0) return { outcome: 'completed' };
     if (turnStalled()) {
       return { outcome: 'stalled', detail: 'no visible output and no progress for ten minutes' };
     }
@@ -1903,7 +2013,7 @@
   /**
    * The local generation a rendered assistant turn belongs to, by node identity.
    *
-   * Deliberately not a reverse lookup through `pageTurnIds`. That map runs generation →
+   * Deliberately not a reverse lookup through `providerTurnIdByLocalTurnId`. That map runs generation →
    * page id, and ChatGPT reuses `data-turn-id` across turns, so inverting it is ambiguous
    * by construction: several generations can claim one page id and the newest entry is not
    * reliably the one on screen. The node is unambiguous — the live turn is whichever holds
@@ -1933,7 +2043,7 @@
 
   function currentGenerationOwner() {
     if (!generating || !turnId) return null;
-    const pageTurn = generationTurn();
+    const pageTurn = ownedAssistantGroup();
     return pageTurn ? { pageTurnId: pageTurn.id || null, localTurnId: turnId, pageTurn } : null;
   }
 
@@ -1952,12 +2062,8 @@
    * user bubble that caused it. Both used to read as "the user has moved on", which closed a
    * turn that had not ended. See `authoredNow`.
    */
-  function reportMessages(nowGenerating) {
-    // See resumeIdentityPending: until the app has said what it already holds for this chat,
-    // this transcript is unreadable rather than merely unopenable.
-    if (resumeIdentityPending) return null;
+  function reportMessages(nowGenerating, rendered = CLF_DOM.messages()) {
     let newUserMessage = null;
-    const rendered = CLF_DOM.messages();
     // The newest user message on screen, by document order. A send the user has just made is
     // always the last one; anything above it is transcript, however new it is to this
     // document — which is what makes scrolling an old turn back into a virtualized page
@@ -2038,6 +2144,10 @@
         // opens the local generation. Re-emitting the transcript would duplicate it, so a seen
         // row contributes only the boundary here.
         const justAuthored = authoredNow(message);
+        // While historical identity is unresolved, only an exact composer receipt may cross the
+        // gate. That preserves the unreadable-history rule while allowing a fresh Send witnessed
+        // by this document to supersede a permanently non-adoptable tracked turn.
+        if (resumeIdentityPending && !justAuthored) continue;
         if (seenMessages.has(key)) {
           if (justAuthored) newUserMessage = justAuthored;
           continue;
@@ -2137,8 +2247,9 @@
     // and waits for it to hold still first. See noteGoalTurn.
     noteGoalTurn(ended, result.outcome, endedTurnId);
     turnStartedAt = 0;
-    unwitnessedGeneration = false;
+    providerLifecycleWitnessed = false;
     genNode = null;
+    preSendContinuationNode = null;
   }
 
   function observe() {
@@ -2148,15 +2259,12 @@
     CLF_DOM.presentUserPrompts?.(message => userMessageSource(message)?.text ?? null);
     publishDesktopDecisionPartial();
     const id = CLF_DOM.conversationId();
-    // One DOM turn snapshot per observation, created lazily because a transient id-less route
-    // returns before transcript work. Everything below this stack frame that needs `turns()`
-    // receives the same array explicitly; it is never cached across an await or another tick.
-    // Besides avoiding repeated transcript walks, this prevents one observation from combining
-    // section identity from two React frames if ChatGPT mutates synchronously through a hook.
-    let turnSnapshot = null;
-    const turnsNow = () => {
-      if (turnSnapshot === null) turnSnapshot = CLF_DOM.turns();
-      return turnSnapshot;
+    // One chronological DOM snapshot per observation. Lifecycle decisions in this tick therefore
+    // never compare wrappers materialized from two different React frames.
+    let transcriptGroupsSnapshot = null;
+    const transcriptNow = () => {
+      if (transcriptGroupsSnapshot === null) transcriptGroupsSnapshot = CLF_DOM.transcriptGroups();
+      return transcriptGroupsSnapshot;
     };
     // A missing id is not a navigation signal. ChatGPT can transiently unmount the route/
     // transcript state during React churn while the same conversation and tab are still
@@ -2177,7 +2285,7 @@
         // the new id is adopted, because from the next line onwards everything emitted
         // carries that id.
         void ask({ type: 'closed', conversationId });
-        retireVisible(turnsNow());
+        retireVisible(transcriptNow());
         epoch++;
         conversationId = id;
         // The worker identity belongs to the conversation the bootstrap created, not to this
@@ -2283,8 +2391,9 @@
     // Every section on screen, not just the assistant's: this is the record of what this
     // script watched while on this conversation, and it is the whole basis on which
     // retireVisible() later decides which sections the tab is leaving behind.
-    const observedTurns = turnsNow();
-    for (const seen of observedTurns) {
+    const transcriptGroups = transcriptNow();
+    const renderedMessages = CLF_DOM.messages(transcriptGroups);
+    for (const seen of transcriptGroups) {
       if (seen.id) seenTurns.add(seen.id);
     }
     if (seenTurns.size > 2000) seenTurns.delete(seenTurns.values().next().value);
@@ -2313,8 +2422,20 @@
     // second or so over an empty transcript while a reloaded page hydrates, and a witness
     // taken from that flicker let the degraded DOM rule close the adopted turn from the
     // previous answer's prose once Stop went away again.
-    if (generating && nowGenerating && (!unwitnessedGeneration || generationTurn(observedTurns))) {
-      unwitnessedGeneration = false;
+    // Cache exact response geometry for the current opening within this immutable transcript
+    // snapshot. A successor user message can close this generation and open another one in the
+    // same observe() call, so key the cache by opening identity rather than by the stack frame.
+    let responseWindowOpening = null;
+    let responseWindow = null;
+    const responseWindowNow = () => {
+      if (responseWindowOpening !== generationOpeningUserMessageId) {
+        responseWindowOpening = generationOpeningUserMessageId;
+        responseWindow = generationResponseWindow(transcriptGroups);
+      }
+      return responseWindow;
+    };
+    if (generating && nowGenerating && (providerLifecycleWitnessed || ownedAssistantGroup(transcriptGroups, responseWindowNow()))) {
+      providerLifecycleWitnessed = true;
     }
 
     // The transcript that is already settled goes in first — before this tick can open a
@@ -2322,9 +2443,16 @@
     // the live turn at sequence 2, the user message that asked for it at 3, and the
     // conversation's earlier history at 4 and 5. A log whose first assistant turn precedes
     // the question that caused it cannot be read back as a session, however complete it is.
-    const submission = reportMessages(nowGenerating);
-    const newUserMessage = submission?.messageId || claimUnrecordedGeneration(nowGenerating, observedTurns);
+    const submission = reportMessages(nowGenerating, renderedMessages);
+    const recoveredOpening = submission
+      ? null
+      : claimUnrecordedGeneration(nowGenerating, transcriptGroups, renderedMessages);
+    const newUserMessage = submission?.messageId || recoveredOpening;
     if (newUserMessage) {
+      if (resumeIdentityPending) {
+        resumeIdentityPending = false;
+        trackedTurn = null;
+      }
       fiberTerminalMessageId = null;
       // A terminal Goal card explains the answer immediately before this user message.
       // Once the user has continued manually it is history, not current composer state.
@@ -2342,7 +2470,10 @@
     // version that asked only whether *this page load* had journalled the message closed a
     // live turn on every reload, and split every chat's opening turn in two.
     if (generating && newUserMessage) {
-      const ended = quietTurn || generationTurn(observedTurns);
+      // `ownedAssistantGroup()` is already bounded before this exact successor question. A successor
+      // assistant mounted in the same React burst can never
+      // become evidence for the turn this question just replaced.
+      const ended = quietTurn || ownedAssistantGroup(transcriptGroups, responseWindowNow());
       const fresh = endOutcome(ended);
       const result = quietOutcome && quietOutcome.outcome !== 'unknown' ? quietOutcome : fresh;
       // A new user message is an actual boundary, unlike a disappearing Stop control. Once
@@ -2378,11 +2509,12 @@
     //
     // Everything Stop still does is downstream of this, describing a turn that already exists:
     // its liveness, the quiet window that closes it, the flicker that cancels that window. A
-    // turn a previous document opened arrives by adoptOpenTurn() from the app's `activeTurnId`,
+    // turn a previous document opened arrives by adoptTurn() from the app's tracked turn,
     // which is adoption and not opening — no second `turn_start` for one generation. A turn no
     // document ever recorded arrives by claimUnrecordedGeneration(), which is an opening.
     if (newUserMessage && !generating) {
       openedUserMessageId = newUserMessage;
+      generationOpeningUserMessageId = newUserMessage;
       generating = true;
       quietSince = 0;
       quietTurn = null;
@@ -2391,13 +2523,13 @@
       stallReported = false;
       genCount++;
       turnId = `g-${RUN_ID}-${epoch}-${genCount}`;
-      unwitnessedGeneration = false;
+      providerLifecycleWitnessed = true;
       bindResumeGoalTurn(turnId);
       genNode = null;
-      // Exclude history as it stood at Send, before a fast answer could mount.
-      // Without a witnessed Send, retain the previous observation's baseline.
-      priorSections = new WeakSet(submission?.baseline?.sections ?? baselineSections);
-      priorMarks = submission?.baseline?.marks ?? baselineMarks;
+      preSendContinuationNode = null;
+      preSendContinuationMarks = submission?.messageId === newUserMessage
+        ? submission?.baseline?.continuationMarks ?? []
+        : [];
       turnStartedAt = Date.now();
       noteTurnProgress();
       // "Wait for this turn to finish" was about a turn that has now been replaced. Keeping
@@ -2415,7 +2547,7 @@
       // what keeps the app's `turn_start` the only one — repeating it would clear the very
       // state the resume exists to keep, since recorder.ts empties `progress`, `pageTools`
       // and the pending sightings on every turn_start.
-      emit({ kind: 'turn_start', turnId });
+      emit({ kind: 'turn_start', turnId, openingUserMessageId: newUserMessage });
 
       // The compaction binding is made here and only here: the first generation to open
     }
@@ -2428,14 +2560,14 @@
     // apart in the same tick. At millisecond resolution they tie, and a tie read as "this
     // turn's" — so an undismissed banner from an earlier failure could fail the next turn,
     // which is the exact thing that comparison exists to prevent.
-    const turn = generating ? generationTurn(observedTurns) : currentAssistantTurn(observedTurns);
+    const turn = generating ? ownedAssistantGroup(transcriptGroups, responseWindowNow()) : latestAssistantGroup(transcriptGroups);
     const visibleErrors = turn ? (CLF_DOM.errorsForTurn?.(turn) ?? CLF_DOM.errors()) : CLF_DOM.errors();
     for (const error of visibleErrors) {
       if (!errorFirstSeen.has(error.node)) errorFirstSeen.set(error.node, turnId);
     }
     if (generating && turn && turn.id) {
-      pageTurnIds.set(turnId, turn.id);
-      if (pageTurnIds.size > 500) pageTurnIds.delete(pageTurnIds.keys().next().value);
+      providerTurnIdByLocalTurnId.set(turnId, turn.id);
+      if (providerTurnIdByLocalTurnId.size > 500) providerTurnIdByLocalTurnId.delete(providerTurnIdByLocalTurnId.keys().next().value);
     }
 
     // Progress lines are only meaningful while they are moving. Captured live they
@@ -2467,7 +2599,7 @@
     if (continuationJournalPending || generating || pendingSendEvidence) {
       void refreshFiber();
     } else if (fiberTerminalMessageId && nowGenerating) {
-      const terminalTurn = currentAssistantTurn(observedTurns);
+      const terminalTurn = latestAssistantGroup(transcriptGroups);
       void refreshFiber({
         pageTurnId: terminalTurn?.id || null,
         terminalProbe: fiberTerminalMessageId
@@ -2510,7 +2642,7 @@
     if (generating && nowGenerating && quietSince > 0) {
       // The stop button came back, so it never went away in the sense that matters: this is
       // one turn that flickered, not two turns. Everything the generation holds — its id,
-      // its baselines, its reported-progress map — is still the right state to carry on
+      // its pre-Send continuation evidence, its reported-progress map — is still the right state to carry on
       // with, so the settle window is simply abandoned.
       quietSince = 0;
       quietTurn = null;
@@ -2624,12 +2756,6 @@
       });
     }
 
-    // Last, so the next generation's idea of "what was already on the page" is this tick's
-    // page rather than the one it is about to change. Marks are kept only for the newest
-    // few sections: they exist to answer "has ChatGPT written into this since", and no
-    // generation ever binds to a section further back than that.
-    baselineSections = assistantSections(observedTurns);
-    baselineMarks = baselineSections.slice(-3).map((node) => ({ node, mark: sectionMark(node) }));
     maybeRecoverResumeGoalTurn();
     // A revival can be waiting outside the command lease while this exact turn settles. Its
     // readiness depends partly on recorder state (`generating`, pending tools/native work), not
@@ -3418,6 +3544,7 @@
     // finishGeneration's exact node/signature tombstone still proves the old ownership.
     const requestedLiveOwner = !settled ? currentGenerationOwner() : null;
     const requestedOwner = settled || requestedLiveOwner;
+    const requestedTurnId = !settled && generating ? turnId : null;
     let answer = await askFiber();
     if (answer === null) {
       // One missed reply is not proof the helper is gone: a busy main thread can outlive this
@@ -3464,20 +3591,21 @@
     // actually owns, and its `data-clf-fiber-turn` stamp names the descriptor exactly even
     // when the virtualized renderer published no page turn id at all. The page-id match
     // stays as the fallback for a scan whose stamps have not been applied yet.
-    const exactOwner = requestedLiveOwner && localGenerationOf(requestedLiveOwner.pageTurn) !== requestedLiveOwner.localTurnId
+    let exactOwner = requestedLiveOwner && localGenerationOf(requestedLiveOwner.pageTurn) !== requestedLiveOwner.localTurnId
       ? null
       : requestedOwner;
-    const ownedPageNode = exactOwner?.pageTurn || null;
-    const ownedPageTurnId = exactOwner?.pageTurnId || null;
-    let ownedPageTurn = stampedFiberTurn(ownedPageNode, answer.turns, answer.scanToken);
-    if (!ownedPageTurn && ownedPageTurnId) {
+    const pageTurnForOwner = (owner) => {
+      if (!owner) return null;
+      const stamped = stampedFiberTurn(owner.pageTurn || null, answer.turns, answer.scanToken);
+      if (stamped) return stamped;
+      const pageTurnId = owner.pageTurnId || null;
+      if (!pageTurnId) return null;
       for (let index = answer.turns.length - 1; index >= 0; index--) {
-        if (answer.turns[index].turnId === ownedPageTurnId) {
-          ownedPageTurn = answer.turns[index];
-          break;
-        }
+        if (answer.turns[index].turnId === pageTurnId) return answer.turns[index];
       }
-    }
+      return null;
+    };
+    let ownedPageTurn = pageTurnForOwner(exactOwner);
     // A destination Resume has a second exact owner that is even more fundamental than this
     // document's local generation: the *durably accepted* continuation marker and the answer
     // turn it opened. Resolve and commit that relation before filtering foreign Fiber ids. The
@@ -3566,6 +3694,28 @@
       else fiberTurns.set(turn.index, turn);
     }
     for (const [index, value] of fiberTurns) if (value === null) fiberTurns.delete(index);
+    // The pre-await owner deliberately comes from the last accepted Fiber frame so a late reply
+    // can never bind itself to a generation that opened while the scan was in flight. One case
+    // necessarily begins without such an owner: the exact pre-Send node changed and this reply is
+    // the first frame whose stable website object proves that semantic transition. Re-evaluate
+    // ownership only after installing the route-filtered frame, and only while the same local
+    // generation that requested it is still current. Fresh evidence may strengthen unknown;
+    // an old frame may never cross a generation boundary.
+    if (
+      !exactOwner &&
+      !ownedPageTurn &&
+      requestedTurnId &&
+      epoch === askedEpoch &&
+      conversationId === askedConversation &&
+      generating &&
+      turnId === requestedTurnId
+    ) {
+      const refreshedOwner = currentGenerationOwner();
+      if (refreshedOwner?.localTurnId === requestedTurnId) {
+        exactOwner = refreshedOwner;
+        ownedPageTurn = pageTurnForOwner(refreshedOwner);
+      }
+    }
     CLF_DOM.presentUserPrompts?.(message => userMessageSource(message)?.text ?? null);
     for (const check of pageViewChecks) void check();
     completeDesktopDecision();
@@ -3835,7 +3985,7 @@
         // before the parent became observable. Raw website ids therefore remain valid
         // canonical ids until/if Fiber can provide the stronger parent identity.
         // Ownership is part of the observation. A Fiber message can become visible a scan
-        // before generationTurn() can bind the React section; if byte-identical content alone
+        // before ownedAssistantGroup() can bind the React section; if byte-identical content alone
         // were the dedupe key, that first unowned snapshot permanently prevented the later
         // exact local turn id from reaching the recorder. The recorder upsert is expressly
         // able to promote the same canonical message when stronger ownership arrives.
@@ -3898,7 +4048,7 @@
       Boolean(answer.turns[activeTurnIndex]?.endMessageId)
     ) {
       fiberTerminalMessageId = answer.turns[activeTurnIndex].endMessageId;
-      const ended = generationTurn();
+      const ended = ownedAssistantGroup();
       if (ended) {
         const local = endOutcome(ended);
         // A later exact native final supersedes the stale Thinking failed header.
@@ -4024,7 +4174,7 @@
    * ChatGPT's identifier for the request, not an observation of ours, so it means the same
    * thing before and after a refresh.
    *
-   * Two conditions, both the ones anchoredRenderForTurn already relies on. The turn must
+   * Two conditions, both the ones anchoredRenderForGroup already relies on. The group must
    * name exactly one request — several is a turn this cannot order — and the request must
    * not already have been claimed by an earlier turn in this pass, since one response's
    * calls cannot belong to two visible turns. Where either fails the turn keeps ChatGPT's
@@ -4480,7 +4630,7 @@
    * undo what it did, or our labels stay frozen on the page for the life of the tab.
    */
   function unpaint() {
-    for (const turn of CLF_DOM.turns()) {
+    for (const turn of CLF_DOM.transcriptGroups()) {
       if (turn.role !== 'assistant') continue;
       for (const block of CLF_DOM.toolBlocks(turn)) {
         if (!block.dataset.clfCall && !block.dataset.clfPage) continue;
@@ -4523,7 +4673,7 @@
     }
     /** Requests already handed to a turn in this pass. One request, one turn. */
     const spentRequests = new Set();
-    for (const turn of CLF_DOM.turns()) {
+    for (const turn of CLF_DOM.transcriptGroups()) {
       if (turn.role !== 'assistant' || !turn.id) continue;
       const calls = recordedCallsFor(turn, byTurn, byRequest, spentRequests);
       const blocks = CLF_DOM.toolBlocks(turn);
@@ -4713,6 +4863,19 @@
     const byTurn = new Map();
     const timedRequestTools = [];
     for (const entry of entries) {
+      if (entry.kind === 'recording_gap') {
+        const lost = entry.lostKinds;
+        const lifecycleLoss = !lost || Number(lost.turn_start || 0) > 0 || Number(lost.turn_end || 0) > 0 ||
+          Number(lost.unknown || 0) > 0;
+        // Transcript-only loss stays visible without destroying exact lifecycle grouping. When
+        // lifecycle evidence is missing, invalidate only the named turn when scope is exact; an
+        // unscoped lifecycle gap remains a barrier for every open presentation group.
+        if (lifecycleLoss) {
+          if (entry.affectedTurnId) byTurn.delete(entry.affectedTurnId);
+          else byTurn.clear();
+        }
+        continue;
+      }
       if (entry.kind === 'turn_start') {
         const group = { id: entry.turnId || `seq:${entry.seq}`, entries: [entry], startedAt: Number(entry.time) || 0 };
         groups.push(group);
@@ -4776,12 +4939,12 @@
     return groups;
   }
 
-  /** The one durable user-message boundary immediately preceding a visible assistant turn. */
-  function userAnchorForTurn(turn, sourceTurns) {
-    const at = sourceTurns.indexOf(turn);
+  /** The one durable user-message boundary immediately preceding a visible assistant group. */
+  function userAnchorForGroup(group, sourceGroups) {
+    const at = sourceGroups.indexOf(group);
     if (at < 0) return null;
     for (let index = at - 1; index >= 0; index--) {
-      const prior = sourceTurns[index];
+      const prior = sourceGroups[index];
       if (!prior || prior.role !== 'user') continue;
       const ids = new Set();
       for (const message of CLF_DOM.messagesIn(prior)) {
@@ -4818,13 +4981,14 @@
    * of those local starts.
    *
    * One group between this user anchor and the next is unambiguous. With several groups we
-   * additionally require the visible Fiber turn's single response request id, then union only
-   * groups in this exact user interval that contain that request id. This handles the live
-   * 2026-08-19 failure (one request split by reload/lifecycle churn) without merging a genuine
-   * regenerate/retry, which gets a different response request while sharing the same user.
+   * additionally require the visible Fiber turn's single response request id, then consider only
+   * groups in this exact user interval that contain that request id. Request identity alone does
+   * not authorize a union: ChatGPT can reuse it across retries. Stable website message/activity
+   * identity selects one attempt when available; otherwise only an explicit unknown-terminal
+   * fragmentation may be reconstructed as one response.
    */
-  function anchoredRenderForTurn(turn, sourceTurns, groups, requiredGroup = null, requireRequest = false) {
-    const anchor = userAnchorForTurn(turn, sourceTurns);
+  function anchoredRenderForGroup(group, sourceGroups, groups, requiredGroup = null, requireRequest = false) {
+    const anchor = userAnchorForGroup(group, sourceGroups);
     if (!anchor || !Number.isFinite(Number(anchor.seq))) return null;
     const anchorSeq = Number(anchor.seq);
     let nextAnchorSeq = Infinity;
@@ -4850,16 +5014,46 @@
 
     let selected = candidates;
     if (candidates.length > 1 || requireRequest) {
-      const descriptor = fiberTurnFor(turn);
+      const descriptor = fiberTurnFor(group);
       if (!descriptor) return null;
       const requestIds = new Set();
       for (const call of descriptor.calls || []) if (call && call.requestId) requestIds.add(call.requestId);
       if (requestIds.size !== 1) return null;
       const requestId = requestIds.values().next().value;
-      selected = candidates.filter((group) =>
+      const requestMatches = candidates.filter((group) =>
         (group.entries || []).some((entry) => entry.kind === 'tool_call' && entry.requestId === requestId)
       );
-      if (selected.length === 0) return null;
+      if (requestMatches.length === 0) return null;
+
+      // Request ids are response evidence, not turn identity: ChatGPT can reuse one across
+      // retries beneath the same user message. Stable website message/activity identity wins
+      // whenever it names one exact logical turn. With no such object yet, multiple local ids
+      // are still one provable response only across an `unknown` terminal boundary: that is the
+      // recorder's explicit "the page disappeared while this turn may still be running" shape.
+      // A completed/failed/stopped predecessor is a semantic attempt boundary, so a reused
+      // request id cannot merge across it.
+      const logicalIds = new Set(requestMatches.map((candidate) => candidate.id));
+      if (logicalIds.size > 1) {
+        const strongMessageIds = new Set();
+        for (const message of descriptor.messages || []) if (message?.messageId) strongMessageIds.add(message.messageId);
+        for (const activity of descriptor.activities || []) if (activity?.messageId) strongMessageIds.add(activity.messageId);
+        const strongOwners = new Set(
+          requestMatches
+            .filter((candidate) => (candidate.entries || []).some((entry) =>
+              (entry.kind === 'assistant_message' || entry.kind === 'page_tool') &&
+              entry.messageId && strongMessageIds.has(entry.messageId)
+            ))
+            .map((candidate) => candidate.id)
+        );
+        if (strongOwners.size === 1) {
+          const owner = strongOwners.values().next().value;
+          selected = requestMatches.filter((candidate) => candidate.id === owner);
+        } else {
+          return null;
+        }
+      } else {
+        selected = requestMatches;
+      }
     }
     // During a live turn, do not let an activity pull that has only part of the response hide
     // the section currently being written. Wait until the app feed includes the exact local
@@ -4945,7 +5139,7 @@
   /**
    * One render-pass index over the local stream.
    *
-   * `websiteRenderForTurn()` used to repeatedly filter all 4,000 retained stream entries for
+   * `websiteRenderForGroup()` used to repeatedly filter all 4,000 retained stream entries for
    * every message/activity/request of every visible turn. A long chat with a few dozen items
    * per turn therefore turned one one-second repaint into millions of main-thread predicate
    * calls, exactly while ChatGPT was also trying to virtualize/navigate its own transcript.
@@ -5002,7 +5196,7 @@
    * When exact keys identify one durable group, orphan exact rows are promoted to that group
    * for rendering only so chronology can put a prematurely-recorded turn_end back at the end.
    */
-  function websiteRenderForTurn(turn, groups, localGroup = null, index = null) {
+  function websiteRenderForGroup(turn, groups, localGroup = null, index = null) {
     const descriptor = fiberTurnFor(turn);
     // Overwrite is presentation, never a reason to make ChatGPT disappear. Without the page
     // model descriptor we cannot prove that the local stream is complete for this visible
@@ -5122,7 +5316,7 @@
     return false;
   }
 
-  function completeReplacementForTurn(turn, entries) {
+  function completeReplacementForGroup(turn, entries) {
     const descriptor = fiberTurnFor(turn);
     if (!descriptor) return false;
     const expected = [];
@@ -5193,8 +5387,10 @@
     icon.setAttribute('aria-hidden', 'true');
     if (entry.kind === 'tool_call') setToolIcon(icon, entry.summary && entry.summary.kind);
     else if (entry.kind === 'page_tool') setToolIcon(icon, 'thought');
-    else icon.textContent = entry.kind === 'chat_error' ? '!' : entry.kind === 'agent_message' ? '↔' : entry.kind === 'repair' ? '↻' : '';
+    else icon.textContent = entry.kind === 'chat_error' || entry.kind === 'recording_gap' ? '!'
+      : entry.kind === 'agent_message' ? '↔' : entry.kind === 'repair' ? '↻' : '';
     row.append(icon);
+    if (entry.kind === 'chat_error') row.setAttribute('role', 'status');
 
     if (entry.agent) {
       const who = document.createElement('span');
@@ -5222,6 +5418,10 @@
     } else if (entry.kind === 'turn_end') {
       const outcome = entry.outcome ? String(entry.outcome).replace(/_/g, ' ') : 'completed';
       body.textContent = `Turn ${outcome}${entry.detail ? ` · ${entry.detail}` : ''}`;
+    } else if (entry.kind === 'recording_gap') {
+      body.textContent = entry.detail
+        ? `Recording gap · ${entry.detail}`
+        : 'Part of this browser recording is incomplete.';
     } else {
       body.textContent = entry.text || '';
     }
@@ -5301,7 +5501,7 @@
    * Independent of Overwrite: the notice is about what the app did to this tab, not a
    * re-rendering of ChatGPT's answer, so it shows whenever the page is paired.
    */
-  function renderRepairNotices(sourceTurns) {
+  function renderRepairNotices(sourceGroups) {
     const shown = status.connected === true && status.paired === true;
     const notices = shown ? streamEntries.filter(repairNotice) : [];
     const wanted = new Set(notices.map((entry) => entry.seq));
@@ -5311,12 +5511,12 @@
       repairNoticeRoots.delete(seq);
     }
     if (notices.length === 0) return;
-    const userTurns = [];
-    for (const turn of sourceTurns) {
+    const userGroups = [];
+    for (const turn of sourceGroups) {
       if (turn.role !== 'user' || !turn.node || !turn.node.parentElement) continue;
       const message = CLF_DOM.messagesIn(turn).find((held) => held.role === 'user' && userAnchorByMessage.has(held.id));
       const anchor = message ? userAnchorByMessage.get(message.id) : null;
-      if (anchor && anchor.seq >= 0) userTurns.push({ node: turn.node, seq: anchor.seq });
+      if (anchor && anchor.seq >= 0) userGroups.push({ node: turn.node, seq: anchor.seq });
     }
     const rootFor = (entry) => {
       let root = repairNoticeRoots.get(entry.seq);
@@ -5345,12 +5545,12 @@
     };
     // Every notice is moved only when it is not already where it belongs: a DOM move under
     // the reader's scroll position is the jump presentationScrollActive() exists to prevent.
-    const tail = sourceTurns[sourceTurns.length - 1];
+    const tail = sourceGroups[sourceGroups.length - 1];
     const tailNode = tail ? (tail.nodes || [tail.node])[(tail.nodes || [tail.node]).length - 1] : null;
     let previous = tailNode && tailNode.parentElement ? tailNode : null;
     const before = new Map();
     for (const entry of notices) {
-      const next = userTurns.find((held) => held.seq > entry.seq);
+      const next = userGroups.find((held) => held.seq > entry.seq);
       if (next) {
         const list = before.get(next.node) || [];
         list.push(entry);
@@ -5426,11 +5626,11 @@
     return null;
   }
 
-  function presentationViewportAnchor(sourceTurns) {
+  function presentationViewportAnchor(sourceGroups) {
     const viewport = Number(globalThis.innerHeight) || Number(document.documentElement && document.documentElement.clientHeight) || 0;
     const pick = (role) => {
       let best = null;
-      for (const turn of sourceTurns || []) {
+      for (const turn of sourceGroups || []) {
         if (role && turn.role !== role) continue;
         for (const node of turn.nodes || (turn.node ? [turn.node] : [])) {
           if (!node || !node.isConnected || typeof node.getBoundingClientRect !== 'function') continue;
@@ -5490,21 +5690,26 @@
     // Existing synthetic roots are frozen for the same reason: Fiber can fill in while the
     // gesture is active, but presentation waits until the reader has stopped moving.
     if (enabled && presentationScrollActive()) return;
-    const sourceTurns = typeof CLF_DOM.presentationTurns === 'function' ? CLF_DOM.presentationTurns() : CLF_DOM.turns();
-    const viewportAnchor = presentationViewportAnchor(sourceTurns);
+    const sourceGroups = CLF_DOM.transcriptGroups();
+    const viewportAnchor = presentationViewportAnchor(sourceGroups);
     // A stable `data-turn-id` is not required for presentation. ChatGPT transiently and, in
     // some renderer builds, permanently exposes assistant sections without one. The preceding
     // user message id is a stronger durable boundary anyway, so an id-less response with an
     // exact user anchor must still be reconstructable instead of randomly falling back native.
-    const assistantTurns = sourceTurns.filter((turn) => turn.role === 'assistant');
+    const assistantGroups = sourceGroups.filter((group) => group.role === 'assistant');
     const groups = streamTurnGroups(streamEntries);
     const renderIndex = streamRenderIndex(streamEntries, groups);
-    const newest = assistantTurns[assistantTurns.length - 1] || null;
+    const newest = assistantGroups[assistantGroups.length - 1] || null;
+    // Wrapper identity is meaningful only inside one DOM snapshot. Resolve the active response
+    // from sourceGroups once so comparisons below never cross two separately materialized reads.
+    const activeOwnedResponse = generating
+      ? ownedAssistantGroup(sourceGroups, generationResponseWindow(sourceGroups))
+      : null;
     // Which reconstructions have already been painted in this pass. See the dedupe below.
     const painted = new Set();
     const seenStreamKeys = new Set();
-    for (let turnIndex = 0; turnIndex < assistantTurns.length; turnIndex++) {
-      const turn = assistantTurns[turnIndex];
+    for (let turnIndex = 0; turnIndex < assistantGroups.length; turnIndex++) {
+      const turn = assistantGroups[turnIndex];
       if (turn.role !== 'assistant') continue;
       const nodes = turn.nodes || (turn.node ? [turn.node] : []);
       const priorKeys = new Set(
@@ -5520,36 +5725,35 @@
       // ordering, the commentary in its own place — never ran at all.
       let localId = localGenerationOf(turn);
       if (generating && turn === newest) {
-        const active = generationTurn();
-        localId = active === turn ? turnId : null;
+        localId = activeOwnedResponse === turn ? turnId : null;
       }
       const localGroup = localId ? groups.find((group) => group.id === localId) || null : null;
       const activeNewest = generating && turn === newest;
-      const anchorRender = anchoredRenderForTurn(
+      const anchorRender = anchoredRenderForGroup(
         turn,
-        sourceTurns,
+        sourceGroups,
         groups,
         activeNewest ? localGroup : null,
         activeNewest && !localGroup
       );
       // The active newest turn is owned only by the local generation this document observed.
-      // While generationTurn() cannot bind it yet, leave ChatGPT native. A stale Fiber stamp
+      // While ownedAssistantGroup() cannot bind it yet, leave ChatGPT native. A stale Fiber stamp
       // or settled node tombstone can describe the previous turn during React reuse, so
       // website-id reconciliation is deliberately reserved for historical/reloaded turns.
       const identityRender = activeNewest
-        ? websiteRenderForTurn(turn, groups, localGroup, renderIndex)
+        ? websiteRenderForGroup(turn, groups, localGroup, renderIndex)
         : localId !== null
-          ? websiteRenderForTurn(turn, groups, localGroup, renderIndex)
-          : websiteRenderForTurn(turn, groups, null, renderIndex);
+          ? websiteRenderForGroup(turn, groups, localGroup, renderIndex)
+          : websiteRenderForGroup(turn, groups, null, renderIndex);
       // A user-message anchor is excellent at finding the right *window*, but it can include
       // an orphan website row that has not yet been re-homed into the local group. Conversely,
-      // websiteRenderForTurn() deliberately promotes exact orphan rows into the chosen group's
+      // websiteRenderForGroup() deliberately promotes exact orphan rows into the chosen group's
       // render copy. Preferring anchorRender unconditionally threw that recovery away: one
       // late/reload-only thinking headline could make the anchor candidate incomplete and drop
       // the entire turn back to native even though the identity reconstruction was provably
       // complete. Pick the candidate that can actually replace every page-authored object.
-      const anchorComplete = Boolean(anchorRender && completeReplacementForTurn(turn, anchorRender.entries));
-      const identityComplete = Boolean(identityRender && completeReplacementForTurn(turn, identityRender.entries));
+      const anchorComplete = Boolean(anchorRender && completeReplacementForGroup(turn, anchorRender.entries));
+      const identityComplete = Boolean(identityRender && completeReplacementForGroup(turn, identityRender.entries));
       const websiteRender = identityComplete && !anchorComplete
         ? identityRender
         : anchorRender || identityRender;
@@ -5568,7 +5772,7 @@
       const groupKey = group ? group.id : localId || null;
       // A reload/history reconstruction can be proven entirely by canonical ChatGPT message
       // ids even when no local lifecycle group survived. Those ids are already the authority
-      // used by websiteRenderForTurn(); use them as the sibling-root key too so moving the
+      // used by websiteRenderForGroup(); use them as the sibling-root key too so moving the
       // stream out of the React section does not throw away that identity.
       const renderedMessageIds = [...new Set(
         rendered.map((entry) => entry && entry.messageId).filter(Boolean)
@@ -5603,10 +5807,10 @@
 
       // One response, however many sections ChatGPT chose to split it into.
       //
-      // `anchoredRenderForTurn` reconstructs from the user message that caused the answer,
+      // `anchoredRenderForGroup` reconstructs from the user message that caused the answer,
       // so every assistant section between that message and the next one resolves to the
       // same render. Sections carrying a `data-turn-id` are already folded into one logical
-      // turn by `presentationTurns`; sections rendered without one are not, and each of them
+      // group by `transcriptGroups`; sections rendered without one are not, and each of them
       // painted the whole reconstruction into itself — the same answer once per section,
       // stacked down the page under Overwrite, each hiding ChatGPT's own copy beneath it.
       //
@@ -5625,7 +5829,7 @@
       // Request-only orphan calls can prove the activity, but not a stable response root.
       // Never mount a sibling that this registry cannot find again on the next paint.
       // Native relabelling stays available until a durable group/message key arrives.
-      if (!streamKey || rendered.length === 0 || !completeReplacementForTurn(turn, rendered)) {
+      if (!streamKey || rendered.length === 0 || !completeReplacementForGroup(turn, rendered)) {
         const lastComplete = existing ? Number(existing.dataset.clfCompleteAt) : 0;
         // A one-second observer and a two-second activity pull race each other by design.
         // Once this exact section has already been proven complete, do not tear ownership
@@ -5721,7 +5925,7 @@
         streamRootsByKey.delete(key);
       }
     }
-    renderRepairNotices(sourceTurns);
+    renderRepairNotices(sourceGroups);
     restorePresentationViewport(viewportAnchor);
   }
 
@@ -5922,19 +6126,25 @@
       job = data.job || null;
       operationProgress = data.progress || null;
       pendingTools = Number.isFinite(Number(data.pendingTools)) ? Number(data.pendingTools) : 0;
-      // The generation this chat has open in the app, if any. Only ever *read* by
-      // resumeOpenTurn(), on the boot pull, and only to work out whether this document is
-      // standing in the middle of a turn a previous one opened. See adoptTurnId.
-      appActiveTurnId = typeof data.activeTurnId === 'string' && data.activeTurnId ? data.activeTurnId : null;
-      if (!generating && pendingTools > 0 && appActiveTurnId === turnId && lastTerminalObservation?.reason === 'thinking_failed') noteTurnProgress();
+      const wireTurn = data.turn && typeof data.turn === 'object' &&
+        typeof data.turn.id === 'string' && data.turn.id
+        ? data.turn
+        : null;
+      const adoption = wireTurn?.adoption && typeof wireTurn.adoption === 'object' &&
+        typeof wireTurn.adoption.openingUserMessageId === 'string' && wireTurn.adoption.openingUserMessageId
+        ? { openingUserMessageId: wireTurn.adoption.openingUserMessageId }
+        : null;
+      trackedTurn = wireTurn ? { id: wireTurn.id, live: wireTurn.live === true, adoption } : null;
+      if (!generating && pendingTools > 0 && trackedTurn?.live && trackedTurn.id === turnId &&
+          lastTerminalObservation?.reason === 'thinking_failed') noteTurnProgress();
       if (resumeIdentityPending) {
-        // A reopened Stop target must prove the original question before adoption
-        // can anchor native messages under its old local turn. Hydration may lag
-        // this first response; retain the existing gate until proof or expiry.
-        const stopReady = !data.stopTurn || (data.stopTurn.turnId === appActiveTurnId && stopQuestionMatches(data.stopTurn.userMessageId));
-        if (!appActiveTurnId || stopReady) {
+        if (trackedTurn?.adoption) {
           resumeIdentityPending = false;
-          if (appActiveTurnId) adoptOpenTurn(appActiveTurnId, data.stopTurn?.userMessageId ?? null);
+          adoptTurn({ turnId: trackedTurn.id, openingUserMessageId: trackedTurn.adoption.openingUserMessageId });
+        } else if (!trackedTurn) {
+          // Only true absence releases the boot gate. A tracked turn without adoption authority
+          // remains unreadable to this replacement document until stronger evidence arrives.
+          resumeIdentityPending = false;
         }
       }
       tokens = Number.isFinite(Number(data.tokens)) ? Number(data.tokens) : 0;
@@ -8619,7 +8829,7 @@
   function briefSoFar(ended, known) {
     const held = finalAnswerText(ended);
     if (held.length > known.length) return held;
-    const turns = CLF_DOM.turns();
+    const turns = CLF_DOM.transcriptGroups();
     const latest = turns.length > 0 ? finalAnswerText(turns[turns.length - 1]) : '';
     if (known && latest.length > known.length && latest.startsWith(known)) return latest;
     return held.length >= known.length ? held : known;
@@ -8639,7 +8849,7 @@
    * snapshot's nodes and a detached node stops changing for the least interesting reason.
    */
   function briefActivityMark(ended) {
-    const turns = CLF_DOM.turns();
+    const turns = CLF_DOM.transcriptGroups();
     const live = turns.length > 0 ? turns[turns.length - 1] : null;
     const seen = [];
     for (const turn of live && (!ended || live.node !== ended.node) ? [ended, live] : [ended]) {
@@ -8808,10 +9018,10 @@
     if (users.length > 1) return void clearResumeGoalPending();
     if (users.length !== 1) return;
 
-    const turns = CLF_DOM.turns();
+    const turns = CLF_DOM.transcriptGroups();
     const ended = pending.turnId
       ? [...turns].reverse().find((candidate) => localGenerationOf(candidate) === pending.turnId) || null
-      : currentAssistantTurn(turns);
+      : latestAssistantGroup(turns);
     if (!ended || !finalAnswerText(ended).trim()) return;
     let result = endOutcome(ended);
     if (result.outcome === 'unknown') {
@@ -10257,7 +10467,7 @@
     const assistant = messages.at(-1);
     if (userIndex < 0 || messages[userIndex].id !== decision.messageId || assistant?.role !== 'assistant' ||
         !assistant.id || !assistant.node?.isConnected || isStale(assistant.node) || retiredMessages.has(assistant.id)) return;
-    const pageTurn = CLF_DOM.turns().at(-1);
+    const pageTurn = CLF_DOM.transcriptGroups().at(-1);
     const nodes = pageTurn?.nodes || (pageTurn?.node ? [pageTurn.node] : []);
     if (pageTurn?.role !== 'assistant' || !nodes.some(node => node.contains(assistant.node))) return;
     // React may replace the section after local turn_end but before canonical final text.
@@ -10270,7 +10480,7 @@
       // Temporary Chat has no /c route, but its canonical messages carry a WEB: thread.
       // Join the final to the accepted user in this same scan instead of comparing that
       // provider identity to the deliberately null route identity.
-      const userTurn = CLF_DOM.turns().find(candidate => candidate.role === 'user' &&
+      const userTurn = CLF_DOM.transcriptGroups().find(candidate => candidate.role === 'user' &&
         (candidate.nodes || [candidate.node]).some(node => node?.contains(messages[userIndex].node)));
       const user = stampedFiberTurn(userTurn, [...fiberTurns.values()], fiberScanToken);
       if (!user || user.conversationConflict || user.conversationId !== turn.conversationId ||
@@ -10289,7 +10499,7 @@
     const decision = desktopDecision;
     if (!decision || (!decision.conversationId && !decision.temporary) || !decision.onTarget() || decision.partialPublishing) return;
     const users = CLF_DOM.messages().filter(message => message.role === 'user');
-    const latest = CLF_DOM.turns().at(-1);
+    const latest = CLF_DOM.transcriptGroups().at(-1);
     if (latest?.role !== 'assistant' || !decision.messageId || users.at(-1)?.id !== decision.messageId) return;
     const text = finalAnswerText(latest).slice(-8000);
     if (!text || text === decision.lastPartial) return;
@@ -10301,14 +10511,14 @@
   /** Fresh exact terminal proof, shared by stuck-composer recovery and idle-tab retirement. */
   async function confirmedProviderTerminal() {
     const terminal = fiberTerminalMessageId;
-    const pageTurn = currentAssistantTurn();
+    const pageTurn = latestAssistantGroup();
     const observedEpoch = epoch;
     const observedConversation = conversationId;
     if (generating || !terminal || !pageTurn) return false;
     const recovered = await refreshFiber({ pageTurnId: pageTurn.id, pageTurn: pageTurn.node || pageTurn.nodes?.[0], terminalProbe: terminal });
     return Boolean(recovered && alive && epoch === observedEpoch && conversationId === observedConversation &&
       CLF_DOM.conversationId() === observedConversation && !generating && pendingTools === 0 &&
-      fiberTerminalMessageId === terminal && fiberTurnFor(currentAssistantTurn())?.endMessageId === terminal);
+      fiberTerminalMessageId === terminal && fiberTurnFor(latestAssistantGroup())?.endMessageId === terminal);
   }
 
   async function acceptDesktopInput(message) {
@@ -10335,7 +10545,7 @@
     if (message.directTurn && (!target || ((generating || CLF_DOM.generating()) &&
         (!sourceUser || sourceTurn !== message.directTurn.id)))) return false;
     const ownsFreshPage = () => !target && onTarget() && location.pathname === '/' &&
-      new URL(location.href).searchParams.get('cos-input') === message.id && !CLF_DOM.turns().length;
+      new URL(location.href).searchParams.get('cos-input') === message.id && !CLF_DOM.transcriptGroups().length;
     if (!target && !ownsFreshPage()) return false;
     desktopInputBusy = true;
     let decision = null;
@@ -10465,7 +10675,8 @@
       const accepted = await retryDesktopInputReceiptCustody();
       if (accepted && deliveredConversation && receipt.user?.id && sendingTarget() &&
           userSendReceipt === witnessedSendReceipt && witnessedSendReceipt?.text === submittedText &&
-          witnessedSendReceipt.conversationId === target &&
+          (witnessedSendReceipt.conversationId === target ||
+            (!target && witnessedSendReceipt.conversationId === deliveredConversation)) &&
           (witnessedSendReceipt.previousMessageId ?? null) === (previousUserId ?? null) &&
           Date.now() - witnessedSendReceipt.at <= USER_SEND_RECEIPT_MS) {
         witnessedSendReceipt.accepted = { messageId: receipt.user.id, conversationId: deliveredConversation, epoch };
@@ -10613,14 +10824,14 @@
         const control = await CLF_DOM.newChatControl(current);
         if (!control || !current()) return failure();
         control.click();
-        const home = await waitPageView(() => !CLF_DOM.conversationId() && location.pathname === '/' && !CLF_DOM.turns().length, current, 5000);
+        const home = await waitPageView(() => !CLF_DOM.conversationId() && location.pathname === '/' && !CLF_DOM.transcriptGroups().length, current, 5000);
         if (!home || !current()) return failure();
       }
       if (!(await CLF_DOM.prepareChatModelSurface(current)) || !current()) return failure();
       // A mounted editor can belong to a hidden/alternate surface. Do not stamp
       // it ready and strand the input there; the existing pre-send fallback owns
       // a clean New Chat when the native transition did not produce a usable one.
-      if (location.pathname !== '/' || CLF_DOM.conversationId() || CLF_DOM.turns().length || !CLF_DOM.composerVisible()) return failure();
+      if (location.pathname !== '/' || CLF_DOM.conversationId() || CLF_DOM.transcriptGroups().length || !CLF_DOM.composerVisible()) return failure();
       const url = new URL(location.href);
       url.searchParams.delete('cos-model-catalog');
       url.searchParams.set('cos-input', message.id);
@@ -10642,7 +10853,7 @@
   }
   function catalogHelper() {
     return !conversationId && location.pathname === '/' &&
-      !!new URL(location.href).searchParams.get('cos-model-catalog') && !CLF_DOM.turns().length;
+      !!new URL(location.href).searchParams.get('cos-model-catalog') && !CLF_DOM.transcriptGroups().length;
   }
   async function inspectAppModelCatalog(message) {
     const ownedEpoch = epoch;
@@ -10776,7 +10987,7 @@
           sendResponse({ conversationId: CLF_DOM.conversationId(), navigationEpoch: epoch,
             safe: alive && epoch === observedEpoch && message.conversationId === conversationId && CLF_DOM.conversationId() === conversationId &&
               !generating && pendingTools === 0 && (!CLF_DOM.generating() ||
-                (terminal && expectedTerminal === fiberTerminalMessageId && fiberTurnFor(currentAssistantTurn())?.endMessageId === expectedTerminal)) && !desktopInputBusy && !modelCatalogBusy && !pluginRefreshBusy && !desktopDecision &&
+                (terminal && expectedTerminal === fiberTerminalMessageId && fiberTurnFor(latestAssistantGroup())?.endMessageId === expectedTerminal)) && !desktopInputBusy && !modelCatalogBusy && !pluginRefreshBusy && !desktopDecision &&
               ((!commandAttempt && !commandJournalGate) || failedBootstrap) && (!message.failedCommand || failedBootstrap) &&
               queue.length === 0 && !flushWork && !!CLF_DOM.composer() &&
               !(CLF_DOM.composer().textContent || '').trim() && !CLF_DOM.hasComposerAttachments() });

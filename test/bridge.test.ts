@@ -105,7 +105,7 @@ const { createSession, deleteSession, findSessionByConversation, getSession, ini
   '../src/main/session/store.js'
 );
 const { addLocalProject, assignSessionProject, initLocalProjects, resetLocalProjectsForTests, restoreLocalProjects } = await import('../src/main/local-projects/service.js');
-const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { closeConversation, liveConversations, noteChatOrigin, rebindConversation, recordChatObservations, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { emptyEvidence, trackInFlight } = await import('../src/main/mcp/call-context.js');
 const { resetBlockedChatsForTests, setChatBlocked } = await import('../src/main/session/blocked-chats.js');
 const {
@@ -163,6 +163,16 @@ const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 const PRIME_CHAT = 'c-prime-bridge';
 /** The chat a worker lands in when its bootstrap ACK is lost and `/events` binds it instead. */
 const LOST_ACK_CHAT = 'bcbcbcbc-1111-2222-3333-444444444444';
+
+/** Current protocol-18 page lifecycle boundary. Historical identity-less rows use direct store fixtures. */
+function pageTurnStart(turnId: string, time = Date.now(), openingUserMessageId = `question-${turnId}`): {
+  kind: 'turn_start';
+  time: number;
+  turnId: string;
+  openingUserMessageId: string;
+} {
+  return { kind: 'turn_start', time, turnId, openingUserMessageId };
+}
 
 /**
  * A continuation that has already been given its brief, ready to be queued.
@@ -753,7 +763,7 @@ describe('observations', () => {
         conversationId,
         events: [
           { kind: 'user_message', time: Date.now(), text: 'first requirement', messageId: 'm1' },
-          { kind: 'turn_start', time: Date.now(), turnId: 'turn-1' },
+          pageTurnStart('turn-1', Date.now()),
           { kind: 'assistant_message', time: Date.now(), text: 'reading files', renderedHtml: '<p><strong>reading</strong> files</p>', messageId: 'a1', state: 'streaming' },
           { kind: 'invented_kind', time: Date.now(), text: 'should be dropped' },
           { kind: 'turn_end', time: Date.now(), turnId: 'turn-1', outcome: 'not-a-real-outcome' }
@@ -774,6 +784,98 @@ describe('observations', () => {
     const end = events.at(-1)!;
     // An outcome the page invented must not be believed.
     expect(end.kind === 'turn_end' && end.outcome).toBe('unknown');
+  });
+
+  it('rejects an overlong opening message id instead of truncating exact turn identity', async () => {
+    await pair();
+    const conversationId = 'f0f00003-1111-4111-8111-222222222222';
+    const openingUserMessageId = 'q'.repeat(257);
+    const reply = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'user_message', time: Date.now(), text: 'exact identity must be lossless', messageId: 'question-lossless' },
+          { kind: 'turn_start', time: Date.now(), turnId: 'turn-lossless', openingUserMessageId }
+        ]
+      }
+    });
+
+    expect(reply.status).toBe(200);
+    expect(reply.body.stored).toBe(2);
+    const events = await readEvents(reply.body.sessionId);
+    expect(events.map((event) => event.kind)).toEqual(['session_start', 'user_message', 'recording_gap']);
+    expect(events.at(-1)).toMatchObject({ kind: 'recording_gap', reason: 'invalid_lifecycle_identity' });
+    expect(events.some((event) => event.kind === 'turn_start')).toBe(false);
+  });
+
+  it('preserves an invalid lifecycle row as an inert gap at its original chronology position', async () => {
+    await pair();
+    const conversationId = 'f0f00003-1111-4111-8111-333333333333';
+    const reply = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'user_message', time: 100, text: 'valid before', messageId: 'before-gap' },
+          { kind: 'turn_start', time: 101, turnId: 'missing-opening' },
+          pageTurnStart('valid-after-gap', 102, 'after-gap-question')
+        ]
+      }
+    });
+
+    expect(reply.status).toBe(200);
+    expect((await readEvents(reply.body.sessionId)).map((event) => event.kind)).toEqual([
+      'session_start',
+      'user_message',
+      'recording_gap',
+      'turn_start'
+    ]);
+  });
+
+  it('records an invalid page-tool identity as explicit observation loss instead of silently dropping it', async () => {
+    await pair();
+    const conversationId = 'f0f00003-1111-4111-8111-343434343434';
+    const reply = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          pageTurnStart('invalid-page-tool-turn', 100, 'invalid-page-tool-question'),
+          { kind: 'page_tool', time: 101, turnId: 'invalid-page-tool-turn', messageId: 'p'.repeat(257), text: 'tool activity' }
+        ]
+      }
+    });
+
+    expect(reply.status).toBe(200);
+    expect((await readEvents(reply.body.sessionId)).at(-1)).toMatchObject({
+      kind: 'recording_gap',
+      reason: 'invalid_observation_identity',
+      affectedTurnId: 'invalid-page-tool-turn',
+      lostKinds: { page_tool: 1 }
+    });
+  });
+
+  it('makes a conflicting repeated turn opening durable instead of treating it as transport replay', async () => {
+    await pair();
+    const conversationId = 'f0f00003-1111-4111-8111-444444444444';
+    const first = await request('POST', '/events', { body: { conversationId, events: [
+      pageTurnStart('conflicted-opening-turn', 100, 'question-a')
+    ] } });
+    await request('POST', '/events', { body: { conversationId, events: [
+      pageTurnStart('conflicted-opening-turn', 101, 'question-b')
+    ] } });
+
+    const lifecycle = await readEvents(first.body.sessionId, { kinds: ['turn_start', 'turn_identity'] });
+    expect(lifecycle.map(event => event.kind)).toEqual(['turn_start', 'turn_identity']);
+    expect(lifecycle[1]).toMatchObject({
+      kind: 'turn_identity',
+      turnId: 'conflicted-opening-turn',
+      openingUserMessageId: 'question-b'
+    });
+    const activity = await request('GET', `/activity?conversationId=${conversationId}`);
+    expect(activity.body.turn).toEqual({ id: 'conflicted-opening-turn', live: true, adoption: null });
+
+    resetRecorderForTests();
+    const restored = await request('GET', `/activity?conversationId=${conversationId}`);
+    expect(restored.body.turn).toEqual({ id: 'conflicted-opening-turn', live: true, adoption: null });
   });
 
   it('replaces an impossible timestamp rather than storing it', async () => {
@@ -831,7 +933,7 @@ describe('activity feed', () => {
     const opened = await request('POST', '/events', {
       body: {
         conversationId,
-        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'before-restart' }]
+        events: [pageTurnStart('before-restart', Date.now())]
       }
     });
     const sessionId = opened.body.sessionId as string;
@@ -1057,7 +1159,7 @@ describe('activity feed', () => {
     await request('POST', '/events', {
       body: { conversationId, events: [
           { kind: 'user_message', time: Date.now(), text: 'private user text stays out of the render anchor', messageId: 'user-anchor-42' },
-          { kind: 'turn_start', time: Date.now(), turnId: 'turn-42' },
+          pageTurnStart('turn-42', Date.now()),
           { kind: 'page_tool', time: Date.now(), turnId: 'turn-42', text: 'Searched the web', messageId: 'native-1' },
           { kind: 'tool_block', time: Date.now(), turnId: 'turn-42', count: 1 }
         ]
@@ -1130,7 +1232,7 @@ describe('activity feed', () => {
     await noteChatOrigin(worker, { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'Build it' });
     for (const conversationId of [worker, own]) {
       await request('POST', '/events', {
-        body: { conversationId, events: [{ kind: 'turn_start', time: Date.now(), turnId: 'turn-1' }] }
+        body: { conversationId, events: [pageTurnStart('turn-1', Date.now())] }
       });
     }
 
@@ -1202,7 +1304,7 @@ describe('activity feed', () => {
     const conversationId = '12121212-3434-5656-7878-909090909090';
     await request('POST', '/events', {
       body: { conversationId, events: [
-          { kind: 'turn_start', time: Date.now(), turnId: 't' },
+          pageTurnStart('t', Date.now()),
           { kind: 'tool_block', time: Date.now(), turnId: 't', count: 4 }
         ]
       }
@@ -1239,7 +1341,7 @@ describe('activity feed', () => {
     const conversationId = '45454545-6767-8989-abab-cdcdcdcdcdcd';
     await request('POST', '/events', {
       body: { conversationId, events: [
-          { kind: 'turn_start', time: Date.now(), turnId: 'secret-turn' },
+          pageTurnStart('secret-turn', Date.now()),
           { kind: 'tool_block', time: Date.now(), turnId: 'secret-turn', count: 2 }
         ]
       }
@@ -1288,7 +1390,7 @@ describe('activity feed', () => {
       body: {
         conversationId,
         events: [
-          { kind: 'turn_start', time: Date.now(), turnId: 'agents-turn' },
+          pageTurnStart('agents-turn', Date.now()),
           { kind: 'tool_block', time: Date.now(), turnId: 'agents-turn', count: 1 }
         ]
       }
@@ -1400,7 +1502,7 @@ describe('automatic compaction', () => {
     await withThreshold(10_000, async () => {
       await request('POST', '/events', { body: { conversationId, events: [
         { kind: 'model_selection', model: 'GPT-6 Pro', time: Date.now() },
-        { kind: 'turn_start', time: Date.now(), turnId: 'astra-live' }, ...over()
+        pageTurnStart('astra-live', Date.now()), ...over()
       ] } });
       await settled();
       const activity = await request('GET', `/activity?conversationId=${conversationId}`);
@@ -1420,7 +1522,7 @@ describe('automatic compaction', () => {
     const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac91';
     await withThreshold(10_000, async () => {
       await request('POST', '/events', { body: { conversationId, events: [
-        { kind: 'turn_start', time: Date.now(), turnId: 'before-astra' }, ...over()
+        pageTurnStart('before-astra', Date.now()), ...over()
       ] } });
       const activity = await request('GET', `/activity?conversationId=${conversationId}`);
       // Ticket persistence runs after event ingestion; wait for that fact rather
@@ -1444,7 +1546,7 @@ describe('automatic compaction', () => {
       await request('POST', '/events', {
         body: {
           conversationId,
-          events: [{ kind: 'turn_start', time: Date.now(), turnId: 'turn-live' }, ...over()]
+          events: [pageTurnStart('turn-live', Date.now()), ...over()]
         }
       });
       // Ticket creation and its durable job publication are asynchronous. Observe the
@@ -1462,7 +1564,7 @@ describe('automatic compaction', () => {
 
       // More work in the same turn is the same ticket.
       await request('POST', '/events', {
-        body: { conversationId, events: [{ kind: 'turn_start', time: Date.now(), turnId: 'turn-live' }] }
+        body: { conversationId, events: [pageTurnStart('turn-live', Date.now())] }
       });
       await settled();
       expect(continuationForSession(sessionId)?.token).toBe(ticket!.token);
@@ -1503,7 +1605,7 @@ describe('automatic compaction', () => {
         await request('POST', '/events', {
           body: {
             conversationId,
-            events: [{ kind: 'turn_start', time: Date.now(), turnId: 'blocked-turn-live' }, ...over()]
+            events: [pageTurnStart('blocked-turn-live', Date.now()), ...over()]
           }
         });
         await settled();
@@ -1557,7 +1659,7 @@ describe('automatic compaction', () => {
       await request('POST', '/events', {
         body: {
           conversationId,
-          events: [{ kind: 'turn_start', time: Date.now(), turnId: 'worker-turn-live' }, ...over()]
+          events: [pageTurnStart('worker-turn-live', Date.now()), ...over()]
         }
       });
       await settled();
@@ -1640,7 +1742,7 @@ describe('automatic compaction', () => {
       await request('POST', '/events', {
         body: {
           conversationId,
-          events: [{ kind: 'turn_start', time: Date.now(), turnId: 'turn-rejected-compact' }, ...over()]
+          events: [pageTurnStart('turn-rejected-compact', Date.now()), ...over()]
         }
       });
       await settled();
@@ -1686,7 +1788,7 @@ describe('automatic compaction', () => {
         body: {
           conversationId,
           events: [
-            { kind: 'turn_start', time: Date.now(), turnId: 'turn-after-rejection' },
+            pageTurnStart('turn-after-rejection', Date.now()),
             {
               kind: 'assistant_message',
               time: Date.now(),
@@ -2011,12 +2113,12 @@ describe('delivering a bootstrap', () => {
     for (const id of [settled, working]) await noteChatOrigin(id, { kind: 'desktop', fromSessionId: null, agentId: null, task: '' });
     for (const id of [settled, personal, working]) {
       await request('POST', '/events', { body: { conversationId: id, events: [
-        { kind: 'turn_start', time: Date.now(), turnId: 'old-turn' },
+        pageTurnStart('old-turn', Date.now()),
         { kind: 'turn_end', time: Date.now(), turnId: 'old-turn', outcome: 'completed' }
       ] } });
     }
     await request('POST', '/events', { body: { conversationId: working, events: [
-      { kind: 'turn_start', time: Date.now(), turnId: 'still-running' }
+      pageTurnStart('still-running', Date.now())
     ] } });
     const now = Date.now();
     const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 121_000);
@@ -2574,7 +2676,7 @@ describe('delivering a bootstrap', () => {
     expect(first.body).toMatchObject({ final: true, committed: true, conversationId });
     await flushDurable();
     const stored = await readDurable<{ version?: number; receipts?: Array<{ id?: string }> }>('bridge-commands');
-    expect(stored?.version).toBe(4);
+    expect(stored?.version).toBe(5);
     expect(stored?.receipts?.some((entry) => entry.id === command.id)).toBe(true);
 
     // Simulate the main-process restart after the durable commit but before the browser got
@@ -2831,7 +2933,7 @@ describe('delivering a bootstrap', () => {
       body: {
         conversationId,
         events: [
-          { kind: 'turn_start', time: settledAt - 20, turnId: 'turn-1' },
+          pageTurnStart('turn-1', settledAt - 20),
           {
             kind: 'assistant_message',
             time: settledAt - 10,
@@ -2869,7 +2971,7 @@ describe('delivering a bootstrap', () => {
     const started = await request('POST', '/events', {
       body: {
         conversationId,
-        events: [{ kind: 'turn_start', time: Date.now() + 1, turnId: 'turn-2' }]
+        events: [pageTurnStart('turn-2', Date.now() + 1)]
       }
     });
     expect(started.status).toBe(200);
@@ -3672,7 +3774,7 @@ describe('delivering a bootstrap', () => {
       body: {
         conversationId,
         events: [
-          { kind: 'turn_start', time: now, turnId: 'g-worker-final' },
+          pageTurnStart('g-worker-final', now),
           {
             kind: 'assistant_message',
             time: now + 1,
@@ -3774,7 +3876,7 @@ describe('delivering a bootstrap', () => {
       body: {
         conversationId,
         events: [
-          { kind: 'turn_start', time: now, turnId: 'g-worker-split-final' },
+          pageTurnStart('g-worker-split-final', now),
           { kind: 'turn_end', time: now + 1, turnId: 'g-worker-split-final', outcome: 'completed' }
         ]
       }
@@ -3818,7 +3920,7 @@ describe('delivering a bootstrap', () => {
     const oldFinal = { kind: 'assistant_message', time: time + 1, turnId: 'worker-old-turn',
       messageId: 'worker-old-final', text: 'Docs done. No new validator yet.', state: 'final', final: true };
     const initial = await request('POST', '/events', { body: { conversationId, events: [
-      { kind: 'turn_start', time, turnId: 'worker-old-turn' }, oldFinal,
+      pageTurnStart('worker-old-turn', time), oldFinal,
       { kind: 'turn_end', time: time + 2, turnId: 'worker-old-turn', outcome: 'completed' }
     ] } });
     expect(initial.status).toBe(200);
@@ -3827,7 +3929,7 @@ describe('delivering a bootstrap', () => {
 
     wake([{ to: 'worker-1', text: 'Now implement and verify the validator.' }]);
     await request('POST', '/events', { body: { conversationId, events: [
-      { kind: 'turn_start', time: time + 10, turnId: 'worker-new-turn' }
+      pageTurnStart('worker-new-turn', time + 10)
     ] } });
     noteAgentAlive(conversationId, 'call');
     expect(swarmState().agents.find(row => row.id === 'worker-1')?.state).toBe('active');
@@ -3875,7 +3977,7 @@ describe('delivering a bootstrap', () => {
       body: {
         conversationId,
         events: [
-          { kind: 'turn_start', time: now, turnId: 'g-worker-no-end' },
+          pageTurnStart('g-worker-no-end', now),
           {
             kind: 'assistant_message',
             time: now + 2,
@@ -3914,7 +4016,7 @@ describe('delivering a bootstrap', () => {
         body: {
           conversationId,
           events: [
-            { kind: 'turn_start', time: now, turnId: 'g-worker-durable-final' },
+            pageTurnStart('g-worker-durable-final', now),
             {
               kind: 'assistant_message',
               time: now + 1,
@@ -3963,7 +4065,7 @@ describe('delivering a bootstrap', () => {
         body: {
           conversationId,
           events: [
-            { kind: 'turn_start', time: now, turnId: 'g-worker-held-finish' },
+            pageTurnStart('g-worker-held-finish', now),
             {
               kind: 'assistant_message',
               time: now + 1,
@@ -4015,11 +4117,11 @@ describe('delivering a bootstrap', () => {
     expect(bindConversation('worker-1', workerConversation)).toBe(true);
     const now = Date.now();
     await recordChatObservations(PRIME_CHAT, [
-      { kind: 'turn_start', time: now, turnId: 'g-prime-stale' },
+      pageTurnStart('g-prime-stale', now),
       { kind: 'turn_end', time: now + 1, turnId: 'g-prime-stale', outcome: 'completed' }
     ], 'prime');
     await recordChatObservations(workerConversation, [
-      { kind: 'turn_start', time: now, turnId: 'g-worker-stale' },
+      pageTurnStart('g-worker-stale', now),
       { kind: 'turn_end', time: now + 1, turnId: 'g-worker-stale', outcome: 'completed' }
     ], 'worker-1');
     noteAgentContextTokens(workerConversation, WORKER_CONTEXT_CEILING_TOKENS);
@@ -4099,10 +4201,10 @@ describe('delivering a bootstrap', () => {
     expect(bindConversation('worker-1', workerConversation)).toBe(true);
     const now = Date.now();
     await recordChatObservations(PRIME_CHAT, [
-      { kind: 'turn_start', time: now, turnId: 'g-prime-open' }
+      pageTurnStart('g-prime-open', now)
     ], 'prime');
     await recordChatObservations(workerConversation, [
-      { kind: 'turn_start', time: now, turnId: 'g-worker-done' },
+      pageTurnStart('g-worker-done', now),
       { kind: 'turn_end', time: now + 1, turnId: 'g-worker-done', outcome: 'completed' }
     ], 'worker-1');
     noteAgentContextTokens(workerConversation, WORKER_CONTEXT_CEILING_TOKENS);
@@ -4124,14 +4226,14 @@ describe('delivering a bootstrap', () => {
     expect(bindConversation('worker-1', workerConversation)).toBe(true);
     const now = Date.now();
     await recordChatObservations(PRIME_CHAT, [
-      { kind: 'turn_start', time: now, turnId: 'g-prime-detached' }
+      pageTurnStart('g-prime-detached', now)
     ], 'prime');
     // Simulate the crash window between the recorder persisting page detach and the bridge
     // getting far enough to call primeConversationGone(). The durable turn_end must name the
     // same turn or orphan recovery will reconstruct it as open forever after restart.
     await closeConversation(PRIME_CHAT);
     await recordChatObservations(workerConversation, [
-      { kind: 'turn_start', time: now, turnId: 'g-worker-detached' },
+      pageTurnStart('g-worker-detached', now),
       { kind: 'turn_end', time: now + 1, turnId: 'g-worker-detached', outcome: 'completed' }
     ], 'worker-1');
     noteAgentContextTokens(workerConversation, WORKER_CONTEXT_CEILING_TOKENS);
@@ -4147,11 +4249,11 @@ describe('delivering a bootstrap', () => {
     expect(bindConversation('worker-1', workerConversation)).toBe(true);
     const now = Date.now();
     await recordChatObservations(PRIME_CHAT, [
-      { kind: 'turn_start', time: now, turnId: 'g-prime-transfer' },
+      pageTurnStart('g-prime-transfer', now),
       { kind: 'turn_end', time: now + 1, turnId: 'g-prime-transfer', outcome: 'completed' }
     ], 'prime');
     await recordChatObservations(workerConversation, [
-      { kind: 'turn_start', time: now, turnId: 'g-worker-transfer' },
+      pageTurnStart('g-worker-transfer', now),
       { kind: 'turn_end', time: now + 1, turnId: 'g-worker-transfer', outcome: 'completed' }
     ], 'worker-1');
     noteAgentContextTokens(workerConversation, WORKER_CONTEXT_CEILING_TOKENS);
@@ -4905,7 +5007,7 @@ describe('a worker chat that never opens', () => {
           conversationId: LOST_ACK_CHAT,
           agent: 'worker-1',
           agentCommandId: first.id,
-          events: [{ kind: 'turn_start', time: Date.now(), turnId: 'lost-ack-turn' }]
+          events: [pageTurnStart('lost-ack-turn', Date.now())]
         }
       });
       expect(reply.status).toBe(200);
@@ -5062,7 +5164,12 @@ describe('unattributed activity recovery', () => {
     });
   }
 
-  const openTurn = (turnId: string): unknown => ({ kind: 'turn_start', time: Date.now(), turnId });
+  const openTurn = (turnId: string): unknown => ({
+    kind: 'turn_start',
+    time: Date.now(),
+    turnId,
+    openingUserMessageId: `question-${turnId}`
+  });
   const endTurn = (turnId: string, outcome: string): unknown => ({
     kind: 'turn_end',
     time: Date.now(),
@@ -5762,8 +5869,20 @@ describe('unattributed activity recovery', () => {
       }]);
       expect(await maintenance()).toBeNull();
 
+      // Ending A does not buy A a second reload. The budget follows the logical turn through its
+      // terminal state and is released only when the successor turn begins.
+      await events(PRIME, [endTurn('turn-prime', 'failed')]);
+      await events(PRIME, [{
+        kind: 'chat_error',
+        time: Date.now(),
+        text: 'Connection interrupted. Waiting for the complete answer',
+        turnId: 'turn-prime',
+        recoverable: true
+      }]);
+      expect(await maintenance()).toBeNull();
+
       // The user's next message is the next turn, and it brings its own reload.
-      await events(PRIME, [endTurn('turn-prime', 'failed'), openTurn('turn-prime-2')]);
+      await events(PRIME, [openTurn('turn-prime-2')]);
       await events(PRIME, [{
         kind: 'chat_error',
         time: Date.now(),
@@ -6632,9 +6751,20 @@ describe('unattributed activity recovery', () => {
       expect(CONTINUATION_SILENCE_MS).toBe(10 * 60_000);
       const live = await request('GET', `/activity?conversationId=${OTHER}`);
       const { sessionControlsFor } = await import('../src/main/bridge.js');
-      expect(live.body.activeTurnId).toBe('pro-silent-' + model);
+      expect(live.body.turn).toMatchObject({
+        id: 'pro-silent-' + model,
+        live: true,
+        adoption: { openingUserMessageId: 'question-pro-silent-' + model }
+      });
       expect((await sessionControlsFor(live.body.sessionId)).activeTurnId).toBe('pro-silent-' + model);
       await vi.advanceTimersByTimeAsync(1);
+      expect((await request('GET', `/activity?conversationId=${OTHER}`)).body).toMatchObject({
+        turn: {
+          id: 'pro-silent-' + model,
+          live: false,
+          adoption: { openingUserMessageId: 'question-pro-silent-' + model }
+        }
+      });
       await sweepStaleSwarm(Date.now());
       const reload = await maintenance();
       expect(reload).toMatchObject({ reason: 'silence' });
@@ -6643,12 +6773,147 @@ describe('unattributed activity recovery', () => {
       await sweepStaleSwarm(Date.now());
       expect(goalPendingReplyFor(OTHER)).toBeNull();
       expect(await maintenance()).toBeNull();
-      expect((await request('GET', `/activity?conversationId=${OTHER}`)).body.activeTurnId).toBeNull();
+      expect((await request('GET', `/activity?conversationId=${OTHER}`)).body).toMatchObject({
+        turn: { id: 'pro-silent-' + model, live: false, adoption: null }
+      });
       expect((await sessionControlsFor(live.body.sessionId)).activeTurnId).toBeNull();
       const refused = await request('POST', '/goal/draft', { body: { conversationId: OTHER, turnId: 'pro-silent-' + model, clientId: 'tab-1' } });
       expect(refused.status).toBe(409);
     } finally {
       resetGoalStateForTests(); await setSecret('openRouterApiKey', ''); await saveConfig(previous); vi.useRealTimers();
+    }
+  });
+
+  it('rejects a protocol-18 turn start that omits its exact opening user identity', async () => {
+    const malformedConversation = '17171717-aaaa-4bbb-8ccc-111111111111';
+    vi.useFakeTimers();
+    try {
+      await pair();
+      await events(malformedConversation, [
+        { kind: 'model_selection', model: 'GPT-6 Pro', time: Date.now() },
+        // Historical protocol-17 rows remain readable from disk. Current protocol-18 browser
+        // traffic is different: a start without its opening identity is malformed and creates no
+        // lifecycle authority at all.
+        { kind: 'turn_start', time: Date.now(), turnId: 'pro-missing-opening-question' }
+      ]);
+      const activity = await request('GET', `/activity?conversationId=${malformedConversation}`);
+      expect(activity.body.turn).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('revalidates turn adoption after awaited activity projections before publishing the response', async () => {
+    await pair();
+    const firstTurn = 'activity-race-first';
+    const nextTurn = 'activity-race-next';
+    await events(OTHER, [openTurn(firstTurn)]);
+
+    // Hold the late goal projection after /activity has already read the first turn. A new
+    // lifecycle boundary can commit while that unrelated await is in flight; the response must
+    // authorize adoption from the final durable/live state rather than its earlier snapshot.
+    resetSecretsCacheForTests();
+    const gate = faultGate();
+    vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockImplementation(async () => {
+      await gate.hold();
+      return true;
+    });
+
+    try {
+      const pending = request('GET', `/activity?conversationId=${OTHER}`);
+      await gate.entered;
+      await recordChatObservations(OTHER, [
+        { kind: 'turn_end', time: Date.now(), turnId: firstTurn, outcome: 'completed' },
+        { kind: 'turn_start', time: Date.now() + 1, turnId: nextTurn, openingUserMessageId: `question-${nextTurn}` }
+      ]);
+      gate.release();
+
+      expect((await pending).body).toMatchObject({
+        turn: {
+          id: nextTurn,
+          live: true,
+          adoption: { openingUserMessageId: `question-${nextTurn}` }
+        }
+      });
+    } finally {
+      gate.release();
+      vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(true);
+      resetSecretsCacheForTests();
+    }
+  });
+
+  it('publishes exact adoption while an owned tool is running even without a recovery activity grant', async () => {
+    await pair();
+    const conversationId = 'a6666666-1111-4111-8111-111111111111';
+    const turnId = 'tool-only-adoption';
+    await recordChatObservations(conversationId, [pageTurnStart(turnId, Date.now(), 'question-tool-only')]);
+
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const context = {
+      startedAt: Date.now(),
+      transportKey: null,
+      agent: null,
+      caller: { transportKey: null, requestId: 'wfr_tool_only_adoption', conversationId },
+      outcome: null,
+      evidence: emptyEvidence()
+    };
+    const running = trackInFlight(context, async () => { await held; });
+    try {
+      const activity = await request('GET', `/activity?conversationId=${conversationId}`);
+      expect(activity.body).toMatchObject({
+        turn: {
+          id: turnId,
+          live: true,
+          adoption: { openingUserMessageId: 'question-tool-only' }
+        }
+      });
+    } finally {
+      release();
+      await running;
+    }
+  });
+
+  it('does not leak destination-session authority into an in-flight activity response for the superseded chat', async () => {
+    await pair();
+    const from = 'a7777777-1111-4111-8111-111111111111';
+    const to = 'a8888888-1111-4111-8111-111111111111';
+    const opened = await events(from, [openTurn('activity-rebind-source')]);
+    const sessionId = opened.body.sessionId as string;
+
+    resetSecretsCacheForTests();
+    const gate = faultGate();
+    vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockImplementation(async () => {
+      await gate.hold();
+      return true;
+    });
+
+    try {
+      const pending = request('GET', `/activity?conversationId=${from}`);
+      await gate.entered;
+      const { rebindSession } = await import('../src/main/session/store.js');
+      expect(await rebindSession(sessionId, from, to, '2026-09-15-activity-race')).toBe(true);
+      rebindConversation(sessionId, from, to);
+      gate.release();
+
+      const stale = (await pending).body;
+      expect(stale).toMatchObject({
+        sessionId: null,
+        bootstrapMessageId: null,
+        entries: [],
+        stream: [],
+        userAnchors: [],
+        nextSince: 0
+      });
+      expect(stale.turn).toBeUndefined();
+      expect(stale.bootstrap).toBeUndefined();
+      expect(stale.job).toBeUndefined();
+      expect(stale.goal).toBeUndefined();
+      expect(stale.revival).toBeUndefined();
+    } finally {
+      gate.release();
+      vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(true);
+      resetSecretsCacheForTests();
     }
   });
 
@@ -6825,11 +7090,13 @@ describe('unattributed activity recovery', () => {
       await vi.advanceTimersByTimeAsync(PRO_ACTIVITY_MS - CHAT_SILENCE_MS - 1);
       const activity = await request('GET', `/activity?conversationId=${OTHER}`);
       const { sessionControlsFor } = await import('../src/main/bridge.js');
-      expect(activity.body.activeTurnId).toBe('pro-recovery-off');
+      expect(activity.body.turn).toMatchObject({ id: 'pro-recovery-off', live: true });
       expect((await sessionControlsFor(activity.body.sessionId)).activeTurnId).toBe('pro-recovery-off');
       await vi.advanceTimersByTimeAsync(2);
       await sweepStaleSwarm(Date.now());
-      expect((await request('GET', `/activity?conversationId=${OTHER}`)).body.activeTurnId).toBeNull();
+      expect((await request('GET', `/activity?conversationId=${OTHER}`)).body).toMatchObject({
+        turn: { id: 'pro-recovery-off', live: false, adoption: null }
+      });
       expect((await sessionControlsFor(activity.body.sessionId)).activeTurnId).toBeNull();
       expect(await maintenance()).toBeNull();
     } finally { await saveConfig(previous); vi.useRealTimers(); }
@@ -6865,7 +7132,7 @@ describe('unattributed activity recovery', () => {
       await pair();
       const began = Date.now();
       await vi.advanceTimersByTimeAsync(60_000);
-      await events(OTHER, [{ kind: 'model_selection', model: 'GPT-6 Pro', time: began }, { kind: 'turn_start', turnId: 'delayed-pro', time: began }]);
+      await events(OTHER, [{ kind: 'model_selection', model: 'GPT-6 Pro', time: began }, pageTurnStart('delayed-pro', began)]);
       const sessionId = (await request('GET', `/activity?conversationId=${OTHER}`)).body.sessionId;
       const { sessionActivityExpiresAt } = await import('../src/main/bridge.js');
       expect(sessionActivityExpiresAt((await getSession(sessionId))!)).toBe(began + PRO_ACTIVITY_MS);
@@ -7309,7 +7576,7 @@ describe('unattributed activity recovery', () => {
       expect(await maintenance()).toBeNull();
       // Opening history hydrates the recorder; it must not revive the orphan.
       await events(SOLO, [{ kind: 'conversation_title', time: Date.now(), text: 'Settled chat' }]);
-      expect(liveConversations().find(entry => entry.conversationId === SOLO)?.activeTurnId).toBeNull();
+      expect(liveConversations().find(entry => entry.conversationId === SOLO)?.activeTurn).toBeNull();
     }
     // Explicit new work in the same chat still earns ordinary recovery.
     await events(SOLO, [openTurn('turn-new-work')]);
@@ -7649,7 +7916,7 @@ describe('unattributed activity recovery', () => {
     const workerChat = model === 'gpt-5-6-pro' ? 'b1111111-1111-4111-8111-111111111111' : 'b2222222-1111-4111-8111-111111111111';
     await request('POST', '/commands/ack', { body: { id: bootstrap.id, status: 'sent', conversationId: workerChat, agent: 'worker-1' } });
     const began = Date.now();
-    await events(workerChat, [{ kind: 'model_selection', model, reasoningEffort: 'pro', time: began }, { kind: 'turn_start', time: began, turnId: 'meter-' + model }]);
+    await events(workerChat, [{ kind: 'model_selection', model, reasoningEffort: 'pro', time: began }, pageTurnStart('meter-' + model, began)]);
     const sessionId = (await request('GET', `/activity?conversationId=${workerChat}`)).body.sessionId;
     const before = swarmState().agents.find(agent => agent.conversationId === workerChat)!.contextTokens;
     const call = await recordToolCall({ tool: 'read', args: { path: '/project/file' }, content: [{ type: 'text', text: 'recorded work '.repeat(100) }], outcome: 'ok', durationMs: 1, startedAt: began + 1, conversationId: workerChat, sessionId });
@@ -7676,7 +7943,9 @@ describe('unattributed activity recovery', () => {
       await attributed(WORKER);
       expect(getConfig().multiAgent.recoverAgentTabs).toBe(true);
       expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
-      expect(liveConversations().find((entry) => entry.conversationId === WORKER)).toMatchObject({ generating: true });
+      expect(liveConversations().find((entry) => entry.conversationId === WORKER)).toMatchObject({
+        activeTurn: { id: 'turn-worker-silent' }
+      });
 
       await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS - 1);
       expect(await maintenance()).toBeNull();
@@ -7937,7 +8206,7 @@ describe('the goal loop over the bridge', () => {
           conversationId: from,
           events: [
             { kind: 'user_message', time: Date.now(), text: 'continue until done', messageId: 'm-retired-goal' },
-            { kind: 'turn_start', time: Date.now(), turnId: 'g-retired-goal' },
+            pageTurnStart('g-retired-goal', Date.now()),
             { kind: 'turn_end', time: Date.now(), turnId: 'g-retired-goal', outcome: 'completed' },
             {
               kind: 'assistant_message',
@@ -7959,7 +8228,9 @@ describe('the goal loop over the bridge', () => {
       expect(await commitContinuation(continuation.token, to)).toBe(true);
 
       const oldFeed = await request('GET', `/activity?conversationId=${from}`);
-      expect(oldFeed.body.goal).toMatchObject({ effectiveEnabled: false, own: true, blocked: 'continued', pending: null });
+      expect(oldFeed.body).toMatchObject({ sessionId: null });
+      expect(oldFeed.body.goal).toBeUndefined();
+      expect(oldFeed.body.job).toBeUndefined();
       expect((await request('POST', '/goal/draft', {
         body: { conversationId: from, turnId: 'g-retired-goal', terminalRequired: true, clientId: 'old-page' }
       })).body.error).toBe('conversation_superseded');
@@ -8194,7 +8465,7 @@ describe('the goal loop over the bridge', () => {
         conversationId: chat,
         events: [
           { kind: 'user_message', time: Date.now(), text: 'finish the release', messageId: 'm-reload-goal' },
-          { kind: 'turn_start', time: Date.now(), turnId: 'g-before-page-reload' },
+          pageTurnStart('g-before-page-reload', Date.now()),
           { kind: 'turn_end', time: Date.now(), turnId: 'g-before-page-reload', outcome: 'unknown' }
         ]
       }
@@ -8776,7 +9047,7 @@ describe('the goal loop over the bridge', () => {
     const chat = 'cafe0188-0000-4000-8000-000000000188';
     const first = await request('POST', '/events', { body: { conversationId: chat, events: [
       { kind: 'user_message', time: Date.now(), text: 'finish the first file', messageId: 'objective-user' },
-      { kind: 'turn_start', time: Date.now(), turnId: 'objective-old-turn' },
+      pageTurnStart('objective-old-turn', Date.now()),
       { kind: 'assistant_message', time: Date.now(), messageId: 'objective-old-final', turnId: 'objective-old-turn',
         text: 'First pass complete.', state: 'final', final: true, goalEligible: true, activeNow: true },
       { kind: 'turn_end', time: Date.now(), turnId: 'objective-old-turn', outcome: 'completed' }
@@ -8784,7 +9055,7 @@ describe('the goal loop over the bridge', () => {
     const sessionId = first.body.sessionId as string;
     const continuation = await openContinuationNow(sessionId, chat);
     await request('POST', '/events', { body: { conversationId: chat, events: [
-      { kind: 'turn_start', time: Date.now(), turnId: 'objective-new-turn' },
+      pageTurnStart('objective-new-turn', Date.now()),
       { kind: 'assistant_message', time: Date.now(), messageId: 'objective-new-final', turnId: 'objective-new-turn',
         text: 'Second pass complete.', state: 'final', final: true, goalEligible: true, activeNow: true },
       { kind: 'turn_end', time: Date.now(), turnId: 'objective-new-turn', outcome: 'completed' }
@@ -8818,7 +9089,7 @@ describe('the goal loop over the bridge', () => {
         conversationId: chat,
         events: [
           { kind: 'user_message', time: Date.now(), text: 'keep going', messageId: 'm-switch-ticket' },
-          { kind: 'turn_start', time: Date.now(), turnId: 'switch-ticket-turn' },
+          pageTurnStart('switch-ticket-turn', Date.now()),
           {
             kind: 'assistant_message',
             time: Date.now(),
@@ -8910,7 +9181,7 @@ describe('the goal loop over the bridge', () => {
           conversationId: chat,
           events: [
             { kind: 'user_message', time: Date.now(), text: 'keep going', messageId: 'm-watchdog' },
-            { kind: 'turn_start', time: Date.now(), turnId: 'g-watchdog' },
+            pageTurnStart('g-watchdog', Date.now()),
             { kind: 'turn_end', time: Date.now(), turnId: 'g-watchdog', outcome: 'completed' }
           ]
         }
@@ -9414,10 +9685,24 @@ describe('app requests to stop one exact active turn', () => {
     expect((await getSession(sessionId))?.activeTurnId).toBe('stop-turn-one');
     expect((await sessionControlsFor(sessionId)).activeTurnId).toBeNull();
   });
+  it('keeps a durable open turn tracked after restart even when adoption authority is unavailable', async () => {
+    const conversationId = 'e5656565-aaaa-4bbb-8ccc-111111111111';
+    const sessionId = await active(conversationId, 'durable-open-without-lease');
+    resetRecorderForTests();
+    await resetBridgeForTests();
+
+    const activity = await request('GET', `/activity?conversationId=${conversationId}`);
+    expect(activity.body.sessionId).toBe(sessionId);
+    expect(activity.body.turn).toEqual({
+      id: 'durable-open-without-lease',
+      live: false,
+      adoption: null
+    });
+  });
   async function active(conversationId: string, turnId = 'stop-turn-one') {
     await pair();
     const result = await request('POST', '/events', { body: { conversationId, events: [
-      { kind: 'turn_start', time: Date.now(), turnId }
+      pageTurnStart(turnId, Date.now())
     ] } });
     expect(result.status).toBe(200);
     return result.body.sessionId as string;
@@ -9430,40 +9715,160 @@ describe('app requests to stop one exact active turn', () => {
       await pair();
       const result = await request('POST', '/events', { body: { conversationId, events: [
         { kind: 'user_message', time: Date.now(), messageId: 'original-question', text: 'Original work' },
-        { kind: 'turn_start', time: Date.now(), turnId: 'original-turn' }
+        pageTurnStart('original-turn', Date.now(), 'original-question')
       ] } });
       const sessionId = result.body.sessionId;
       const began = Date.now();
       await stopSessionTurn(sessionId, 'original-turn');
       resetRecorderForTests(); // The new tab must restore the durable turn rather than minting one.
       const activity = await request('GET', `/activity?conversationId=${conversationId}`);
-      expect(activity.body).toMatchObject({ activeTurnId: 'original-turn', stopTurn: { turnId: 'original-turn', userMessageId: 'original-question' } });
+      expect(activity.body).toMatchObject({
+        turn: {
+          id: 'original-turn',
+          live: true,
+          adoption: { openingUserMessageId: 'original-question' }
+        }
+      });
+      expect(activity.body.stopTurn).toBeUndefined();
       await vi.advanceTimersByTimeAsync(30_001);
       const command = (await request('GET', '/status')).body.stopTurns[0];
       expect(command.expiresAt).toBe(began + STOP_COMMAND_TIMEOUT_MS);
       const redeemed = await request('POST', '/commands/redeem', { body: { id: command.id, client: 'reopened-page', conversationId } });
-      expect(redeemed.body.command.userMessageId).toBe('original-question');
+      expect(redeemed.body.command.openingUserMessageId).toBe('original-question');
       await vi.advanceTimersByTimeAsync(STOP_COMMAND_TIMEOUT_MS - 30_001);
       expect((await request('GET', '/status')).body.stopTurns).toEqual([]);
-      expect((await request('GET', `/activity?conversationId=${conversationId}`)).body.activeTurnId).toBeNull();
+      expect((await request('GET', `/activity?conversationId=${conversationId}`)).body.turn?.live).toBe(false);
       expect((await getSession(sessionId))?.activeTurnId).toBe('original-turn');
     } finally { vi.useRealTimers(); }
   });
-  it('does not borrow a previous turn question when the Stop target has no native question anchor', async () => {
+  it('does not let a pending Stop command recreate current identity after durable opening conflict', async () => {
+    const { sessionControlsFor, stopSessionTurn } = await import('../src/main/bridge.js');
+    const conversationId = 'e6767677-aaaa-4bbb-8ccc-111111111111';
+    await pair();
+    const opened = await request('POST', '/events', { body: { conversationId, events: [
+      pageTurnStart('conflicted-stop-turn', Date.now(), 'stop-question-a')
+    ] } });
+    await stopSessionTurn(opened.body.sessionId, 'conflicted-stop-turn');
+    const command = (await request('GET', '/status')).body.stopTurns[0];
+    expect(command).toBeTruthy();
+    await request('POST', '/events', { body: { conversationId, events: [
+      pageTurnStart('conflicted-stop-turn', Date.now() + 1, 'stop-question-b')
+    ] } });
+
+    expect((await request('GET', `/activity?conversationId=${conversationId}`)).body.turn).toEqual({
+      id: 'conflicted-stop-turn',
+      live: true,
+      adoption: null
+    });
+    expect(await sessionControlsFor(opened.body.sessionId)).toMatchObject({
+      activeTurnId: 'conflicted-stop-turn',
+      stopPending: true,
+      canStop: false
+    });
+    const redeemed = await request('POST', '/commands/redeem', {
+      body: { id: command.id, client: 'conflicted-stop-page', conversationId }
+    });
+    expect(redeemed.status).toBe(409);
+    expect(redeemed.body.error).toBe('stop_turn_changed');
+  });
+  it('keeps a damaged active turn tracked but removes both adoption and Stop capability', async () => {
+    const { sessionControlsFor, stopSessionTurn } = await import('../src/main/bridge.js');
+    const conversationId = 'e6767678-aaaa-4bbb-8ccc-111111111111';
+    await pair();
+    const opened = await request('POST', '/events', { body: { conversationId, events: [
+      pageTurnStart('damaged-stop-turn', Date.now(), 'damaged-stop-question')
+    ] } });
+    await request('POST', '/events', { body: { conversationId, events: [{
+      kind: 'recording_gap',
+      time: Date.now() + 1,
+      reason: 'worker_journal_overflow',
+      affectedTurnId: 'damaged-stop-turn',
+      lostKinds: { turn_end: 1 }
+    }] } });
+
+    expect((await request('GET', `/activity?conversationId=${conversationId}`)).body.turn).toEqual({
+      id: 'damaged-stop-turn',
+      live: true,
+      adoption: null
+    });
+    expect(await sessionControlsFor(opened.body.sessionId)).toMatchObject({
+      activeTurnId: 'damaged-stop-turn',
+      canStop: false
+    });
+    await expect(stopSessionTurn(opened.body.sessionId, 'damaged-stop-turn')).rejects.toThrow('active_turn_identity_unavailable');
+  });
+  it('migrates a v4 durable Stop anchor to the Protocol-18 opening identity without losing it', async () => {
     const { stopSessionTurn } = await import('../src/main/bridge.js');
+    const conversationId = 'e6767676-aaaa-4bbb-8ccc-111111111111';
+    const sessionId = await active(conversationId, 'legacy-stop-turn');
+    await stopSessionTurn(sessionId, 'legacy-stop-turn');
+    await flushDurable();
+
+    const legacy = await readDurable<any>('bridge-commands');
+    const row = legacy?.commands?.find((entry: any) => entry?.spec?.type === 'stop');
+    expect(row?.spec?.openingUserMessageId).toBe('question-legacy-stop-turn');
+    legacy.version = 4;
+    row.spec.userMessageId = row.spec.openingUserMessageId;
+    delete row.spec.openingUserMessageId;
+    await writeDurableNow('bridge-commands', legacy);
+
+    await resetBridgeForTests();
+    await restoreCommands();
+    await flushDurable();
+    const migrated = await readDurable<any>('bridge-commands');
+    expect(migrated?.version).toBe(5);
+    const restored = migrated?.commands?.find((entry: any) => entry?.spec?.type === 'stop');
+    expect(restored?.spec).toMatchObject({
+      turnId: 'legacy-stop-turn',
+      openingUserMessageId: 'question-legacy-stop-turn'
+    });
+    expect(restored?.spec?.userMessageId).toBeUndefined();
+  });
+  it('rejects a v5 Stop row that carries only the legacy opening field', async () => {
+    const { stopSessionTurn } = await import('../src/main/bridge.js');
+    const conversationId = 'e6868686-aaaa-4bbb-8ccc-111111111111';
+    const sessionId = await active(conversationId, 'invalid-v5-stop-turn');
+    await stopSessionTurn(sessionId, 'invalid-v5-stop-turn');
+    await flushDurable();
+
+    const saved = await readDurable<any>('bridge-commands');
+    const row = saved?.commands?.find((entry: any) => entry?.spec?.type === 'stop');
+    expect(saved?.version).toBe(5);
+    row.spec.userMessageId = row.spec.openingUserMessageId;
+    delete row.spec.openingUserMessageId;
+    await writeDurableNow('bridge-commands', saved);
+
+    await resetBridgeForTests();
+    await restoreCommands();
+    await flushDurable();
+    const rewritten = await readDurable<any>('bridge-commands');
+    expect(rewritten?.version).toBe(5);
+    expect(rewritten?.commands?.some((entry: any) => entry?.spec?.type === 'stop')).toBe(false);
+  });
+  it('does not borrow a previous question when a legacy live turn has no native opening anchor', async () => {
     const conversationId = 'e7777777-aaaa-4bbb-8ccc-111111111111';
     await pair();
     const result = await request('POST', '/events', { body: { conversationId, events: [
       { kind: 'user_message', time: Date.now(), messageId: 'previous-question', text: 'Previous work' },
-      { kind: 'turn_start', time: Date.now(), turnId: 'previous-turn' },
+      pageTurnStart('previous-turn', Date.now(), 'previous-question'),
       { kind: 'turn_end', time: Date.now(), turnId: 'previous-turn', outcome: 'completed' }
     ] } });
-    await request('POST', '/events', { body: { conversationId, events: [
+    // A real protocol-17 journal can still contain a start with no opening identity. Exercise
+    // that compatibility path directly; protocol 18 /events correctly rejects this shape.
+    await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: Date.now() + 1, turnId: 'unanchored-turn' }
-    ] } });
-    await stopSessionTurn(result.body.sessionId, 'unanchored-turn');
+    ]);
+    expect((await getSession(result.body.sessionId))?.activeTurnId).toBe('unanchored-turn');
+    expect(liveConversations().find(row => row.conversationId === conversationId)).toMatchObject({
+      activeTurn: {
+        id: 'unanchored-turn',
+        opening: { status: 'unknown' }
+      }
+    });
     const activity = await request('GET', `/activity?conversationId=${conversationId}`);
-    expect(activity.body.stopTurn).toEqual({ turnId: 'unanchored-turn', userMessageId: null });
+    expect(activity.body).toMatchObject({
+      turn: { id: 'unanchored-turn', live: false, adoption: null }
+    });
   });
   it('hands a new Stop to the shared absent-browser startup owner once and revokes it for a newer turn', async () => {
     const { stopSessionTurn } = await import('../src/main/bridge.js');
@@ -9478,7 +9883,7 @@ describe('app requests to stop one exact active turn', () => {
     await stopSessionTurn(sessionId, 'stop-turn-one');
     expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
     await request('POST', '/events', { body: { conversationId, events: [
-      { kind: 'turn_start', time: Date.now() + 1, turnId: 'newer-turn' }
+      pageTurnStart('newer-turn', Date.now() + 1)
     ] } });
     expect(authority!.current()).toBe(false);
   });
@@ -9555,7 +9960,7 @@ describe('app requests to stop one exact active turn', () => {
     await stopSessionTurn(sessionId, 'stop-turn-one');
     const command = (await request('GET', '/status')).body.stopTurns[0];
     await request('POST', '/events', { body: { conversationId, events: [
-      { kind: 'turn_start', time: Date.now() + 1, turnId: 'stop-turn-two' }
+      pageTurnStart('stop-turn-two', Date.now() + 1)
     ] } });
     const stale = await request('POST', '/commands/redeem', { body: { id: command.id, client: 'stop-page', conversationId } });
     expect(stale.status).toBe(409);
@@ -9575,7 +9980,7 @@ it('retires an already armed ordinary Goal repair when its conversation is now A
     const chat = 'a5555555-1111-4111-8111-000000000005';
     await request('POST', '/events', { body: { conversationId: chat, events: [
       { kind: 'model_selection', model: 'gpt-5.6-sol', reasoningEffort: 'high', time: Date.now() },
-      { kind: 'turn_start', turnId: 'legacy-goal-turn', time: Date.now() },
+      pageTurnStart('legacy-goal-turn', Date.now()),
       { kind: 'turn_end', turnId: 'legacy-goal-turn', outcome: 'completed', time: Date.now() }
     ] } });
     const sessionId = (await request('GET', `/activity?conversationId=${chat}`)).body.sessionId;

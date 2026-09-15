@@ -31,7 +31,7 @@ vi.mock('../src/main/session/store.js', () => ({
     const session = { id, conversationId, activeTurnId: binding.activeTurnId, origin: { kind: binding.origin },
       lastToolCallAt: binding.lastToolCallAt, finishTurn: { turnId: binding.activeTurnId, released: binding.finishReleased },
       selectedModel: { conversationId, model: binding.model } };
-    const lifecycle = { seq: 2, source: 'extension', ...binding.end };
+    const lifecycle = { seq: 2, source: 'extension', integrity: 'intact' as const, ...binding.end };
     return { session, lifecycle, head: lifecycle, exactMcpCall: {
       seq: 1, time: binding.end.time - 1, source: 'mcp', kind: 'tool_call', turnId,
       call: { callId: 'exact-mcp', conversationId, attribution: 'request_id' }

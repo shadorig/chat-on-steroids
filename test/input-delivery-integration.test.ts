@@ -53,6 +53,11 @@ async function post(route: string, body: unknown) {
   });
   return { status: response.status, body: await response.json() as any };
 }
+
+/** Current protocol-18 lifecycle boundary. Legacy identity-less history is tested below the wire. */
+function pageTurnStart(turnId: string, time: number, openingUserMessageId = `question-${turnId}`) {
+  return { kind: 'turn_start' as const, turnId, time, openingUserMessageId };
+}
 beforeAll(async () => {
   directory = await makeTempDir('clf-input-integration-');
   initConfigPath(directory); initSecretsPath(directory); initDurableStore(directory); initSessionStore(directory);
@@ -117,7 +122,7 @@ it('does not pin an idle chat to tool transport because another call is unattrib
   const session = await createSession({ title: 'Completed target', conversationId });
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-5.6-sol', time: Date.now() },
-    { kind: 'turn_start', turnId: 'completed-before-input', time: Date.now() },
+    pageTurnStart('completed-before-input', Date.now()),
     { kind: 'turn_end', turnId: 'completed-before-input', outcome: 'completed', time: Date.now() }
   ] });
   let row!: import('../src/main/session/input.js').InputEntry;
@@ -139,7 +144,7 @@ it('projects and delivers a direct correction through the real recorder, bridge 
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-5.6-sol', reasoningEffort: 'high', time },
     { kind: 'user_message', messageId: 'plain-user', text: 'Explain the idea without tools', time },
-    { kind: 'turn_start', turnId: 'plain-turn', time: time + 1 }
+    pageTurnStart('plain-turn', time + 1, 'plain-user')
   ] });
   expect(await sessionControlsFor(session.id)).toMatchObject({ canInject: false, canSendDirectly: true });
   const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto' });
@@ -194,7 +199,7 @@ describe.each(['input', 'loop'] as const)('MCP admission for %s recovery', desti
           await goal.setGoalLoopTriggerNow(conversationId, 'after-turn');
         }
         if (evidence === 'previous-turn') {
-          await post('/events', { conversationId, events: [{ kind: 'turn_start', turnId: 'previous-mcp-turn', time: now }] });
+          await post('/events', { conversationId, events: [pageTurnStart('previous-mcp-turn', now)] });
           await attributedMcp(conversationId);
           await post('/events', { conversationId, events: [{ kind: 'turn_end', turnId: 'previous-mcp-turn', outcome: 'stopped', time: now }] });
           now++;
@@ -202,7 +207,7 @@ describe.each(['input', 'loop'] as const)('MCP admission for %s recovery', desti
         await post('/events', { conversationId, events: [
           { kind: 'model_selection', model: destination === 'loop' ? 'gpt-5.6-pro' : 'gpt-6-pro', reasoningEffort: 'pro', time: now },
           { kind: 'user_message', messageId: 'new-user', text: 'Fixture task', time: now },
-          { kind: 'turn_start', turnId: 'current-turn', time: now }
+          pageTurnStart('current-turn', now, 'new-user')
         ] });
         const row = destination === 'input' ? await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' }) : null;
         if (evidence === 'current-turn') await attributedMcp(conversationId);
@@ -247,7 +252,7 @@ it.each(['gpt-6-pro', 'gpt-5.6-sol'])('carries settled Thinking failed through H
   const time = Date.now();
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model, time },
-    { kind: 'turn_start', turnId: 'native-failed-turn', time }
+    pageTurnStart('native-failed-turn', time)
   ] });
   const first = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn', afterTurn: true });
   const second = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn', afterTurn: true });
@@ -299,7 +304,7 @@ it('ignores unshipped development recovery fields without MCP proof but still de
   const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn' });
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-6-pro', time: Date.now() },
-    { kind: 'turn_start', turnId: 'restored-turn', time: Date.now() }
+    pageTurnStart('restored-turn', Date.now())
   ] });
   const [start] = await readRecentEvents(session.id, 1);
   await writeDurableNow('session-input', [{ ...row, silenceBoundary: { turnId: 'restored-turn', conversationId, workSeq: start!.seq } }]);
@@ -321,7 +326,7 @@ it('does not turn generic failed/error prose or an unknown wire reason into queu
   const session = await createSession({ title: 'Unclassified failure', conversationId });
   await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn', afterTurn: true });
   await post('/events', { conversationId, events: [
-    { kind: 'turn_start', turnId: 'unclassified', time: Date.now() },
+    pageTurnStart('unclassified', Date.now()),
     { kind: 'turn_end', turnId: 'unclassified', outcome: 'failed', reason: 'unrecognized', detail: 'Thinking failed', time: Date.now() + 1 }
   ] });
   expect((await readEvents(session.id, { kinds: ['turn_end'] })).at(-1)).not.toHaveProperty('reason');
@@ -333,7 +338,7 @@ it('revokes Thinking-failed recovery when durable work lands after the failure b
   const session = await createSession({ title: 'Failure followed by work', conversationId });
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-6-pro', reasoningEffort: 'pro', time: Date.now() },
-    { kind: 'turn_start', turnId: 'failed-then-resumed', time: Date.now() }
+    pageTurnStart('failed-then-resumed', Date.now())
   ] });
   const row = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'after-turn', afterTurn: true });
   await attributedMcp(conversationId);
@@ -359,7 +364,7 @@ it.each(['open', 'stalled', 'final-during-listen', 'failure-during-listen'])('fi
     await post('/events', { conversationId, events: [
       { kind: 'model_selection', model: 'gpt-6-pro', reasoningEffort: 'pro', time: now },
       { kind: 'user_message', messageId: 'silence-user', text: 'Continue the task', time: now },
-      { kind: 'turn_start', turnId: 'silence-turn', time: now }
+      pageTurnStart('silence-turn', now, 'silence-user')
     ] });
     await attributedMcp(conversationId);
     now += bridge.CONTINUATION_SILENCE_MS - 1;
@@ -430,7 +435,7 @@ it('gives a recovered checkpoint to queued user input before synthesizing Loop w
     await post('/events', { conversationId, events: [
       { kind: 'model_selection', model: 'gpt-5.6-pro', reasoningEffort: 'pro', time: now },
       { kind: 'user_message', messageId: 'priority-user', text: 'Keep going', time: now },
-      { kind: 'turn_start', turnId: 'priority-turn', time: now }
+      pageTurnStart('priority-turn', now, 'priority-user')
     ] });
     await attributedMcp(conversationId);
     now += bridge.CONTINUATION_SILENCE_MS + 1;
@@ -459,7 +464,7 @@ it('transfers an unspent Loop recovery to user input queued after the synthetic 
     await post('/events', { conversationId, events: [
       { kind: 'model_selection', model: 'gpt-5.6-pro', reasoningEffort: 'pro', time: now },
       { kind: 'user_message', messageId: 'late-priority-user', text: 'Keep going', time: now },
-      { kind: 'turn_start', turnId: 'late-priority-turn', time: now }
+      pageTurnStart('late-priority-turn', now, 'late-priority-user')
     ] });
     await attributedMcp(conversationId);
     now += bridge.CONTINUATION_SILENCE_MS + 1;
@@ -498,7 +503,7 @@ it('refuses synthetic recovery spend even when retiring its duplicate projection
     await post('/events', { conversationId, events: [
       { kind: 'model_selection', model: 'gpt-5.6-pro', reasoningEffort: 'pro', time: now },
       { kind: 'user_message', messageId: 'cleanup-failure-user', text: 'Keep going', time: now },
-      { kind: 'turn_start', turnId: 'cleanup-failure-turn', time: now }
+      pageTurnStart('cleanup-failure-turn', now, 'cleanup-failure-user')
     ] });
     await attributedMcp(conversationId);
     now += bridge.CONTINUATION_SILENCE_MS + 1;
@@ -547,7 +552,7 @@ it.each(['queued', 'claimed', 'tool', 'settled-failure'])('withdraws a silence t
     await post('/events', { conversationId, events: [
       { kind: 'model_selection', model: 'gpt-6-pro', time: now },
       { kind: 'user_message', messageId: 'resume-user', text: 'Continue', time: now },
-      { kind: 'turn_start', turnId: 'resume-turn', time: now }
+      pageTurnStart('resume-turn', now, 'resume-user')
     ] });
     await attributedMcp(conversationId);
     now += bridge.CONTINUATION_SILENCE_MS + 1;
@@ -613,7 +618,7 @@ it('freezes image injection from staged originals with replay, receipt, and brow
   const attachment = await stageInputAttachment({ name: 'full-resolution.png', bytes }, new Set());
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-6-astra', time: Date.now() },
-    { kind: 'turn_start', turnId: 'image-turn', time: Date.now() }
+    pageTurnStart('image-turn', Date.now())
   ] });
   const authored = { ...message(session.id, 'off'), mode: 'auto' as const, attachments: [attachment], attachmentDelivery: 'tool-image-projection' as const };
   const [first, duplicate] = await Promise.all([
@@ -662,7 +667,7 @@ it('rejects image admission when the session changes during normalization', asyn
   const session = await createSession({ title: 'Image preparation race', conversationId });
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-6-astra', time: Date.now() },
-    { kind: 'turn_start', turnId: 'image-race-turn', time: Date.now() }
+    pageTurnStart('image-race-turn', Date.now())
   ] });
   const bytes = await sharp({ create: { width: 20, height: 20, channels: 3, background: '#123456' } }).png().toBuffer();
   const file = await attachments.stageInputAttachment({ name: 'race.png', bytes }, new Set());
@@ -796,7 +801,7 @@ it('delivers only the selected project AGENTS.md, freezes claims across restart,
 it.each(['finish', 'after-turn'] as const)('wakes browser delivery after a committed final makes %s input eligible', async mode => {
   const conversationId = randomUUID();
   const session = await createSession({ title: 'Final-boundary wake', conversationId });
-  await post('/events', { conversationId, events: [{ kind: 'turn_start', turnId: 'wake-turn', time: Date.now() }] });
+  await post('/events', { conversationId, events: [pageTurnStart('wake-turn', Date.now())] });
   const queued = await input.enqueueInput({ ...message(session.id, 'off'), mode });
   expect(await input.pendingBrowserInputs()).toEqual([]);
   const snapshots: ReturnType<typeof input.pendingBrowserInputs>[] = [];
@@ -938,7 +943,7 @@ describe('IPC input delivery and Goal control integration', () => {
     // The extension's accepted observation route owns live activity, not a durable
     // recorder row alone. Exercise that authority before asking IPC for live controls.
     const first = await post('/events', { conversationId,
-      events: [{ kind: 'turn_start', turnId: 'first-held-turn', time: Date.now() }] });
+      events: [pageTurnStart('first-held-turn', Date.now())] });
     expect(first.status).toBe(200);
     expect(first.body.sessionId).toBe(session.id);
     const current = await handlers.get('sessions:controls')!(null, { id: session.id });
@@ -947,7 +952,7 @@ describe('IPC input delivery and Goal control integration', () => {
     const released = await handlers.get('sessions:releaseFinish')!(null, { id: session.id, expectedTurnId: 'first-held-turn' });
     expect(released.data.finishHeld).toBe(false);
     const second = await post('/events', { conversationId,
-      events: [{ kind: 'turn_start', turnId: 'second-held-turn', time: Date.now() + 1 }] });
+      events: [pageTurnStart('second-held-turn', Date.now() + 1)] });
     expect(second.status).toBe(200);
     expect(second.body.sessionId).toBe(session.id);
     expect((await handlers.get('sessions:releaseFinish')!(null, { id: session.id, expectedTurnId: 'first-held-turn' })).ok).toBe(false);
@@ -1134,7 +1139,7 @@ it.each(['auto', 'finish'] as const)('adds one short reminder to every later Ast
   const t = Date.now();
   await post('/events', { conversationId, events: [
     { kind: 'model_selection', model: 'gpt-6-pro', reasoningEffort: 'pro', time: t },
-    { kind: 'turn_start', turnId: 'previous-astra', time: t },
+    pageTurnStart('previous-astra', t),
     { kind: 'turn_end', turnId: 'previous-astra', outcome: 'completed', time: t + 1000 }
   ] });
   const request = { ...message(chat.id, 'off'), mode, afterTurn: true } as Parameters<typeof input.enqueueInput>[0];

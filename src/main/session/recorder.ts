@@ -26,7 +26,9 @@ import type {
   StoredText,
   ToolCallRecord,
   ToolOutcome,
-  TurnOutcome
+  TurnOutcome,
+  RecordingGapReason,
+  RecordingGapLostKind
 } from '../../shared/session.js';
 import { estimateTokens, originTitle } from '../../shared/session.js';
 import type { AutomationSourceBoundary } from '../../shared/automation-source.js';
@@ -41,6 +43,7 @@ import {
   MAX_USER_MESSAGE_CHARS,
   MAX_ASSET_BYTES,
   appendEvent,
+  appendEventIfAttachedToConversation,
   observeSessionModel,
   conversationAttachment,
   createSession,
@@ -50,8 +53,10 @@ import {
   getSession,
   readAsset,
   readCanonicalAssistantMessage,
+  readCurrentTurnAuthority,
   readEvents,
   readRecentEvents,
+  readTurnReconciliationContext,
   indexedSessions,
   renameSession,
   reopenSession,
@@ -69,44 +74,24 @@ import {
 } from './correlation.js';
 import { resumeOpeningChat } from './resume-gate.js';
 import { summarizeToolCall } from './summarize.js';
-import { projectTurnEnd, projectTurnReopen, projectTurnStart } from './turn-lifecycle.js';
+import {
+  activeTurn as projectedActiveTurn,
+  addActiveRequestId,
+  emptyTurnLifecycleProjection,
+  lastTurn as projectedLastTurn,
+  openingIdentity,
+  projectTurnEnd,
+  reduceTurnLifecycleEvent,
+  reopenCandidateTurn,
+  turnRecord,
+  turnStartDisposition,
+  type OpeningIdentity,
+  type TurnLifecycleProjection
+} from './turn-lifecycle.js';
 
-interface LiveConversation {
+interface LiveConversation extends TurnLifecycleProjection {
   conversationId: string;
   sessionId: string;
-  /** Durable local turn lifecycle only. Never used as MCP ownership evidence. */
-  turnStartedAt: number | null;
-  turnId: string | null;
-  /**
-   * Turns this session's log started and has not ended.
-   *
-   * Only these may be closed by the reload-recovery path. A cold page reports a final
-   * assistant message tagged with whatever turn id it can read, and those ids are reused
-   * turn after turn, so trusting the id alone let a reload append a second completion for
-   * a turn that ended long before. Seeded from the log at pickup, so it is right after an
-   * app restart and not only for a page that stayed open.
-   */
-  openTurns: Set<string>;
-  /** Durable starts and ends not superseded by an app-authored reopen; browser replay stays idempotent. */
-  knownTurnStarts: Set<string>;
-  knownTurnEnds: Set<string>;
-  /** Newest durable turn verdict, used only to interpret post-reload final/call evidence. */
-  lastTurnOutcome: TurnOutcome | null;
-  /** Start of that turn, so its final may predate a later detach/end while old finals cannot. */
-  lastTurnStartedAt: number | null;
-  /** ChatGPT request ids — one per server turn — that called tools while the open turn ran. */
-  turnRequestIds: Set<string>;
-  /**
-   * The newest turn the page reported completed, with the server turns it was calling under.
-   *
-   * A request id is minted per server turn and outlives anything the page does: a reload,
-   * a lost stream, a Stop click. So a call under one of these ids that *starts* after the
-   * reported end is proof the end was the page's mistake — ChatGPT is still working that
-   * turn — and the recorder reopens it rather than let Goal answer a turn that has not
-   * finished. See reopenFalselyEndedTurn. In-memory only: an app restart inside such a turn
-   * loses the proof, and the turn stays closed as the page reported it.
-   */
-  endedTurn: { turnId: string; startedAt: number | null; endedAt: number; requestIds: Set<string> } | null;
   /** Visible ChatGPT-native activity rows, updated by the page's stable row identity. */
   pageTools: Map<string, ProgressRecord>;
 }
@@ -324,14 +309,47 @@ async function initializeSessionForConversation(
   const history = known
     ? await storedHistory(summary.id)
     : {
-        openTurns: new Set<string>(),
-        knownTurnStarts: new Set<string>(),
-        knownTurnEnds: new Set<string>(),
-        lastTurnStartedAt: null,
-        activeTurnId: null,
-        activeTurnStartedAt: null,
+        lifecycle: emptyTurnLifecycleProjection(),
         pageTools: new Map<string, ProgressRecord>()
       };
+  // Metadata owns whether a turn is durably open. The bounded history read below is only a cache
+  // for idempotency/presentation and may have aged the opening start out of its tail. Resolve the
+  // one named active turn from the full journal once on cold restore; /activity never scans it.
+  if (known) {
+    const activeTurnId = summary.activeTurnId ?? null;
+    if (!activeTurnId) {
+      history.lifecycle.activeTurnId = null;
+      history.lifecycle.activeRequestIds.clear();
+    } else {
+      const boundedTurn = projectedActiveTurn(history.lifecycle);
+      const bounded = boundedTurn?.id === activeTurnId ? boundedTurn : null;
+      const reconciled = await readCurrentTurnAuthority(summary.id, activeTurnId);
+      // A synthesized legacy `seq-*` active id has no matching durable named start and therefore
+      // cannot become executable/reconciliation authority. A named turn remains tracked even if
+      // durable lineage is damaged; its opening becomes unknown so a replacement page cannot
+      // mistake "not adoptable" for "no app-owned turn" and mint a duplicate generation.
+      if (reconciled.status === 'found' || bounded || !activeTurnId.startsWith('seq-')) {
+        const context = reconciled.status === 'found' ? reconciled.context : null;
+        const opening = context?.opening ?? openingIdentity();
+        history.lifecycle.turnsById.set(activeTurnId, {
+          opening,
+          integrity: context?.integrity ?? (reconciled.status === 'damaged' ? 'damaged' : 'intact'),
+          logicalStartedAt: context?.logicalStartedAt ?? bounded?.logicalStartedAt ?? null,
+          segmentStartedAt: context?.latestSegmentStartedAt ?? bounded?.segmentStartedAt ?? null,
+          phase: 'unclosed',
+          outcome: null
+        });
+        history.lifecycle.activeTurnId = activeTurnId;
+        history.lifecycle.activeRequestIds = new Set<string>();
+      } else {
+        history.lifecycle.activeTurnId = null;
+        history.lifecycle.activeRequestIds.clear();
+      }
+    }
+    if (!projectedLastTurn(history.lifecycle) && summary.lastTurnOutcome) {
+      history.lifecycle.legacyLastTurnOutcome = summary.lastTurnOutcome;
+    }
+  }
 
   // `storedHistory()` can take long enough for Compact & Resume to durably move this exact
   // session from chat A to chat B while first-sight initialisation of A is still in flight.
@@ -352,18 +370,7 @@ async function initializeSessionForConversation(
   conversations.set(conversationId, {
     conversationId,
     sessionId: summary.id,
-    // A running turn survives an app/content-script restart. The durable log is the only
-    // component that can still know the old document's generation id, so restore it here
-    // and let /activity hand it back to the replacement content script.
-    turnStartedAt: history.activeTurnStartedAt,
-    turnId: history.activeTurnId,
-    openTurns: history.openTurns,
-    knownTurnStarts: history.knownTurnStarts,
-    knownTurnEnds: history.knownTurnEnds,
-    lastTurnOutcome: summary.lastTurnOutcome,
-    lastTurnStartedAt: history.lastTurnStartedAt,
-    turnRequestIds: new Set<string>(),
-    endedTurn: null,
+    ...history.lifecycle,
     pageTools: history.pageTools
   });
   if (!known) {
@@ -477,18 +484,8 @@ async function applyOrigin(sessionId: string, conversationId: string): Promise<v
 
 /** What a session's own log already says, for a conversation being picked up again. */
 interface StoredHistory {
-  /** Turns this log started and never ended — the only ones a recovery may close. */
-  openTurns: Set<string>;
-  /** Every durable turn start, including starts whose turn has already ended. */
-  knownTurnStarts: Set<string>;
-  /** Durable turn ends not superseded by an app-authored reopen. */
-  knownTurnEnds: Set<string>;
-  /** Durable start time of the newest turn that ended in the recovered tail. */
-  lastTurnStartedAt: number | null;
-  /** Current generation from lifecycle replay; older unended turns are history, not active work. */
-  activeTurnId: string | null;
-  /** Durable start time of activeTurnId. */
-  activeTurnStartedAt: number | null;
+  /** Bounded lifecycle cache. Active authority is reconciled against SessionSummary on restore. */
+  lifecycle: TurnLifecycleProjection;
   /** Latest stable ChatGPT-native activity row by website thought/message identity. */
   pageTools: Map<string, ProgressRecord>;
 }
@@ -505,48 +502,19 @@ interface StoredHistory {
  * recovery path appended a second completion for a turn that had ended many turns ago.
  */
 async function storedHistory(sessionId: string): Promise<StoredHistory> {
-  const openTurns = new Set<string>();
-  const knownTurnStarts = new Set<string>();
-  const knownTurnEnds = new Set<string>();
-  let lastTurnEndedAt: number | null = null;
-  let lastTurnStartedAt: number | null = null;
-  let activeTurnId: string | null = null;
-  let activeTurnStartedAt: number | null = null;
-  const turnStarts = new Map<string, number>();
+  const lifecycle = emptyTurnLifecycleProjection();
   const pageTools = new Map<string, ProgressRecord>();
   try {
     const events = await readRecentEvents(sessionId, 4096, {
-      kinds: ['turn_start', 'turn_end', 'page_tool'],
+      kinds: ['turn_start', 'turn_identity', 'turn_end', 'recording_gap', 'page_tool'],
       maxBytes: 2 * 1024 * 1024
     });
-    // Presentation groups a turn's starts before its end. Lifecycle replay must
-    // instead retain an app-authored reopen that was committed after that end.
+    // Replay the same transition functions live recording uses. This cache is deliberately
+    // bounded; initializeSessionForConversation separately reconciles any durably-active turn
+    // against the unbounded journal authority before publishing it to the browser.
     for (const event of events.sort((a, b) => a.seq - b.seq)) {
-      if (event.kind === 'turn_start') {
-        if (event.turnId) {
-          knownTurnStarts.add(event.turnId);
-          knownTurnEnds.delete(event.turnId);
-          openTurns.add(event.turnId);
-          turnStarts.set(event.turnId, event.time);
-          // Match live recording: each committed start replaces the current generation.
-          // An older turn missing its end remains forensic history; it must not become
-          // active again after a later turn completes and the user closes/revisits the chat.
-          activeTurnId = event.turnId;
-          activeTurnStartedAt = event.time;
-        }
-      } else if (event.kind === 'turn_end') {
-        if (event.turnId) {
-          knownTurnEnds.add(event.turnId);
-          openTurns.delete(event.turnId);
-          if (activeTurnId === event.turnId) {
-            activeTurnId = null;
-            activeTurnStartedAt = null;
-          }
-        }
-        if (lastTurnEndedAt === null || event.time >= lastTurnEndedAt) {
-          lastTurnEndedAt = event.time;
-          lastTurnStartedAt = event.turnId ? turnStarts.get(event.turnId) ?? null : null;
-        }
+      if (event.kind === 'turn_start' || event.kind === 'turn_identity' || event.kind === 'turn_end' || event.kind === 'recording_gap') {
+        reduceTurnLifecycleEvent(lifecycle, event);
       } else if (event.kind === 'page_tool' && event.messageId) {
         const held = pageTools.get(event.messageId);
         if (!held) {
@@ -567,7 +535,7 @@ async function storedHistory(sessionId: string): Promise<StoredHistory> {
   } catch (err) {
     logWarn(`could not read stored session history: ${(err as Error).message}`);
   }
-  return { openTurns, knownTurnStarts, knownTurnEnds, lastTurnStartedAt, activeTurnId, activeTurnStartedAt, pageTools };
+  return { lifecycle, pageTools };
 }
 
 async function ensureUnattributedSession(): Promise<string | null> {
@@ -609,9 +577,10 @@ export function unattributedSession(): string | null {
 }
 
 /**
- * `activeTurnId` is the generation id of the turn this conversation currently has open, or
- * null. It exists so a reloaded content script can adopt the turn it is standing in the
- * middle of instead of minting a second one.
+ * `activeTurn` is the atomic process-local identity of the logical turn this conversation
+ * currently has open, or null. It exists so a reloaded content script can adopt the turn it is
+ * standing in the middle of instead of minting a second one, without splitting its id from the
+ * exact native question that opened it.
  *
  * The extension's turn ids are `g-<run>-<epoch>-<n>`, where `<run>` is a namespace random
  * per *document*. That is what makes them unique, and it is also why a reload cannot
@@ -620,33 +589,53 @@ export function unattributedSession(): string | null {
  * splitting one assistant run across two local lifecycle generations. This app holds the
  * durable half of that lifecycle identity, so this is where it has to come from.
  */
-export function liveConversations(): Array<{
+export interface LiveConversationView {
   conversationId: string;
   sessionId: string;
-  generating: boolean;
-  activeTurnId: string | null;
-  /**
-   * How many turns of this chat have finished. Only ever goes up, for the life of the entry.
-   *
-   * `knownTurnEnds` is the recorder's idempotency set for turn ends, so its size is already an
-   * exact count of them - including the ends recovered from a final assistant message after a
-   * page reload. It answers the one question a turn id cannot: whether the turn that was live a
-   * moment ago is the turn that is live now. A reload mints a fresh local id for a generation
-   * that never ended, so id inequality means "or the page came back", while this counter moves
-   * only when a turn is actually over.
-   */
-  endedTurns: number;
-  /** Newest durable turn verdict; null when this chat has never reported an end. */
-  lastTurnOutcome: TurnOutcome | null;
-}> {
-  return [...conversations.values()].map((entry) => ({
+  /** Atomic process-local projection of the recorder's currently open logical turn. */
+  activeTurn: {
+    id: string;
+    logicalStartedAt: number | null;
+    segmentStartedAt: number | null;
+    opening: OpeningIdentity;
+    integrity: 'intact' | 'damaged';
+  } | null;
+  /** Monotonic process-local terminal boundary generation used by browser-repair budgets. */
+  terminalRevision: number;
+  /** Newest durable turn verdict and logical id, when this process can project them. */
+  lastTurn: { id: string | null; outcome: TurnOutcome } | null;
+}
+
+function liveConversationView(entry: LiveConversation): LiveConversationView {
+  const active = projectedActiveTurn(entry);
+  const last = projectedLastTurn(entry);
+  return {
     conversationId: entry.conversationId,
     sessionId: entry.sessionId,
-    generating: entry.turnStartedAt !== null,
-    activeTurnId: entry.turnStartedAt !== null ? entry.turnId : null,
-    endedTurns: entry.knownTurnEnds.size,
-    lastTurnOutcome: entry.lastTurnOutcome
-  }));
+    activeTurn: active
+      ? {
+          id: active.id,
+          logicalStartedAt: active.logicalStartedAt,
+          segmentStartedAt: active.segmentStartedAt,
+          opening: active.opening,
+          integrity: active.integrity
+        }
+      : null,
+    terminalRevision: entry.terminalRevision,
+    lastTurn: last ? { id: last.id, outcome: last.outcome } : null
+  };
+}
+
+/** Process-local recorder projection for one exact conversation/session pair. */
+export function liveConversationFor(conversationId: string, expectedSessionId?: string): LiveConversationView | null {
+  const entry = conversations.get(conversationId);
+  if (!entry || (expectedSessionId && entry.sessionId !== expectedSessionId)) return null;
+  return liveConversationView(entry);
+}
+
+/** Full live catalog for consumers that genuinely need to inspect every conversation. */
+export function liveConversations(): LiveConversationView[] {
+  return [...conversations.values()].map(liveConversationView);
 }
 
 /**
@@ -1225,6 +1214,7 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
   let attributing: Promise<Target>;
   if (input.conversationId) {
     const live = conversations.get(input.conversationId);
+    const active = live ? projectedActiveTurn(live) : null;
     const correlation = input.requestId ? requestCorrelation(input.requestId) : null;
     const target: Target = {
       conversationId: input.conversationId,
@@ -1232,7 +1222,7 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
         input.sessionId ??
         (correlation?.conversationId === input.conversationId ? correlation.sessionId : null),
       attribution: 'request_id',
-      turnId: live?.turnId ?? null
+      turnId: active?.id ?? null
     };
     if (input.bind) bindAgentConversation(input.bind, input.conversationId);
     attributing = Promise.resolve(target);
@@ -1253,11 +1243,12 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
             );
           }
           if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
+          const live = conversationId ? conversations.get(conversationId) : undefined;
           return {
             conversationId,
             sessionId: correlation?.sessionId ?? null,
             attribution: conversationId ? ('request_id' as const) : ('unattributed' as const),
-            turnId: conversationId ? conversations.get(conversationId)?.turnId ?? null : null
+            turnId: live ? projectedActiveTurn(live)?.id ?? null : null
           };
         })
       : Promise.resolve<Target>({ conversationId: null, sessionId: null, attribution: 'unattributed', turnId: null });
@@ -1318,12 +1309,13 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       const summary = await getSession(sessionId);
       const selection = summary?.selectedModel;
       const live = conversations.get(target.conversationId);
+      const active = live ? projectedActiveTurn(live) : null;
       // Selection evidence must precede this exact turn, not merely arrive before the
       // tool result is recorded. A user changing next-turn settings cannot reprice the
       // model still executing the old turn. Unknown/historical calls stay unattributed.
-      if (selection?.conversationId === target.conversationId && live?.turnId === target.turnId &&
-          live.turnStartedAt !== null && live.turnStartedAt !== undefined &&
-          selection.observedAt <= live.turnStartedAt && selection.observedAt <= input.startedAt) {
+      if (selection?.conversationId === target.conversationId && active?.id === target.turnId &&
+          active.logicalStartedAt !== null &&
+          selection.observedAt <= active.logicalStartedAt && selection.observedAt <= input.startedAt) {
         callModel = { model: selection.model, ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
       }
       const origin = summary?.origin;
@@ -1453,17 +1445,76 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
   }
 }
 
+/**
+ * The sole authority for app-authored same-id lifecycle correction.
+ *
+ * A corrective start restores execution authority, so cached process state is not enough. Read
+ * the complete durable lineage, reject damaged or contradictory identity, then revalidate the
+ * caller's reason immediately before appending. Legacy turns whose opening is still unknown may
+ * reopen as tracked-but-nonadoptable: exact same-request/fresh-work evidence proves that the logical
+ * lifecycle continued, while browser adoption remains separately unavailable without an exact
+ * opening question. Every same-id reopen goes through this gate.
+ */
+type ReopenResult =
+  | { status: 'rejected' }
+  | { status: 'committed'; current: boolean; turnId: string };
+
+async function authorizeAndReopenTurn(
+  sessionId: string,
+  live: LiveConversation,
+  input: {
+    turnId: string;
+    at: number;
+    detail: string;
+    requestIds?: ReadonlySet<string>;
+    agent?: string | null;
+    current: () => boolean;
+  }
+): Promise<ReopenResult> {
+  if (projectedActiveTurn(live) || !input.current()) return { status: 'rejected' };
+  const reconciled = await readTurnReconciliationContext(sessionId, input.turnId);
+  if (reconciled.status !== 'found' || reconciled.context.opening.status === 'conflict') return { status: 'rejected' };
+  if (projectedActiveTurn(live) || !input.current()) return { status: 'rejected' };
+  const openingUserMessageId = reconciled.context.opening.status === 'exact'
+    ? reconciled.context.opening.messageId
+    : null;
+  const event = await appendEventIfAttachedToConversation(sessionId, live.conversationId, {
+    source: 'app',
+    time: input.at,
+    kind: 'turn_start',
+    turnId: input.turnId,
+    ...(openingUserMessageId ? { openingUserMessageId } : {}),
+    detail: input.detail,
+    ...(input.agent ? { agent: input.agent } : {})
+  });
+  if (!event) return { status: 'rejected' };
+  // A newer recorder transition may have published while the durable append was awaiting fsync.
+  // The journal order remains authoritative; never let this older process-local projection replace
+  // a newer active generation after that await.
+  if (projectedActiveTurn(live) || !input.current()) {
+    return { status: 'committed', current: false, turnId: input.turnId };
+  }
+  reduceTurnLifecycleEvent(live, event);
+  live.activeRequestIds = new Set(input.requestIds ?? []);
+  return { status: 'committed', current: true, turnId: input.turnId };
+}
+
 /** A fresh exact observation can disprove a failed view, including after reload/restart. */
 async function reopenThinkingFailure(sessionId: string, live: LiveConversation | undefined, at: number,
   owner?: string): Promise<string | null> {
-  if (!live || live.turnId) return null;
+  if (!live || projectedActiveTurn(live)) return null;
   const [boundary] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] });
-  if (live.turnId || boundary?.kind !== 'turn_end' || boundary.reason !== 'thinking_failed' ||
+  const active = projectedActiveTurn(live);
+  if (active || boundary?.kind !== 'turn_end' || boundary.reason !== 'thinking_failed' ||
       !boundary.turnId || (owner && boundary.turnId !== owner) || at <= boundary.time) return null;
-  await appendEvent(sessionId, { source: 'app', time: at, kind: 'turn_start', turnId: boundary.turnId,
-    detail: 'fresh work resumed the same turn after its native view failed' });
-  projectTurnReopen(live, boundary.turnId, live.lastTurnStartedAt ?? at);
-  return boundary.turnId;
+  const reopened = await authorizeAndReopenTurn(sessionId, live, {
+    turnId: boundary.turnId,
+    at,
+    detail: 'fresh work resumed the same turn after its native view failed',
+    current: () => !projectedActiveTurn(live) && projectedLastTurn(live)?.id === boundary.turnId &&
+      projectedLastTurn(live)?.outcome === 'failed'
+  });
+  return reopened.status === 'committed' && reopened.current ? reopened.turnId : null;
 }
 
 /**
@@ -1497,36 +1548,37 @@ async function reopenFalselyEndedTurn(
   if (!live || live.sessionId !== sessionId) return null;
   const failed = await reopenThinkingFailure(sessionId, live, startedAt);
   if (failed) {
-    live.turnRequestIds.add(requestId);
+    addActiveRequestId(live, requestId);
     return failed;
   }
-  if (live.turnStartedAt !== null) {
-    live.turnRequestIds.add(requestId);
+  if (projectedActiveTurn(live)) {
+    addActiveRequestId(live, requestId);
     return null;
   }
-  const ended = live.endedTurn;
-  if (!ended || !ended.requestIds.has(requestId) || startedAt <= ended.endedAt) return null;
+  const candidate = reopenCandidateTurn(live);
+  if (!candidate || !candidate.requestIds.has(requestId) || startedAt <= candidate.endedAt) return null;
   // A request id proves conversation ownership, not that the selected native
   // answer is still generating. Pro can issue same-request work after its public
   // terminal message. Only a completion inferred without that native final is
   // contradicted by the late call.
   const [answer] = await readRecentEvents(sessionId, 1, { kinds: ['assistant_message'] });
-  if (live.endedTurn !== ended || live.turnStartedAt !== null) return null;
-  if (answer?.kind === 'assistant_message' && answer.turnId === ended.turnId &&
+  const durableCandidate = live.reopenCandidate;
+  if (!durableCandidate || durableCandidate.turnId !== candidate.turn.id || projectedActiveTurn(live)) return null;
+  if (answer?.kind === 'assistant_message' && answer.turnId === candidate.turn.id &&
       answer.state === 'final' && answer.final === true && answer.providerMessageId) return null;
-  await appendEvent(sessionId, {
-    time: startedAt,
-    source: 'app',
-    kind: 'turn_start',
-    turnId: ended.turnId,
+  const reopened = await authorizeAndReopenTurn(sessionId, live, {
+    turnId: candidate.turn.id,
+    at: startedAt,
+    requestIds: candidate.requestIds,
     detail: 'the same ChatGPT request kept calling tools after the page reported this turn completed',
-    ...(agent ? { agent } : {})
+    agent,
+    current: () => live.reopenCandidate === durableCandidate && !projectedActiveTurn(live)
   });
-  projectTurnReopen(live, ended.turnId, ended.startedAt ?? startedAt, ended.requestIds);
+  if (reopened.status !== 'committed' || !reopened.current) return null;
   logInfo(
-    `session ${sessionId} reopened turn ${ended.turnId} — request ${requestId} kept calling tools after the page reported it completed`
+    `session ${sessionId} reopened turn ${candidate.turn.id} — request ${requestId} kept calling tools after the page reported it completed`
   );
-  return ended.turnId;
+  return reopened.turnId;
 }
 
 interface Target {
@@ -1660,6 +1712,7 @@ export interface ChatObservation {
     | 'page_tool'
     | 'turn_start'
     | 'turn_end'
+    | 'recording_gap'
     | 'chat_error'
     | 'tool_evidence';
   time: number;
@@ -1681,6 +1734,8 @@ export interface ChatObservation {
   /** Raw public provider message UUID, retained as evidence, never used to guess ownership. */
   providerMessageId?: string;
   turnId?: string;
+  /** turn_start only: exact native user message whose Send opened this local generation. */
+  openingUserMessageId?: string;
   final?: boolean;
   state?: 'streaming' | 'final';
   /** Internal React conversation id used only to cross-check the URL conversation id. */
@@ -1688,6 +1743,12 @@ export interface ChatObservation {
   outcome?: TurnOutcome;
   /** Provider/app machine reason. Recovery timing belongs to the main-process recovery lease. */
   reason?: 'thinking_failed' | 'no_visible_progress';
+  /** recording_gap only: why browser-recording evidence is incomplete. */
+  gapReason?: RecordingGapReason;
+  /** recording_gap only: structured kinds confirmed lost or unusable. */
+  lostKinds?: Partial<Record<RecordingGapLostKind, number>>;
+  /** recording_gap only: logical turn whose evidence was affected, when still known. */
+  affectedTurnId?: string;
   detail?: string;
   /** Browser terminal proof; app-owned Goal policy is applied only after this is durable. */
   goalEligible?: boolean;
@@ -1697,6 +1758,17 @@ export interface ChatObservation {
   blocking?: boolean;
   /** tool_evidence only: the connector requests this turn's message model holds. */
   calls?: PageCallEvidence[];
+}
+
+export interface RecordedObservationActivity {
+  meaningful: boolean;
+  working: boolean;
+  terminal: boolean;
+  at?: number;
+  toolStartedAt?: number;
+  endedTurnId?: string;
+  /** Start of the exact segment whose terminal boundary was accepted. */
+  endedSegmentStartedAt?: number;
 }
 
 /**
@@ -1817,7 +1889,7 @@ export function recordChatObservations(
 ): Promise<{
   sessionId: string | null;
   stored: number;
-  activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string };
+  activity: RecordedObservationActivity;
   goalCandidates: Array<{ replyId: string; turnId: string; source: AutomationSourceBoundary; eventSeq: number }>;
 }> {
   const hasEvidence = observations.some((item) => item.kind === 'tool_evidence');
@@ -1926,10 +1998,10 @@ async function recordChatObservationsNow(
 ): Promise<{
   sessionId: string | null;
   stored: number;
-  activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string };
+  activity: RecordedObservationActivity;
   goalCandidates: Array<{ replyId: string; turnId: string; source: AutomationSourceBoundary; eventSeq: number }>;
 }> {
-  const activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string } = { meaningful: false, working: false, terminal: false };
+  const activity: RecordedObservationActivity = { meaningful: false, working: false, terminal: false };
   if (!recordingEnabled()) return { sessionId: null, stored: 0, activity, goalCandidates: [] };
   if (!conversations.has(conversationId)) {
     const lineage = await supersededLineage(conversationId);
@@ -1962,14 +2034,13 @@ async function recordChatObservationsNow(
   if (!sessionId) return { sessionId: null, stored: 0, activity, goalCandidates: [] };
   const live = conversations.get(conversationId);
   let stored = 0;
-  let recoveredGoalSeen = false;
   const goalCandidates: Array<{ replyId: string; turnId: string; source: AutomationSourceBoundary; eventSeq: number }> = [];
   // Reload can lose or replace the page's turn id. The canonical message store keeps
   // the first exact owner of that stable assistant message through every revision.
   // Decide recovery from its committed result, never the replacement page's hint.
   // Only a turn already open before this batch qualifies; apply the end after all
   // observations so a newer turn or an explicit verdict cannot be overwritten.
-  const recoverableTurns = new Set(live?.openTurns);
+  const recoverableTurnId = live ? projectedActiveTurn(live)?.id ?? null : null;
   let recoveredFinal: { turnId: string; time: number; seq: number; origin: number; native: boolean } | undefined;
 
   for (const item of observations) {
@@ -2014,14 +2085,18 @@ async function recordChatObservationsNow(
         // therefore the exact fence; the stable reply id is the durable exactly-once identity.
         const batchUncertainStartedAt = batchUncertainEndId
           ? batchTurnStarts.get(batchUncertainEndId) ??
-            (live?.turnId === batchUncertainEndId ? live.turnStartedAt : null)
+            (live && projectedActiveTurn(live)?.id === batchUncertainEndId
+              ? projectedActiveTurn(live)!.logicalStartedAt
+              : null)
           : null;
+        const currentActive = live ? projectedActiveTurn(live) : null;
+        const currentLast = live ? projectedLastTurn(live) : null;
         const priorUncertainStartedAt =
-          live?.turnStartedAt === null &&
-          live.lastTurnOutcome !== null &&
-          live.lastTurnOutcome !== 'completed' &&
-          live.lastTurnOutcome !== 'stopped'
-            ? live.lastTurnStartedAt
+          !currentActive &&
+          currentLast !== null &&
+          currentLast.outcome !== 'completed' &&
+          currentLast.outcome !== 'stopped'
+            ? currentLast.logicalStartedAt
             : null;
         const uncertainTurnStartedAt = batchUncertainStartedAt ?? priorUncertainStartedAt;
         const terminalActivity =
@@ -2040,11 +2115,11 @@ async function recordChatObservationsNow(
           ...(item.providerMessageId ? { providerMessageId: item.providerMessageId } : {})
         });
         const candidateTurn = item.turnId ?? previousAssistant?.turnId ?? null;
-        const [boundaryBeforeEvidence] = candidateTurn && !live?.turnId
+        const [boundaryBeforeEvidence] = candidateTurn && !(live && projectedActiveTurn(live))
           ? await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] }) : [];
         const contentWillChange = !previousAssistant || previousAssistant.text !== (item.text ?? '') ||
           previousAssistant.state !== state || previousAssistant.final !== (state === 'final');
-        const canReopenFailedView = contentWillChange && candidateTurn && live && !live.turnId &&
+        const canReopenFailedView = contentWillChange && candidateTurn && live && !projectedActiveTurn(live) &&
           boundaryBeforeEvidence?.kind === 'turn_end' && boundaryBeforeEvidence.reason === 'thinking_failed' &&
           boundaryBeforeEvidence.turnId === candidateTurn && item.time > boundaryBeforeEvidence.time;
         // The correction belongs before the evidence that proves it. A native final is exact only
@@ -2075,18 +2150,24 @@ async function recordChatObservationsNow(
         // DOM after restart cannot renew work, nor can an old message borrow a
         // newer page turn. Preserve the revision while using its canonical owner
         // and the recorder's terminal boundary to decide activity.
-        const uncertainEnd = reopenedBeforeEvidence ? boundaryBeforeEvidence : canonicalTurn && !live?.turnId
+        const activeAfterWrite = live ? projectedActiveTurn(live) : null;
+        const lastAfterWrite = live ? projectedLastTurn(live) : null;
+        const uncertainEnd = reopenedBeforeEvidence ? boundaryBeforeEvidence : canonicalTurn && !activeAfterWrite
           ? (await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end', 'user_message'] }))[0] : undefined;
         // A fresh exact interim can resume an uncertain failure without inventing
         // a new user turn. Old messages and explicit completed/stopped turns cannot.
         const resumedUncertainTurn = uncertainEnd?.kind === 'turn_end' && uncertainEnd.turnId === canonicalTurn &&
           uncertainEnd.outcome !== 'completed' && uncertainEnd.outcome !== 'stopped' && item.time > uncertainEnd.time;
         const workingActivity = written.contentChanged && state !== 'final' && item.activeNow === true &&
-          (!canonicalTurn || canonicalTurn === live?.turnId || resumedUncertainTurn) &&
-          !(live?.turnStartedAt === null && (live.lastTurnOutcome === 'stopped' || live.lastTurnOutcome === 'completed'));
-        if (state === 'final' && written.event.kind === 'assistant_message' && canonicalTurn && recoverableTurns.has(canonicalTurn) &&
-            !explicitEnds.has(canonicalTurn) && live?.turnId === canonicalTurn) {
-          recoveredFinal = { turnId: canonicalTurn, time: item.time,
+          (!canonicalTurn || canonicalTurn === activeAfterWrite?.id || resumedUncertainTurn) &&
+          !(!activeAfterWrite && (lastAfterWrite?.outcome === 'stopped' || lastAfterWrite?.outcome === 'completed'));
+        if (state === 'final' && written.event.kind === 'assistant_message' && canonicalTurn && recoverableTurnId === canonicalTurn &&
+            !explicitEnds.has(canonicalTurn) && activeAfterWrite?.id === canonicalTurn) {
+          // ChatGPT's authored create_time can predate the moment this document actually proves
+          // the message final by minutes. A recovered lifecycle boundary is an observation, not
+          // authorship: using the old create_time lets a tool call that genuinely started before
+          // final observation appear to happen after the inferred end and falsely reopen the turn.
+          recoveredFinal = { turnId: canonicalTurn, time: item.authoredTime === true ? Date.now() : item.time,
             seq: written.event.finalContentSeq ?? written.event.origin ?? written.event.seq,
             origin: written.event.origin ?? written.event.seq, native: Boolean(written.event.providerMessageId) };
         }
@@ -2110,12 +2191,6 @@ async function recordChatObservationsNow(
             eventSeq: written.event.origin ?? written.event.seq
           });
         }
-        if (recoveredGoalEligible && live) {
-          // This is an in-memory verdict for later call/reload decisions, not a fabricated
-          // turn_end. The canonical message keeps goalEligible monotonically, so an HTTP 503
-          // can still replay the same obligation even after this stronger final evidence wins.
-          recoveredGoalSeen = true;
-        }
         if (!written.changed) continue;
         if (state === 'final' && written.event.kind === 'assistant_message' && written.event.providerMessageId && canonicalTurn &&
             reopenedBeforeEvidence === canonicalTurn && live) {
@@ -2130,8 +2205,11 @@ async function recordChatObservationsNow(
           // nothing about lifecycle state and must not gate this close.
           await appendEvent(sessionId, { ...base, kind: 'turn_end', turnId: canonicalTurn, outcome: 'completed',
             detail: 'the exact native final completed the turn after its failed view was superseded' });
-          projectTurnEnd(live, canonicalTurn, 'completed', item.time);
-          activity.endedTurnId = canonicalTurn;
+          const projected = projectTurnEnd(live, canonicalTurn, 'completed', item.time);
+          if (projected.current) {
+            activity.endedTurnId = canonicalTurn;
+            if (projected.segmentStartedAt !== null) activity.endedSegmentStartedAt = projected.segmentStartedAt;
+          }
           activity.terminal = true;
           activity.meaningful = true;
         }
@@ -2154,9 +2232,23 @@ async function recordChatObservationsNow(
           activity.meaningful = true;
           activity.at = Math.max(activity.at ?? 0, item.time);
         }
-        if (newlyObserved && item.turnId === live?.turnId && live.turnStartedAt !== null && item.time >= live.turnStartedAt) {
+        const active = live ? projectedActiveTurn(live) : null;
+        if (newlyObserved && active && item.turnId === active.id && active.segmentStartedAt !== null &&
+            item.time >= active.segmentStartedAt) {
           activity.toolStartedAt = Math.max(activity.toolStartedAt ?? 0, item.time);
         }
+        break;
+      }
+      case 'recording_gap': {
+        const gap = await appendEvent(sessionId, {
+          ...base,
+          kind: 'recording_gap',
+          reason: item.gapReason ?? 'bridge_rejected_observation',
+          ...(item.lostKinds ? { lostKinds: item.lostKinds } : {}),
+          ...(item.affectedTurnId ? { affectedTurnId: item.affectedTurnId } : {}),
+          ...(item.detail ? { detail: item.detail } : {})
+        });
+        if (live) reduceTurnLifecycleEvent(live, gap);
         break;
       }
       case 'chat_error': {
@@ -2192,18 +2284,32 @@ async function recordChatObservationsNow(
         // always mints/adopts a local id before announcing a start, so an unnamed boundary is
         // stale/legacy noise and must fail closed here as well.
         if (!item.turnId) continue;
-        // /events is intentionally at-least-once. A response can be lost after commit, so the
-        // service worker may replay the exact same local lifecycle id. Never turn that transport
-        // retry into a second durable boundary or reopen a turn that already ended.
-        if (live?.knownTurnStarts.has(item.turnId) || live?.knownTurnEnds.has(item.turnId)) continue;
-        await appendEvent(sessionId, { ...base, kind: 'turn_start' });
+        // /events is intentionally at-least-once. Same turn/same opening is transport replay;
+        // same turn/different opening is contradictory immutable evidence and must be durable.
+        const startDisposition = live
+          ? turnStartDisposition(live, item.turnId, item.openingUserMessageId ?? null)
+          : 'new';
+        if (startDisposition === 'replay') continue;
+        const lifecycleEvent = startDisposition === 'new'
+          ? await appendEvent(sessionId, {
+              ...base,
+              kind: 'turn_start',
+              ...(item.openingUserMessageId ? { openingUserMessageId: item.openingUserMessageId } : {})
+            })
+          : item.openingUserMessageId
+            ? await appendEvent(sessionId, {
+              ...base,
+              kind: 'turn_identity',
+              turnId: item.turnId,
+              openingUserMessageId: item.openingUserMessageId
+            })
+            : null;
+        if (!lifecycleEvent) continue;
         // Commit before publishing the lifecycle projection. If append rejects, the same
         // browser event remains eligible for its normal at-least-once retry.
-        if (live) {
-          // Turn lifecycle is presentation/recovery state only in 1.8. It is never consulted
-          // for MCP ownership, so a replayed journal timestamp cannot misattribute a call.
-          projectTurnStart(live, item.turnId, item.time);
-        }
+        if (live) reduceTurnLifecycleEvent(live, lifecycleEvent);
+        // Identity updates/conflicts are durable evidence but not second lifecycle transitions.
+        if (startDisposition !== 'new') break;
         activity.meaningful = true; activity.at = Math.max(activity.at ?? 0, item.time);
         activity.working = true;
         break;
@@ -2212,12 +2318,12 @@ async function recordChatObservationsNow(
         // turn happened to be live. Ignore it. A stale named end is still useful history for
         // the turn it names, but it must not tear down a newer active generation.
         if (!item.turnId) continue;
-        if (live?.knownTurnEnds.has(item.turnId)) continue;
-        if (live?.turnId === item.turnId) {
+        if (live && turnRecord(live, item.turnId)?.phase === 'ended') continue;
+        if (live && projectedActiveTurn(live)?.id === item.turnId) {
           const [latest] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
           if (latest?.kind === 'turn_start' && latest.source === 'app' && latest.turnId === item.turnId && latest.time >= item.time) continue;
         }
-        await appendEvent(sessionId, {
+        const end = await appendEvent(sessionId, {
           ...base,
           kind: 'turn_end',
           outcome: item.outcome ?? 'unknown',
@@ -2226,8 +2332,11 @@ async function recordChatObservationsNow(
         });
         // As above, durable journal state owns idempotency; in-memory state follows it.
         if (live) {
-          const projected = projectTurnEnd(live, item.turnId, item.outcome ?? 'unknown', item.time);
-          if (projected.current) activity.endedTurnId = item.turnId;
+          const projected = reduceTurnLifecycleEvent(live, end);
+          if (projected?.current) {
+            activity.endedTurnId = item.turnId;
+            if (projected.segmentStartedAt !== null) activity.endedSegmentStartedAt = projected.segmentStartedAt;
+          }
         }
         if (item.outcome !== 'unknown') {
           activity.meaningful = true;
@@ -2262,23 +2371,24 @@ async function recordChatObservationsNow(
     priorBoundary.turnId === recoveredFinal.turnId && priorBoundary.outcome === 'completed';
   if (recoveredFinal && latestWork && (latestWork.seq < recoveredFinal.seq || nativeReopen) &&
       (!latestUser || (latestUser.kind === 'user_message' && (latestUser.origin ?? latestUser.seq) < recoveredFinal.origin)) &&
-      runningToolCalls(conversationId) === 0 && live?.turnId === recoveredFinal.turnId && live.openTurns.has(recoveredFinal.turnId)) {
+      runningToolCalls(conversationId) === 0 && live && projectedActiveTurn(live)?.id === recoveredFinal.turnId &&
+      turnRecord(live, recoveredFinal.turnId)?.phase === 'unclosed') {
     const { turnId, time } = recoveredFinal;
-    await appendEvent(sessionId, {
+    const recoveredEnd = await appendEvent(sessionId, {
       time, source: 'extension', kind: 'turn_end', turnId, outcome: 'completed',
       detail: 'recovered from a final assistant message after the ChatGPT page reloaded',
       ...(agent ? { agent } : {})
     });
     // Commit before publishing, preserving the same late-tool evidence as an explicit end.
     // Native message time may be its creation time, long before this final was observed.
-    projectTurnEnd(live, turnId, 'completed', Date.now());
+    const projected = reduceTurnLifecycleEvent(live, recoveredEnd)!;
     activity.meaningful = true;
     activity.at = Math.max(activity.at ?? 0, time);
     activity.terminal = true;
     activity.endedTurnId = turnId;
+    if (projected.segmentStartedAt !== null) activity.endedSegmentStartedAt = projected.segmentStartedAt;
     stored++;
   }
-  if (recoveredGoalSeen && live) live.lastTurnOutcome = 'completed';
   notifyChanged();
   return { sessionId, stored, activity, goalCandidates };
 }
@@ -2430,12 +2540,13 @@ export async function ensureHandoffRecorded(
 export async function closeConversation(conversationId: string): Promise<void> {
   const live = conversations.get(conversationId);
   if (!live) return;
-  if (live.turnStartedAt !== null) {
+  const active = projectedActiveTurn(live);
+  if (active) {
     await appendEvent(live.sessionId, {
       time: Date.now(),
       source: 'extension',
       kind: 'note',
-      ...(live.turnId ? { turnId: live.turnId } : {}),
+      turnId: active.id,
       message: await storeText(
         live.sessionId,
         'the ChatGPT page detached while this turn was still open; the turn stays open until real evidence ends it',
@@ -2471,15 +2582,7 @@ export function rebindConversation(sessionId: string, fromConversationId: string
   conversations.set(toConversationId, {
     conversationId: toConversationId,
     sessionId,
-    turnStartedAt: null,
-    turnId: null,
-    openTurns: new Set<string>(),
-    knownTurnStarts: new Set<string>(),
-    knownTurnEnds: new Set<string>(),
-    lastTurnOutcome: null,
-    lastTurnStartedAt: null,
-    turnRequestIds: new Set<string>(),
-    endedTurn: null,
+    ...emptyTurnLifecycleProjection(),
     pageTools: new Map()
   });
   lastActiveSessionId = sessionId;

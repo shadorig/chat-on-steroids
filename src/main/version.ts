@@ -78,4 +78,10 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
 // 17 — source-chat Send checkpoints use the same exclusive claim/arm/release action vocabulary as
 // replacement-chat checkpoints. A 16 page can otherwise present contradictory source booleans to
 // a newer background worker after extension reload, so mixed documents are rejected explicitly.
-export const BRIDGE_PROTOCOL = 17;
+// 18 — page-authored turn starts are self-contained (`turnId` + exact opening native user-message
+// identity). Invalid lifecycle observations are accepted in place as typed `recording_gap` history
+// rather than creating a partial-ack protocol, and /activity exposes one tracked `{ id, live,
+// adoption }` turn so durable ownership, process liveness and replacement-document adoption cannot
+// collapse into the same nullable bit. A 17 page reconstructs the opening boundary from DOM position
+// and cannot interpret those authority/integrity semantics, so mixed peers must fail loudly.
+export const BRIDGE_PROTOCOL = 18;

@@ -602,6 +602,13 @@ async function timelineItem(
       const message = await exactStored(sessionId, event.message);
       return item(event, `${when}${agent} ERROR\n${message}`, 'error');
     }
+    case 'recording_gap':
+      if (!include.has('errors')) return null;
+      return item(
+        event,
+        `${when}${agent} RECORDING GAP\n${event.detail || 'Part of this browser recording could not be verified.'}`,
+        'recording gap'
+      );
     case 'turn_end':
       if (!include.has('errors') || event.outcome === 'completed') return null;
       return item(
@@ -751,6 +758,7 @@ function searchCategory(event: SessionEvent): string | null {
     case 'page_tool':
       return 'tools';
     case 'chat_error':
+    case 'recording_gap':
       return 'errors';
     case 'agent_message':
       return 'agents';

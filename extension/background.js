@@ -40,7 +40,7 @@ const MODEL_REQUEST_TIMEOUT_MS = 190_000;
 /** The reason a deadline aborts with, so it is a fact the caller can act on rather than prose. */
 const TIMED_OUT = 'the app took too long to answer';
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 17;
+const BRIDGE_PROTOCOL = 18;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -297,6 +297,11 @@ async function loadOnce() {
   ]);
   settled = Array.isArray(live.settled) ? live.settled : [];
   journal = Array.isArray(live.journal) ? live.journal : [];
+  // A restored loss marker may have reached the app before this worker died while its ACK did
+  // not. Object identity cannot prove otherwise after restart, so restored gaps are immutable.
+  for (const entry of journal) {
+    if (entry?.event?.kind === 'recording_gap') frozenJournalGaps.add(entry);
+  }
   tabConversations =
     live.tabConversations && typeof live.tabConversations === 'object' && !Array.isArray(live.tabConversations)
       ? { ...live.tabConversations }
@@ -382,34 +387,25 @@ function persistLive() {
  *
  * Chrome stops the service worker after seconds of idling, so an in-memory journal is
  * not a journal at all. If the write is refused the size estimate was optimistic, so
- * compact harder and try once more; only if *that* fails is durability genuinely lost,
- * and then the journal says so in place rather than pretending it is safe.
+ * compact harder and try once more. If that still fails, the observations remain queued in
+ * this worker and delivery reports `durable: false`; volatile crash risk is not rewritten as
+ * confirmed history loss. Only an observation we actually discard/reject becomes a gap.
  */
-let durabilityGap = false;
 let journalWriteQueue = Promise.resolve();
 
 async function persistJournalNow() {
   try {
     await chrome.storage.session.set({ journal });
-    durabilityGap = false;
     return true;
   } catch {
-    makeRoom(true);
+    if (!makeRoom(true)) return false;
     try {
       await chrome.storage.session.set({ journal });
-      durabilityGap = false;
       return true;
-    } catch (err) {
-      if (!durabilityGap) {
-        durabilityGap = true;
-        journal.push(
-          gapEntry(
-            journal.length > 0 ? journal[journal.length - 1] : null,
-            'chat_error',
-            '⚠ The browser refused to store this extension’s pending observations. Until the app accepts them they exist only in memory, so closing the browser or reloading the extension would lose them.'
-          )
-        );
-      }
+    } catch {
+      // The observations still exist in this worker and may all reach the app. A failed
+      // storage.session write is crash-durability risk, not proof that history is missing.
+      // Only confirmed discard/rejection becomes a durable recording_gap.
       return false;
     }
   }
@@ -435,7 +431,7 @@ function persistJournal() {
  * Progress lines are not among them: they are dense, repetitive, and their outline can
  * be inferred from what surrounds them. A user message cannot be inferred from anything.
  */
-const ESSENTIAL = new Set(['user_message', 'assistant_message', 'chat_error', 'turn_start', 'turn_end']);
+const ESSENTIAL = new Set(['user_message', 'assistant_message', 'recording_gap', 'chat_error', 'turn_start', 'turn_end']);
 
 /**
  * Cached per-entry serialised size, kept out-of-band so measuring an entry does not
@@ -494,8 +490,52 @@ function routeKey(entry) {
   return JSON.stringify([route.conversationId, route.provisional, route.agent, route.agentCommandId]);
 }
 
-function gapEntry(source, kind, text) {
-  return { ...routeOf(source), gap: true, event: { kind, time: Date.now(), text } };
+const RECORDING_GAP_KINDS = new Set([
+  'model_selection', 'conversation_title',
+  'user_message', 'assistant_message', 'page_tool', 'progress', 'turn_start', 'turn_end',
+  'chat_error', 'tool_evidence', 'recording_gap', 'unknown'
+]);
+
+/** Once an exact gap payload enters an HTTP batch, later compaction must not mutate it. */
+const frozenJournalGaps = new WeakSet();
+
+function recordingLoss(source) {
+  const event = source?.event || {};
+  if (event.kind === 'recording_gap') {
+    const counts = {};
+    if (event.lostKinds && typeof event.lostKinds === 'object') {
+      for (const [kind, raw] of Object.entries(event.lostKinds)) {
+        if (RECORDING_GAP_KINDS.has(kind) && Number.isSafeInteger(raw) && raw > 0) counts[kind] = raw;
+      }
+    }
+    return {
+      counts: Object.keys(counts).length ? counts : { unknown: 1 },
+      affectedTurnId: typeof event.affectedTurnId === 'string' && event.affectedTurnId ? event.affectedTurnId : null
+    };
+  }
+  const sourceKind = event.kind;
+  return {
+    counts: typeof sourceKind === 'string' ? { [RECORDING_GAP_KINDS.has(sourceKind) ? sourceKind : 'unknown']: 1 } : { unknown: 1 },
+    affectedTurnId: typeof event.turnId === 'string' && event.turnId ? event.turnId : null
+  };
+}
+
+function recordingGapEntry(source, reason, detail = '', lostKinds = null) {
+  const loss = recordingLoss(source);
+  const counts = lostKinds ? { ...lostKinds } : loss.counts;
+  const affectedTurnId = loss.affectedTurnId;
+  return {
+    ...routeOf(source),
+    gap: true,
+    event: {
+      kind: 'recording_gap',
+      time: Number.isFinite(source?.event?.time) ? source.event.time : Date.now(),
+      reason,
+      lostKinds: counts,
+      ...(affectedTurnId ? { affectedTurnId } : {}),
+      ...(detail ? { detail } : {})
+    }
+  };
 }
 
 /**
@@ -521,7 +561,6 @@ function makeRoom(tighten = false) {
   // discarded row still made quota compaction quadratic under a long outage.
   let bytes = totalBytes();
   const fits = () => journal.length <= countCap && bytes <= byteCap;
-  if (fits()) return;
 
   const removeAt = (index) => {
     const before = journal.length;
@@ -535,18 +574,123 @@ function makeRoom(tighten = false) {
     journal.splice(Math.min(index, journal.length), 0, entry);
     bytes += sizeOf(entry) + comma;
   };
-  /** Updates a gap and keeps the running exact serialised size in sync. */
-  const setGapText = (gap, text) => {
-    const before = sizeOf(gap);
-    gap.event.text = text;
-    sizeCache.delete(gap);
-    bytes += sizeOf(gap) - before;
+  /** The only supported mutation of a measured journal row. */
+  const mutateEntry = (entry, mutate) => {
+    const before = sizeOf(entry);
+    mutate(entry);
+    sizeCache.delete(entry);
+    bytes += sizeOf(entry) - before;
   };
+
+  const lossCount = (counts) => Object.values(counts).reduce((sum, count) => sum + (Number(count) || 0), 0);
+  const compatibleGap = (entry, key) => !!entry && !frozenJournalGaps.has(entry) && entry.gap === true &&
+    entry.event?.kind === 'recording_gap' && entry.event.reason === 'worker_journal_overflow' && routeKey(entry) === key;
+  const addLoss = (gap, loss) => {
+    const beforeCounts = gap.event.lostKinds && typeof gap.event.lostKinds === 'object' ? gap.event.lostKinds : {};
+    const counts = { ...beforeCounts };
+    const beforeCount = lossCount(counts);
+    for (const [kind, raw] of Object.entries(loss.counts)) counts[kind] = (Number(counts[kind]) || 0) + Number(raw);
+    mutateEntry(gap, (row) => {
+      row.event.lostKinds = counts;
+      if (beforeCount === 0 && loss.affectedTurnId) row.event.affectedTurnId = loss.affectedTurnId;
+      else if (!loss.affectedTurnId || row.event.affectedTurnId !== loss.affectedTurnId) delete row.event.affectedTurnId;
+      const detail = Object.entries(counts)
+        .filter(([, count]) => Number(count) > 0)
+        .map(([lostKind, count]) => `${count} ${lostKind}`)
+        .join(', ');
+      row.event.detail = `${lossCount(counts)} browser observation(s) (${detail}) were dropped before the app accepted them because the service-worker journal reached its storage limit.`;
+    });
+  };
+
+  const routeNeighbor = (index, key, step) => {
+    for (let at = index; at >= 0 && at < journal.length; at += step) {
+      if (routeKey(journal[at]) === key) return { index: at, entry: journal[at] };
+    }
+    return null;
+  };
+
+  // Chronology belongs to one delivery route, not to this multiplexed transport array. A row from
+  // chat B cannot split two adjacent loss regions in chat A because B is never written into A's
+  // durable session history. A retained A row still is a boundary. Offered/restored gaps are never
+  // mutated; compaction may only replace them with new evidence in the emergency pass below.
+  const recordLossAt = (index, entry) => {
+    const key = routeKey(entry);
+    const loss = recordingLoss(entry);
+    const left = routeNeighbor(index - 1, key, -1);
+    const right = routeNeighbor(index, key, 1);
+    if (compatibleGap(left?.entry, key)) {
+      addLoss(left.entry, loss);
+      if (right && compatibleGap(right.entry, key)) {
+        addLoss(left.entry, recordingLoss(right.entry));
+        removeAt(right.index);
+      }
+      return;
+    }
+    if (right && compatibleGap(right.entry, key)) {
+      mutateEntry(right.entry, (gap) => {
+        if (Number.isFinite(entry.event?.time)) gap.event.time = Math.min(Number(gap.event.time) || entry.event.time, entry.event.time);
+      });
+      addLoss(right.entry, loss);
+      return;
+    }
+    const gap = recordingGapEntry(entry, 'worker_journal_overflow', '', {});
+    insertAt(index, gap);
+    addLoss(gap, loss);
+  };
+
+  const collapseGapEvidence = () => {
+    const byRoute = new Map();
+    for (const entry of journal) {
+      if (entry?.event?.kind !== 'recording_gap') continue;
+      const key = routeKey(entry);
+      let aggregate = byRoute.get(key);
+      if (!aggregate) {
+        aggregate = {
+          source: entry,
+          time: Number.isFinite(entry.event.time) ? entry.event.time : Date.now(),
+          counts: {},
+          affectedTurnId: undefined,
+          scoped: true
+        };
+        byRoute.set(key, aggregate);
+      }
+      const loss = recordingLoss(entry);
+      aggregate.time = Math.min(aggregate.time, Number.isFinite(entry.event.time) ? entry.event.time : aggregate.time);
+      for (const [kind, raw] of Object.entries(loss.counts)) {
+        aggregate.counts[kind] = (Number(aggregate.counts[kind]) || 0) + Number(raw);
+      }
+      if (aggregate.scoped) {
+        if (!loss.affectedTurnId) {
+          aggregate.scoped = false;
+          aggregate.affectedTurnId = undefined;
+        } else if (aggregate.affectedTurnId === undefined) {
+          aggregate.affectedTurnId = loss.affectedTurnId;
+        } else if (aggregate.affectedTurnId !== loss.affectedTurnId) {
+          aggregate.scoped = false;
+          aggregate.affectedTurnId = undefined;
+        }
+      }
+    }
+    journal = [...byRoute.values()].map((aggregate) => {
+      const gap = recordingGapEntry(aggregate.source, 'worker_journal_overflow', '', aggregate.counts);
+      gap.event.time = aggregate.time;
+      if (aggregate.scoped && aggregate.affectedTurnId) gap.event.affectedTurnId = aggregate.affectedTurnId;
+      else delete gap.event.affectedTurnId;
+      const detail = Object.entries(aggregate.counts)
+        .filter(([, count]) => Number(count) > 0)
+        .map(([kind, count]) => `${count} ${kind}`)
+        .join(', ');
+      gap.event.detail = `${lossCount(aggregate.counts)} browser observation(s) (${detail}) were dropped before the app accepted them because the service-worker journal reached its storage limit; older loss regions for this route were conservatively combined.`;
+      return gap;
+    });
+    bytes = totalBytes();
+  };
+
+  if (fits()) return true;
 
   // Pass one: progress and other non-essential lines, oldest first. The gap marker is
   // inserted on the first removal and counts against the limits while we keep trimming,
   // so pressure can never make the algorithm delete its own evidence of what was lost.
-  const progressGaps = new Map();
   let progressAt = 0;
   while (!fits()) {
     while (
@@ -559,57 +703,33 @@ function makeRoom(tighten = false) {
     const index = progressAt;
     const entry = removeAt(index);
     if (!entry) break;
-    const key = routeKey(entry);
-    let bucket = progressGaps.get(key);
-    if (!bucket) {
-      bucket = { gap: gapEntry(entry, 'progress', ''), dropped: 0 };
-      progressGaps.set(key, bucket);
-      insertAt(index, bucket.gap);
-      progressAt = index + 1;
-    }
-    bucket.dropped++;
-    setGapText(
-      bucket.gap,
-      `⚠ ${bucket.dropped} progress line(s) observed here were dropped in the browser before the app accepted them. The app was unreachable and the local queue was full.`
-    );
+    recordLossAt(index, entry);
+    progressAt = index;
   }
-  if (fits()) return;
+  if (fits()) return true;
 
   // Pass two: essentials themselves have to go. This is real loss, so keep one durable
   // marker naming exactly what kinds disappeared. As above, the marker is present while
   // trimming, which guarantees the final journal is genuinely inside both caps.
-  const lossGaps = new Map();
   let lossAt = 0;
   while (!fits()) {
-    while (lossAt < journal.length && journal[lossAt].gap) lossAt++;
+    while (lossAt < journal.length && (journal[lossAt].gap || frozenJournalGaps.has(journal[lossAt]))) lossAt++;
     if (lossAt >= journal.length) break;
     const index = lossAt;
     const entry = removeAt(index);
     if (!entry) break;
-    const key = routeKey(entry);
-    let bucket = lossGaps.get(key);
-    if (!bucket) {
-      bucket = { gap: gapEntry(entry, 'chat_error', ''), lost: 0, counts: {} };
-      lossGaps.set(key, bucket);
-      insertAt(index, bucket.gap);
-      lossAt = index + 1;
-    }
-    bucket.lost++;
-    bucket.counts[entry.event.kind] = (bucket.counts[entry.event.kind] || 0) + 1;
-    const detail = Object.entries(bucket.counts)
-      .map(([kind, count]) => `${count} ${kind}`)
-      .join(', ');
-    setGapText(
-      bucket.gap,
-      `⚠ ${bucket.lost} observation(s) (${detail}) were lost in the browser before the app accepted them: the local journal hit its storage limit while the app was unreachable. This part of the history is incomplete.`
-    );
+    recordLossAt(index, entry);
+    lossAt = index;
   }
+  if (!fits()) collapseGapEvidence();
+  return fits();
 }
 
 function enqueue(entries) {
+  const normalized = [];
   for (const entry of entries) {
     if (!entry || !entry.event || typeof entry.event.kind !== 'string') continue;
-    journal.push({
+    normalized.push({
       conversationId: typeof entry.conversationId === 'string' ? entry.conversationId : null,
       // Observations made before ChatGPT has assigned a conversation id are held under
       // the tab that saw them; bindProvisional() renames them once the id exists.
@@ -619,7 +739,38 @@ function enqueue(entries) {
       event: entry.event
     });
   }
-  makeRoom();
+  if (normalized.length === 0) return true;
+
+  // One independently routable history needs at least one loss marker in the worst case. Refuse
+  // custody before accepting a batch whose route cardinality alone cannot fit the hard count cap;
+  // the page will retain and retry the exact batch instead of the worker silently dropping it.
+  const routes = new Set(journal.map(routeKey));
+  for (const entry of normalized) routes.add(routeKey(entry));
+  if (routes.size > MAX_JOURNAL) return false;
+
+  const projectedBytes = totalBytes() + normalized.reduce((sum, entry) => sum + sizeOf(entry) + 1, 0);
+  const mayCompact = journal.length + normalized.length > MAX_JOURNAL || projectedBytes > MAX_JOURNAL_BYTES;
+  const rollback = mayCompact
+    ? journal.map((entry) => ({
+        ...entry,
+        event: entry?.event && typeof entry.event === 'object'
+          ? {
+              ...entry.event,
+              ...(entry.event.lostKinds && typeof entry.event.lostKinds === 'object'
+                ? { lostKinds: { ...entry.event.lostKinds } }
+                : {})
+            }
+          : entry.event
+      }))
+    : null;
+  journal.push(...normalized);
+  if (makeRoom()) return true;
+
+  // This can only be reached when even one conservative marker per route cannot satisfy a byte
+  // bound. Restore the last bounded state and refuse custody; the caller still owns the batch.
+  journal = rollback || [];
+  for (const entry of journal) if (entry?.event?.kind === 'recording_gap') frozenJournalGaps.add(entry);
+  return false;
 }
 
 /**
@@ -724,6 +875,7 @@ function nextJournalBatch(preferredConversationId = null, excluded = []) {
 
 async function deliverJournalBatch(batch) {
   const { conversationId, mine, agent, agentCommandId } = batch;
+  for (const entry of mine) if (entry?.event?.kind === 'recording_gap') frozenJournalGaps.add(entry);
   const result = await call('/events', {
     method: 'POST',
     body: JSON.stringify({
@@ -749,14 +901,14 @@ async function deliverJournalBatch(batch) {
   }
   if (result.status === 413 && mine.length === 1) {
     const rejected = mine[0];
-    journal = journal.filter((entry) => entry !== rejected);
-    journal.unshift(
-      gapEntry(
+    const index = journal.indexOf(rejected);
+    if (index >= 0) {
+      journal.splice(index, 1, recordingGapEntry(
         rejected,
-        'chat_error',
-        '⚠ One browser observation was too large for the local bridge and was replaced by this explicit gap.'
-      )
-    );
+        'observation_too_large',
+        'One browser observation was too large for the local bridge and was replaced by this explicit recording gap.'
+      ));
+    }
     return true;
   }
   if (!result.ok) {
@@ -765,15 +917,13 @@ async function deliverJournalBatch(batch) {
     // auth, throttling and server failures remain retryable.
     if (result.status >= 400 && result.status < 500 && ![401, 408, 409, 426, 429].includes(result.status)) {
       const rejected = mine[0];
-      journal = journal.filter((entry) => entry !== rejected);
-      if (!rejected.gap) {
-        journal.unshift(
-          gapEntry(
-            rejected,
-            'chat_error',
-            `⚠ One browser observation was rejected by the local bridge (HTTP ${result.status}) and was replaced by this explicit gap.`
-          )
-        );
+      const index = journal.indexOf(rejected);
+      if (index >= 0) {
+        journal.splice(index, 1, recordingGapEntry(
+          rejected,
+          'bridge_rejected_observation',
+          `One browser observation was rejected by the local bridge (HTTP ${result.status}) and was replaced by this explicit recording gap.`
+        ));
       }
       return true;
     }
@@ -2971,7 +3121,13 @@ const HANDLERS = {
     const entries = (Array.isArray(message.entries) ? message.entries : []).map((entry) =>
       entry && !entry.conversationId ? { ...entry, provisional: key } : entry
     );
-    enqueue(entries);
+    if (!enqueue(entries)) {
+      // The worker has reached the point where even conservative route-local loss evidence cannot
+      // fit without exceeding its hard bound. Do not take partial custody: the page still owns the
+      // exact batch and will retry after the existing journal drains.
+      scheduleRetry();
+      return { ok: false, error: 'journal_capacity', retryable: true };
+    }
     let ackBound = 0;
     if (message.conversationId) {
       bindProvisional(key, message.conversationId);
@@ -3588,7 +3744,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
  * receive both its static manifest injection and this recovery injection.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 11;
+const PAGE_RECORDER_VERSION = 12;
 
 let deferredRecoveryWork = null;
 

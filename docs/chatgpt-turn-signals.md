@@ -24,9 +24,10 @@ continued. Corrections are represented by later journal events rather than rewri
 | Did the conversation go away mid-turn? | the browser *released* the tab's claim | `extension/background.js` → bridge → `closeConversation()` |
 
 Page-observed endings are folded into one decision in `endOutcome()`
-(`extension/content.js:1317`). The recorder independently writes `unknown` when
-`closeConversation()` releases a conversation with an open turn. Both paths are deliberately
-conservative: an unexplained stop stays `unknown`, never "the model hit its limit".
+(`extension/content.js`). Browser detach is deliberately **not** another ending signal:
+`closeConversation()` releases the process-local attachment and records a diagnostic note while
+leaving any named durable turn open. An actually observed terminal that cannot be classified more
+strongly may still be `unknown`; absence of a page is not enough to manufacture one.
 
 ### The outcome vocabulary
 
@@ -39,7 +40,7 @@ conservative: an unexplained stop stays `unknown`, never "the model hit its limi
 | `stopped` | the user clicked Stop | no — and never retry it |
 | `interrupted` | ChatGPT marked the turn interrupted | no |
 | `stalled` | no visible progress for `STALL_MS` (ten minutes) | no |
-| `unknown` | the conversation was released mid-turn, or stopped for a reason it did not give | no — **this is the reload shape** |
+| `unknown` | the page emitted a terminal observation that could not be classified more strongly | no |
 
 ### Lifecycle correction invariant
 
@@ -59,6 +60,19 @@ The old `turn_end` remains history. It is never deleted or revised into `complet
 fold and the shared chronological projection must understand the app-authored same-id reopen as a
 new bounded segment. This makes restart/replay deterministic and keeps the renderer, Goal and
 recovery readers from inventing different meanings for “terminal.”
+
+The current durable lifecycle/Protocol contract is owned by `docs/architecture/sessions-browser.md`.
+The provider-page observation relevant here is chronological: equal `data-turn-id` values may
+reappear after an intervening user message, so transcript groups preserve document order and only
+coalesce adjacent split sections. There is deliberately no global same-id grouping: a provider id
+reused across two user-response intervals is not one semantic response and must not merge their tool
+rows. Response ownership starts at the unique rendered occurrence of the exact opening user message
+and ends at the next user row. A document that witnessed Send gets one narrow exception: React may
+keep writing into the exact immediately preceding assistant node that the document sampled before
+Send, but node mutation alone is insufficient because late citations/media/formatting can also change
+that historical node. The exception requires both exact node continuity **and** a changed stable Fiber
+response-message identity. Mutations in older historical responses, a same-identity hydration,
+remounted clones and ambiguous duplicate openings are not ownership evidence.
 
 ---
 
@@ -91,7 +105,9 @@ never on "prose appeared" and never on "tool calls stopped".**
 
 ## 3. The detach / stale shape
 
-Observed live on 2026-08-30, and the reason this file exists:
+Observed live on 2026-08-30, and the reason this file exists. The bullets below describe the
+historical failure shape that motivated recovery; current code deliberately no longer turns detach
+into a lifecycle terminal:
 
 - the turn detached mid-generation **while tool calls were still active**
 - the app recorded:
@@ -100,8 +116,7 @@ Observed live on 2026-08-30, and the reason this file exists:
 - a **new turn then started**
 - Chrome showed **no assistant text** and the **blue Stop button still present**
 
-That message is emitted by `closeConversation()` (`src/main/session/recorder.ts:1733`) when a turn
-was still open:
+The old implementation synthesized this row from `closeConversation()`:
 
 ```ts
 kind: 'turn_end',
@@ -109,7 +124,12 @@ outcome: 'unknown',
 detail: 'the ChatGPT page detached while generating; outcome may be recovered when the chat reopens'
 ```
 
-**It is not driven by `pagehide`.** `content.js`'s `pagehide` handler deliberately flushes queued
+Current `closeConversation()` instead records a diagnostic `note` and leaves the named turn open.
+A browser/document disappearing is evidence that observation stopped, not evidence that the
+provider generation ended. Real later page/Fiber evidence writes the eventual `turn_end`, or the
+same durable open turn is restored/adopted when exact opening authority exists.
+
+**Detach is not driven by `pagehide`.** `content.js`'s `pagehide` handler deliberately flushes queued
 observations and then does nothing else — a document unload also happens on an ordinary reload, and
 closing there "corrupts live turn identity" and produced a flood of `session … reopened` churn.
 
@@ -121,24 +141,20 @@ Conversation lifetime is owned by the service worker's tab tracking instead:
   script when another concrete conversation id appears.
 
 Either path calls `releaseTab`, which reaches the app over the bridge, and only then does
-`closeConversation()` write the event. So the durable signal means *the browser reported the
-conversation actually released*, not *a document unloaded*.
+`closeConversation()` release the process-local attachment. The session can become inactive while
+its durable turn lifecycle remains open; those are deliberately separate facts.
 
-Why `unknown` and not `interrupted`: even a genuine release cannot tell whether the work died with
-the page — ChatGPT may keep a server-side generation alive while the page is absent. Calling it
-"interrupted" made an ordinary reload look like a failed turn.
-
-**This is already a first-class, durable, queryable signal.** A recovery rule does not need new
-detection — it needs to read `turn_end` events whose `outcome` is `unknown` and whose session has
-not since produced a later `completed` one. `recordChatObservations` reconciles the pair when the
-chat reopens, so a stale `unknown` that was really fine repairs itself.
+Why no synthetic `unknown`: even a genuine release cannot tell whether the work died with the page
+— ChatGPT may keep a server-side generation alive while the page is absent. A guessed terminal makes
+the exact turn recovery is meant to resume unreachable. Detach therefore changes attachment/session
+liveness, not the lifecycle reducer.
 
 ### Distinguishing the shapes that look alike
 
 | What you see | Outcome recorded | Reload? |
 | --- | --- | --- |
 | User clicked Stop | `stopped` | **never** |
-| Conversation released mid-generation | `unknown` + the detail above | yes |
+| Conversation released mid-generation | no synthetic outcome; open turn + detach note | yes |
 | Ten minutes of no progress | `stalled` | yes |
 | Visible error banner | `failed` | depends on the banner |
 | Turn closed normally | `completed` | no |
@@ -237,12 +253,13 @@ Derived from the above, with no new detection required:
 
 1. **"Prime finished"** is `turn_end` with `outcome: 'completed'`. Nothing else qualifies —
    not prose, not tool calls stopping.
-2. **"Needs a reload"** is a `turn_end` with `outcome: 'unknown'` (especially with the detach
-   detail) or `'stalled'`, with no later `completed` for that session.
+2. **"Needs recovery attention"** is evidence such as an explicit `stalled`/recoverable provider
+   failure, or a durable open turn whose browser attachment disappeared and has not since produced
+   stronger terminal evidence. Detach itself is not converted into `turn_end unknown`.
 3. **"Leave it alone"** is `outcome: 'stopped'`. The user made that decision by hand.
-4. **Reconciliation already exists**: if the chat reopens and produces a real final message, the
-   recorder resolves the earlier `unknown` into a later completed turn, so acting on `unknown`
-   must be idempotent and must re-check before it types anything.
+4. **Reconciliation already exists**: if the chat reopens, the same durable open turn can be
+   adopted when exact opening authority exists; a real final message then writes its terminal
+   boundary. Recovery actions must remain idempotent and re-check authority before acting.
 
 ---
 

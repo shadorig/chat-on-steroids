@@ -34,8 +34,8 @@ describe('extension release metadata', () => {
     ) as { version: string };
     expect(pkg.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(17);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 17;');
+    expect(BRIDGE_PROTOCOL).toBe(18);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 18;');
   });
 
   /**
@@ -209,7 +209,8 @@ function toolBlock(label = 'Called tool'): FakeNode {
 interface DomApi {
   conversationId(): string | null;
   conversationFromPath(pathname: unknown): string | null;
-  turns(): Array<{ node: FakeNode; nodes: FakeNode[]; id: string | null; role: string | null }>;
+  transcriptGroups(): Array<{ node: FakeNode; nodes: FakeNode[]; id: string | null; role: string | null }>;
+  responseWindowForOpeningMessage(groups: unknown[], openingUserMessageId: string): { openingIndex: number; endIndex: number; responseGroups: unknown[] } | null;
   messages(): Array<{ id: string; role: string; text: string; turnId: string | null }>;
   progressLine(turn: unknown): string | null;
   interrupted(turn: unknown): boolean;
@@ -280,12 +281,52 @@ describe('ChatGPT DOM adapter', () => {
     const a2 = turn('assistant', 'request-1').with(TOOL_SELECTOR, [toolBlock(), toolBlock(), toolBlock()]);
     const dom = loadDom([user, a1, a2]);
 
-    const turns = dom.turns();
+    const turns = dom.transcriptGroups();
     expect(turns).toHaveLength(2);
     const assistant = turns[1]!;
     expect(assistant.id).toBe('request-1');
     expect(assistant.nodes).toEqual([a1, a2]);
     expect(dom.toolBlocks(assistant)).toHaveLength(5);
+  });
+
+  it('keeps message chronology when ChatGPT reuses an assistant data-turn-id after a user message', () => {
+    const oldMessage = new FakeNode(
+      { 'data-message-id': 'assistant-old', 'data-message-author-role': 'assistant' },
+      'old answer'
+    );
+    const userMessage = new FakeNode(
+      { 'data-message-id': 'user-between', 'data-message-author-role': 'user' },
+      'try again'
+    );
+    const newMessage = new FakeNode(
+      { 'data-message-id': 'assistant-new', 'data-message-author-role': 'assistant' },
+      'new answer'
+    );
+    const oldAssistant = turn('assistant', 'request-reused').with('[data-message-id]', [oldMessage]);
+    const user = turn('user', 'user-between').with('[data-message-id]', [userMessage]);
+    const newAssistant = turn('assistant', 'request-reused').with('[data-message-id]', [newMessage]);
+    const dom = loadDom([oldAssistant, user, newAssistant]);
+
+    expect(dom.transcriptGroups()).toHaveLength(3);
+    expect(dom.messages().map(message => message.id)).toEqual(['assistant-old', 'user-between', 'assistant-new']);
+  });
+
+  it('treats duplicate rendered occurrences of one opening message id as ambiguous', () => {
+    const userMessageA = new FakeNode(
+      { 'data-message-id': 'opening-user', 'data-message-author-role': 'user' },
+      'same opening'
+    );
+    const userMessageB = new FakeNode(
+      { 'data-message-id': 'opening-user', 'data-message-author-role': 'user' },
+      'same opening'
+    );
+    const firstUser = turn('user', 'user-a').with('[data-message-id]', [userMessageA]);
+    const firstAssistant = turn('assistant', 'assistant-a');
+    const secondUser = turn('user', 'user-b').with('[data-message-id]', [userMessageB]);
+    const secondAssistant = turn('assistant', 'assistant-b');
+    const dom = loadDom([firstUser, firstAssistant, secondUser, secondAssistant]);
+
+    expect(dom.responseWindowForOpeningMessage(dom.transcriptGroups(), 'opening-user')).toBeNull();
   });
 
   /**
@@ -299,7 +340,7 @@ describe('ChatGPT DOM adapter', () => {
     const assistant = turn('assistant', 'request-3').with(TOOL_SELECTOR, [prose, real]);
     const dom = loadDom([assistant]);
 
-    expect(dom.toolBlocks(dom.turns()[0]!)).toEqual([real]);
+    expect(dom.toolBlocks(dom.transcriptGroups()[0]!)).toEqual([real]);
   });
 
   it('does not mistake ChatGPT transport-failure markdown for a completed assistant answer', () => {
@@ -357,7 +398,7 @@ describe('ChatGPT DOM adapter', () => {
     const a1 = turn('assistant', 'request-progress').with('[data-interrupted]', [firstBox]);
     const a2 = turn('assistant', 'request-progress').with('[data-interrupted]', [secondBox]);
     const dom = loadDom([a1, a2]);
-    const logical = dom.turns()[0]!;
+    const logical = dom.transcriptGroups()[0]!;
     expect(dom.markProgress(logical)).toBe(2);
     expect(firstBox.getAttribute('data-clf-progress')).toBe('1');
     expect(secondBox.getAttribute('data-clf-progress')).toBe('1');
@@ -374,7 +415,7 @@ describe('ChatGPT DOM adapter', () => {
     answer.with('.markdown', [new FakeNode({ class: 'markdown' }, 'Here is the summary')]);
     const section = turn('assistant', 'request-answer').with('[data-interrupted]', [commentary, answer]);
     const dom = loadDom([section]);
-    const logical = dom.turns()[0]!;
+    const logical = dom.transcriptGroups()[0]!;
 
     dom.hideProgress(logical, true);
     expect(commentary.getAttribute('data-clf-native-hidden')).toBe('1');
@@ -394,7 +435,7 @@ describe('ChatGPT DOM adapter', () => {
       .with('[data-interrupted]', [secondBox])
       .with('[data-interrupted="true"]', [secondBox]);
     const dom = loadDom([a1, a2]);
-    const logical = dom.turns()[0]!;
+    const logical = dom.transcriptGroups()[0]!;
 
     // Taking only the newest box made this value shrink whenever ChatGPT grew a new one,
     // and a shrink reads as new text to the delta logic, which printed it all over again.
@@ -1773,7 +1814,7 @@ describe('extension command delivery', () => {
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
     worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
-    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 11 });
+    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 12 });
 
     await worker.installed('update');
 
@@ -1904,7 +1945,7 @@ describe('extension revival delivery', () => {
 
   const liveRecorder = async (_tabId: number, message: Record<string, unknown>) =>
     message.type === 'clf-recorder-ping'
-      ? { ok: true, recorderVersion: 11 }
+      ? { ok: true, recorderVersion: 12 }
       : { ok: true, claimed: true };
 
   it('scans before opening and routes to the oldest exact worker tab', async () => {
@@ -2301,6 +2342,32 @@ describe('extension observation journal', () => {
       })
     ]);
     expect(JSON.stringify(journalOf(session))).not.toContain('rejected by the local bridge');
+  });
+
+  it('retires a successful observation batch atomically without a second partial-ack path', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/events') return response(200, { stored: 2 });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const conversationId = '13131313-3535-5756-7978-919191919191';
+
+    const result = await worker.send({
+      type: 'events',
+      conversationId,
+      entries: [
+        { conversationId, event: { kind: 'user_message', time: 1, messageId: 'question-good', text: 'valid neighbor' } },
+        { conversationId, event: { kind: 'turn_start', time: 2, turnId: 'turn-bad' } }
+      ]
+    });
+
+    expect(result).toMatchObject({ ok: true, pending: 0, durable: true });
+    expect(fetch.mock.calls.filter(([input]) => new URL(String(input)).pathname === '/events')).toHaveLength(1);
+    expect(journalOf(session)).toEqual([]);
   });
 
   it('keeps one retry alarm while work remains instead of resetting it on every failure', async () => {
@@ -3219,7 +3286,8 @@ describe('extension observation journal', () => {
     await worker.send({ type: 'events', entries });
     const journal = journalOf(session);
     expect(journal.length).toBeLessThanOrEqual(4000);
-    expect(journal.some((entry) => entry.gap === true && /progress line\(s\).*dropped/.test(entry.event.text))).toBe(true);
+    expect(journal.some((entry) => entry.gap === true && entry.event.kind === 'recording_gap' &&
+      entry.event.reason === 'worker_journal_overflow' && Number(entry.event.lostKinds?.progress) > 0)).toBe(true);
   });
 
   it('keeps queue-pressure gap evidence scoped to every affected chat and provisional route', async () => {
@@ -3238,8 +3306,8 @@ describe('extension observation journal', () => {
     await worker.send({ type: 'events', entries }, tabId);
     let journal = journalOf(session);
     const gaps = journal.filter((entry) => entry.gap === true);
-    expect(gaps.some((entry) => entry.conversationId === chatA && /progress line\(s\).*dropped/.test(entry.event.text))).toBe(true);
-    expect(gaps.some((entry) => entry.conversationId === chatB && /progress line\(s\).*dropped/.test(entry.event.text))).toBe(true);
+    expect(gaps.some((entry) => entry.conversationId === chatA && Number(entry.event.lostKinds?.progress) > 0)).toBe(true);
+    expect(gaps.some((entry) => entry.conversationId === chatB && Number(entry.event.lostKinds?.progress) > 0)).toBe(true);
     expect(gaps.some((entry) => entry.conversationId === null && entry.provisional === provisional)).toBe(true);
 
     const freshChat = 'cccccccc-1111-2222-3333-444444444444';
@@ -3261,9 +3329,145 @@ describe('extension observation journal', () => {
     }));
 
     await worker.send({ type: 'events', entries });
-    const gaps = journalOf(session).filter((entry) => entry.gap === true && entry.event.kind === 'chat_error');
-    expect(gaps.some((entry) => entry.conversationId === chatA && /observation\(s\).*lost/.test(entry.event.text))).toBe(true);
-    expect(gaps.some((entry) => entry.conversationId === chatB && /observation\(s\).*lost/.test(entry.event.text))).toBe(true);
+    const journal = journalOf(session);
+    expect(journal.length).toBeLessThanOrEqual(4000);
+    const gaps = journal.filter((entry) => entry.gap === true && entry.event.kind === 'recording_gap');
+    expect(gaps.some((entry) => entry.conversationId === chatA && entry.event.reason === 'worker_journal_overflow' &&
+      Number(entry.event.lostKinds?.user_message) > 0)).toBe(true);
+    expect(gaps.some((entry) => entry.conversationId === chatB && entry.event.reason === 'worker_journal_overflow' &&
+      Number(entry.event.lostKinds?.user_message) > 0)).toBe(true);
+  });
+
+  it('never mutates a restored gap whose exact payload may already have been committed', async () => {
+    const local = new FakeStorageArea();
+    const chat = 'f1111111-2222-3333-4444-555555555555';
+    const oldGap = {
+      conversationId: chat,
+      provisional: null,
+      agent: null,
+      agentCommandId: null,
+      gap: true,
+      event: {
+        kind: 'recording_gap',
+        time: 1,
+        reason: 'worker_journal_overflow',
+        lostKinds: { progress: 1 },
+        detail: 'old loss region'
+      }
+    };
+    const seeded = [
+      oldGap,
+      ...Array.from({ length: 3999 }, (_, index) => ({
+        conversationId: chat,
+        event: { kind: 'user_message', time: 10 + index, messageId: `seed-${index}`, text: `seed ${index}` }
+      }))
+    ];
+    const session = new FakeStorageArea({ journal: seeded });
+    const worker = loadWorker({ local, session });
+
+    await worker.send({
+      type: 'events',
+      entries: [{ conversationId: chat, event: { kind: 'turn_end', time: 5000, turnId: 'later-turn', outcome: 'failed' } }]
+    });
+
+    const journal = journalOf(session);
+    const old = journal.find(entry => entry.event?.detail === 'old loss region');
+    expect(old?.event.lostKinds).toEqual({ progress: 1 });
+    expect(journal.some(entry => entry !== old && entry.conversationId === chat && entry.gap === true &&
+      entry.event?.reason === 'worker_journal_overflow' && Number(entry.event.lostKinds?.user_message) > 0)).toBe(true);
+    expect(journal.length).toBeLessThanOrEqual(4000);
+  });
+
+  it('conservatively collapses restored gap-only pressure and still honors the hard journal cap', async () => {
+    const local = new FakeStorageArea();
+    const chatA = 'f4444444-2222-3333-4444-555555555555';
+    const chatB = 'f5555555-2222-3333-4444-555555555555';
+    const seeded = Array.from({ length: 4001 }, (_, index) => ({
+      conversationId: index % 2 === 0 ? chatA : chatB,
+      provisional: null,
+      agent: null,
+      agentCommandId: null,
+      gap: true,
+      event: {
+        kind: 'recording_gap',
+        time: index + 1,
+        reason: 'worker_journal_overflow',
+        lostKinds: { user_message: 1 }
+      }
+    }));
+    const session = new FakeStorageArea({ journal: seeded });
+    const worker = loadWorker({ local, session });
+
+    await worker.send({
+      type: 'events',
+      entries: [{ conversationId: chatA, event: { kind: 'progress', time: 5000, text: 'new pressure' } }]
+    });
+
+    const journal = journalOf(session);
+    expect(journal.length).toBeLessThanOrEqual(4000);
+    expect(journal.filter(entry => entry.event?.kind === 'recording_gap')).toHaveLength(2);
+    expect(journal.every(entry => Number(entry.event?.lostKinds?.user_message) > 0)).toBe(true);
+  });
+
+  it('rewrites restored gap-only evidence when compact payloads are required to satisfy the byte cap', async () => {
+    const local = new FakeStorageArea();
+    const conversationId = 'f6666666-2222-3333-4444-555555555555';
+    const detail = 'x'.repeat(100_000);
+    const seeded = Array.from({ length: 100 }, (_, index) => ({
+      conversationId,
+      provisional: null,
+      agent: null,
+      agentCommandId: null,
+      gap: true,
+      event: {
+        kind: 'recording_gap',
+        time: index + 1,
+        reason: 'worker_journal_overflow',
+        lostKinds: { progress: 1 },
+        detail: `${index}:${detail}`
+      }
+    }));
+    const session = new FakeStorageArea({ journal: seeded });
+    const worker = loadWorker({ local, session });
+
+    await worker.send({
+      type: 'events',
+      entries: [{ conversationId, event: { kind: 'progress', time: 1000, text: 'trigger compaction' } }]
+    });
+
+    const journal = journalOf(session);
+    expect(Buffer.byteLength(JSON.stringify(journal), 'utf8')).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(journal.filter(entry => entry.event?.kind === 'recording_gap')).toHaveLength(1);
+    expect(Number(journal[0]?.event?.lostKinds?.progress)).toBeGreaterThanOrEqual(100);
+  });
+
+  it('refuses new route custody before route cardinality can violate the hard journal cap', async () => {
+    const local = new FakeStorageArea();
+    const seeded = Array.from({ length: 4000 }, (_, index) => ({
+      conversationId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      provisional: null,
+      agent: null,
+      agentCommandId: null,
+      gap: true,
+      event: {
+        kind: 'recording_gap',
+        time: index + 1,
+        reason: 'worker_journal_overflow',
+        lostKinds: { progress: 1 }
+      }
+    }));
+    const session = new FakeStorageArea({ journal: seeded });
+    const worker = loadWorker({ local, session });
+    const reply = await worker.send({
+      type: 'events',
+      entries: [{
+        conversationId: 'ffffffff-0000-4000-8000-ffffffffffff',
+        event: { kind: 'progress', time: 5000, text: 'must remain page-owned' }
+      }]
+    });
+
+    expect(reply).toMatchObject({ ok: false, error: 'journal_capacity', retryable: true });
+    expect(journalOf(session)).toHaveLength(4000);
   });
 
   it('stays inside the journal byte budget under large observations', async () => {
@@ -3317,8 +3521,58 @@ describe('extension observation journal', () => {
 
     expect(journalOf(session)).toEqual([]);
     expect(received).toHaveLength(1);
-    expect(received[0]).toMatchObject({ kind: 'chat_error' });
-    expect(received[0].text).toMatch(/too large.*explicit gap/i);
+    expect(received[0]).toMatchObject({
+      kind: 'recording_gap',
+      reason: 'observation_too_large',
+      lostKinds: { assistant_message: 1 }
+    });
+  });
+
+  it('preserves inner loss evidence when a gap itself is permanently rejected', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const received: any[] = [];
+    let rejected = false;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/events') {
+        const body = JSON.parse(String(init.body));
+        if (!rejected) {
+          rejected = true;
+          return response(422, { error: 'invalid_observation' });
+        }
+        received.push(...body.events);
+        return response(200, { ok: true });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const conversationId = 'f3333333-2222-3333-4444-555555555555';
+
+    await worker.send({
+      type: 'events',
+      conversationId,
+      entries: [{
+        conversationId,
+        gap: true,
+        event: {
+          kind: 'recording_gap',
+          time: 10,
+          reason: 'page_queue_overflow',
+          affectedTurnId: 'gap-turn',
+          lostKinds: { turn_start: 1, page_tool: 2 }
+        }
+      }]
+    });
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({
+      kind: 'recording_gap',
+      reason: 'bridge_rejected_observation',
+      affectedTurnId: 'gap-turn',
+      lostKinds: { turn_start: 1, page_tool: 2 }
+    });
   });
 
   it('tightens and retries when Chrome rejects a session-storage write', async () => {

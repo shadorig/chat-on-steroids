@@ -44,6 +44,30 @@ export type TurnOutcome =
   | 'stalled'
   | 'unknown';
 
+/** Browser-recorder integrity loss. Inert: this is not a ChatGPT/model failure. */
+export type RecordingGapReason =
+  | 'invalid_lifecycle_identity'
+  | 'invalid_observation_identity'
+  | 'page_queue_overflow'
+  | 'worker_journal_overflow'
+  | 'observation_too_large'
+  | 'bridge_rejected_observation';
+
+/** Browser observation kinds whose confirmed loss can be described structurally. */
+export type RecordingGapLostKind =
+  | 'model_selection'
+  | 'conversation_title'
+  | 'user_message'
+  | 'assistant_message'
+  | 'page_tool'
+  | 'progress'
+  | 'turn_start'
+  | 'turn_end'
+  | 'chat_error'
+  | 'tool_evidence'
+  | 'recording_gap'
+  | 'unknown';
+
 export const TURN_OUTCOME_LABELS: Record<TurnOutcome, string> = {
   completed: 'completed',
   failed: 'failed with a visible error',
@@ -321,11 +345,27 @@ export type SessionEvent =
    */
   | (BaseEvent & { kind: 'page_tool'; messageId: string; label: string; origin?: number })
   /**
-   * `detail` names an app-authored reopening: the page reported this turn ended, and a tool
+   * `openingUserMessageId` is the exact native user message that opened this logical turn.
+   * Page-authored starts carry it. An app-authored same-id reopen may repeat that already-proven
+   * relationship so the corrective boundary remains self-contained; it never names a new opening
+   * message for the same logical turn.
+   *
+   * `detail` names such an app-authored reopening: the page reported this turn ended, and a tool
    * call under the same server turn then proved it had not. Absent on the page's own starts.
    */
-  | (BaseEvent & { kind: 'turn_start'; detail?: string })
+  | (BaseEvent & { kind: 'turn_start'; openingUserMessageId?: string; detail?: string })
+  /** Immutable opening-question evidence learned after the lifecycle segment was already known. */
+  | (BaseEvent & { kind: 'turn_identity'; turnId: string; openingUserMessageId: string })
   | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed' })
+  | (BaseEvent & {
+      kind: 'recording_gap';
+      reason: RecordingGapReason;
+      /** Exact browser observation kinds confirmed lost or unusable, when known. */
+      lostKinds?: Partial<Record<RecordingGapLostKind, number>>;
+      /** Logical turn whose evidence was affected, when the browser still had that identity. */
+      affectedTurnId?: string;
+      detail?: string;
+    })
   | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; reason?: 'thinking_failed' | 'no_visible_progress' })
   | (BaseEvent & { kind: 'tool_call'; call: ToolCallRecord })
   /**
@@ -838,6 +878,8 @@ export function eventTokens(event: SessionEvent): number {
     case 'chat_error':
     case 'note':
       return storedTextTokens(event.message);
+    case 'recording_gap':
+      return 0;
     case 'progress':
       // Live progress/reasoning captions are useful audit evidence but are not stable
       // conversation context, and often restate work that later appears in the final

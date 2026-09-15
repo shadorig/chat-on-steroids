@@ -71,7 +71,7 @@ it.each(['missing', 'replaced', 'matching', 'restart'])('closes the canonical re
   const [message] = await readEvents(sessionId, { kinds: ['assistant_message'] });
   expect(message).toMatchObject({ turnId, state: 'final', message: { text: final.text } });
   expect((await getSession(sessionId))?.activeTurnId).toBeNull();
-  expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId).toBeNull();
+  expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurn).toBeNull();
   expect(recovered.activity).toMatchObject({ terminal: true, endedTurnId: turnId });
   await recordChatObservations(conversationId, [final]);
   expect(await readEvents(sessionId, { kinds: ['turn_end'] })).toHaveLength(1);
@@ -121,7 +121,7 @@ it.each(['canonical', 'explicit'])('keeps a turn reopened for late tools open un
   await recordChatObservations(conversationId, [{ kind: 'assistant_message', time: 30, messageId: 'answer',
     text: 'First final', state: 'final', final: true }]);
   expect((await getSession(opened.sessionId!))?.activeTurnId).toBe('turn');
-  expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId).toBe('turn');
+  expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurn?.id).toBe('turn');
   expect(await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).toHaveLength(1);
   // A fresh canonical revision may finish the same turn; silence cannot.
   await recordChatObservations(conversationId, completion === 'canonical'

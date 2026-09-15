@@ -466,56 +466,53 @@ var CLF_DOM = (() => {
     return parts;
   }
 
-  function turns() {
+  /** Chronological transcript groups. Equal provider ids merge only while adjacent. */
+  function transcriptGroups() {
     return safe(() => {
-      const out = [];
-      const byKey = new Map();
-      for (const node of document.querySelectorAll(TURN)) {
-        const id = node.getAttribute('data-turn-id');
-        const role = node.getAttribute('data-turn');
-        const key = id ? `${role || ''}:${id}` : null;
-        if (key && byKey.has(key)) {
-          byKey.get(key).nodes.push(node);
-          continue;
-        }
-        const turn = { node, nodes: [node], id, role };
-        out.push(turn);
-        if (key) byKey.set(key, turn);
-      }
-      return out;
-    }, []);
-  }
-
-  /**
-   * Logical turns for presentation only.
-   *
-   * Keep this separate from `turns()`: the recorder has a deliberately conservative model
-   * that other code depends on. The renderer needs one extra guarantee the live ChatGPT DOM
-   * no longer gives it: `data-turn-id` can be reused by later requests. Grouping every
-   * section with the same id across the whole page therefore lets one old id swallow several
-   * different assistant turns and the overwrite renderer hides them all as one block.
-   *
-   * Split sections of one response are adjacent, while a later response is separated by a
-   * user turn. So presentation groups only consecutive sections with the same role + id.
-   * This changes no observation, attribution or recording path; it is only the list the
-   * synthetic stream paints into.
-   */
-  function presentationTurns() {
-    return safe(() => {
-      const out = [];
+      const groups = [];
       let previous = null;
       for (const node of document.querySelectorAll(TURN)) {
         const id = node.getAttribute('data-turn-id');
         const role = node.getAttribute('data-turn');
         if (previous && id && previous.id === id && previous.role === role) {
           previous.nodes.push(node);
-          continue;
+        } else {
+          previous = { node, nodes: [node], id, role };
+          groups.push(previous);
         }
-        previous = { node, nodes: [node], id, role };
-        out.push(previous);
       }
-      return out;
+      return groups;
     }, []);
+  }
+
+  /**
+   * Exact rendered response interval for one native user-message identity.
+   *
+   * Zero matches is ordinary hydration lag. More than one distinct transcript occurrence is
+   * ambiguous renderer state. Both are unknown: callers must never turn either case into a
+   * recency heuristic. `messagesIn()` already deduplicates one logical message repeated inside
+   * adjacent split sections, so only genuinely separate transcript positions make this ambiguous.
+   */
+  function responseWindowForOpeningMessage(groups, openingUserMessageId) {
+    if (!Array.isArray(groups) || !openingUserMessageId) return null;
+    let openingIndex = -1;
+    let matches = 0;
+    for (let index = 0; index < groups.length; index++) {
+      if (groups[index]?.role !== 'user') continue;
+      if (!messagesIn(groups[index]).some((message) => message.id === openingUserMessageId)) continue;
+      openingIndex = index;
+      matches++;
+      if (matches > 1) return null;
+    }
+    if (openingIndex < 0) return null;
+    let endIndex = groups.length;
+    for (let index = openingIndex + 1; index < groups.length; index++) {
+      if (groups[index]?.role === 'user') {
+        endIndex = index;
+        break;
+      }
+    }
+    return { openingIndex, endIndex, responseGroups: groups.slice(openingIndex + 1, endIndex) };
   }
 
   const turnNodes = (turn) =>
@@ -528,11 +525,11 @@ var CLF_DOM = (() => {
    * clamped by ChatGPT, and the clamped part is exactly the part a five-hour session
    * cannot afford to lose.
    */
-  function messages() {
+  function messages(groups = transcriptGroups()) {
     return safe(() => {
       const out = [];
       const seen = new Set();
-      for (const [index, turn] of turns().entries()) out.push(...messagesIn(turn, index, seen));
+      for (const [index, group] of groups.entries()) out.push(...messagesIn(group, index, seen));
       return out;
     }, []);
   }
@@ -1376,7 +1373,7 @@ var CLF_DOM = (() => {
       // Hot turn observation asks for one exact assistant turn. Global provider dialogs /
       // alerts above still participate because they can fail a request before a section is
       // mounted, but historical assistant DOM is not rescanned on every mutation.
-      for (const turn of turnFilter ? [turnFilter] : turns()) {
+      for (const turn of turnFilter ? [turnFilter] : transcriptGroups()) {
         if (turn.role !== 'assistant') continue;
         for (const section of turnNodes(turn)) {
           // Native Pro failure header observed in Chrome, 2026-09-12: an
@@ -1527,7 +1524,7 @@ var CLF_DOM = (() => {
    */
   function firstUserMessage() {
     return safe(() => {
-      for (const turn of turns()) {
+      for (const turn of transcriptGroups()) {
         for (const section of turnNodes(turn)) {
           for (const node of section.querySelectorAll('[data-message-id]')) {
             const role = node.getAttribute('data-message-author-role') || turn.role;
@@ -2184,7 +2181,7 @@ var CLF_DOM = (() => {
       const check = () => {
         if (done) return;
         if (!stillCurrent()) return finish(false);
-        if (clicked && projectHomeId() === entry.id && composer()?.isConnected && composer() !== sourceComposer && !turns().length) return finish(true);
+        if (clicked && projectHomeId() === entry.id && composer()?.isConnected && composer() !== sourceComposer && !transcriptGroups().length) return finish(true);
         if (conversationId() !== entry.sourceConversationId) {
           if (projectHomeId() !== entry.id) finish(false);
           return;
@@ -2285,8 +2282,8 @@ var CLF_DOM = (() => {
     conversationId,
     conversationFromPath,
     conversationTitle,
-    turns,
-    presentationTurns,
+    transcriptGroups,
+    responseWindowForOpeningMessage,
     messages,
     messagesIn,
     sectionSignature,

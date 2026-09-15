@@ -190,7 +190,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       getChatModels: () => ok({ state: 'ready', requestedAt: 1, observedAt: Date.now(), models: [options.astra
         ? { id: 'gpt-6-astra', label: 'GPT-6 Astra', efforts: ['high', 'pro'] }
         : { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: options.pro ? ['high', 'pro'] : ['none', 'high'] }] }),
-      getSessionControls: (id: string) => ok({ sessionId: id, conversationId: 'chat-a', automation: live.automation, activeTurnId: 'held-turn', finishHeld: live.finishHeld, blocked: '', job: live.compacting ? { busy: true } : null }),
+      getSessionControls: (id: string) => ok({ sessionId: id, conversationId: 'chat-a', automation: live.automation, activeTurnId: 'held-turn', canStop: true, finishHeld: live.finishHeld, blocked: '', job: live.compacting ? { busy: true } : null }),
       releaseSessionFinish: (id: string, turn: string) => { live.controlCalls.push({ id, action: `release:${turn}` }); live.finishHeld = false; return ok({}); },
       setSessionAutomation: (id: string, action: string) => { live.controlCalls.push({ id, action }); live.automation = action; return ok({}); },
       compactSession: (id: string) => { live.controlCalls.push({ id, action: 'compact' }); live.compacting = true; return ok({}); },
@@ -732,6 +732,36 @@ it('folds a whole Compact & Resume into one row that says the new chat opened', 
   expect(card.textContent).toContain('keep the loop running');
   expect(card.textContent).toContain('Handoff saved');
   expect(card.textContent).toContain('Bootstrap sent into the new chat');
+});
+
+it('renders recording gaps as explicit accessible warnings and keeps identity-only rows diagnostic', async () => {
+  const gap: SessionEvent = {
+    seq: 1,
+    time: T0,
+    source: 'extension',
+    kind: 'recording_gap',
+    reason: 'worker_journal_overflow',
+    lostKinds: { assistant_message: 1 },
+    detail: 'One assistant observation was lost.'
+  };
+  const identity: SessionEvent = {
+    seq: 2,
+    time: T0 + 1,
+    source: 'extension',
+    kind: 'turn_identity',
+    turnId: 'turn-one',
+    openingUserMessageId: 'question-one'
+  };
+  const normal = await boot([gap, identity]);
+  const warning = normal.w.document.querySelector('.ev-recording_gap .is-warn')!;
+  expect(warning.textContent).toContain('Part of this browser recording is incomplete.');
+  expect(warning.getAttribute('role')).toBeNull();
+  expect(warning.getAttribute('title')).toBe('One assistant observation was lost.');
+  expect(normal.w.document.querySelector('.ev-turn_identity')).toBeNull();
+
+  normal.w.close(); dom = null; vi.resetModules();
+  const developer = await boot([gap, identity], true, [], [], { developerMode: true });
+  expect(developer.w.document.querySelector('.ev-turn_identity')?.textContent).toContain('Turn opening identity recorded');
 });
 
 it('starts in New Chat despite active history and selects only the exact acknowledged send', async () => {

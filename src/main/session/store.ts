@@ -33,7 +33,8 @@ import type {
   SessionEvent,
   SessionOrigin,
   SessionSummary,
-  StoredText
+  StoredText,
+  TurnOutcome
 } from '../../shared/session.js';
 import { CONTINUATION_MARKER, REASONING_EFFORTS, eventTokens, normalizedToolOutcome } from '../../shared/session.js';
 import { chronological, positionOf } from '../../shared/chronology.js';
@@ -45,6 +46,13 @@ import { automaticTitle, firstTitleMessage, legacyContextTitle, refreshUserTitle
 import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
+import {
+  mergeOpeningIdentity,
+  openingIdentity,
+  recordingGapAffectsLifecycle,
+  type LineageIntegrity,
+  type OpeningIdentity
+} from './turn-lifecycle.js';
 
 /**
  * Caps on how much of a value is written *inline*, into the JSONL line itself.
@@ -265,6 +273,8 @@ const MAX_EVENT_TAIL = 4096;
 const MAX_RECENT_READ_BYTES = 8 * 1024 * 1024;
 /** Keep restart catch-up bounded even when only diagnostic/non-authoritative rows are appended. */
 const MAX_RECOVERY_CHECKPOINT_GAP = 1024 * 1024;
+/** Maximum exact damaged-turn tombstones retained by the bounded recovery checkpoint. */
+const MAX_RECOVERY_DAMAGE_TURNS = 256;
 const MAX_CANONICAL_MESSAGE_BYTES = 1024 * 1024;
 export const MAX_ASSET_BYTES = 8 * 1024 * 1024;
 export const MAX_SESSION_ASSET_BYTES = 192 * 1024 * 1024;
@@ -276,16 +286,22 @@ let assetWriteQueue = Promise.resolve();
 
 type MessageEvent = Extract<SessionEvent, { kind: 'user_message' | 'assistant_message' }>;
 type RecoveryHead = { seq: number; kind: SessionEvent['kind']; turnId?: string };
+type RecoveryLifecycleBase = {
+  seq: number;
+  time: number;
+  turnId?: string;
+  opening: OpeningIdentity;
+  integrity: LineageIntegrity;
+  logicalStartedAt: number | null;
+  segmentStartedAt: number | null;
+};
 type RecoveryLifecycle =
-  | { seq: number; time: number; kind: 'turn_start'; turnId?: string }
-  | {
-      seq: number;
-      time: number;
+  | (RecoveryLifecycleBase & { kind: 'turn_start' })
+  | (RecoveryLifecycleBase & {
       kind: 'turn_end';
-      turnId?: string;
       outcome: Extract<SessionEvent, { kind: 'turn_end' }>['outcome'];
       reason?: 'thinking_failed';
-    };
+    });
 type RecoveryMcpCall = {
   seq: number;
   time: number;
@@ -298,7 +314,7 @@ type RecoveryMcpCall = {
   };
 };
 interface RecoveryJournalCheckpoint {
-  version: 1;
+  version: 3;
   /** False only for a pre-checkpoint session whose current turn began before this version. */
   complete: boolean;
   /** Exact newline boundary already folded into this projection. */
@@ -306,6 +322,10 @@ interface RecoveryJournalCheckpoint {
   head: RecoveryHead | null;
   lifecycle: RecoveryLifecycle | null;
   exactMcpCall: RecoveryMcpCall | null;
+  /** Scoped lifecycle loss that arrived before the first surviving row for the named logical id. */
+  damagedTurnIds: string[];
+  /** Exact scoped-damage precision was discarded; this checkpoint remains fail-closed thereafter. */
+  scopedDamagePrecisionLost: boolean;
 }
 type NewMessageEvent = MessageEvent extends infer Event
   ? Event extends MessageEvent
@@ -1027,23 +1047,51 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
 }
 
 const RECOVERY_WORK_KINDS = new Set<SessionEvent['kind']>([
-  'user_message', 'assistant_message', 'tool_call', 'page_tool', 'turn_start', 'turn_end'
+  'user_message', 'assistant_message', 'tool_call', 'page_tool', 'turn_start', 'turn_identity', 'turn_end', 'recording_gap'
 ]);
 
 function emptyRecoveryJournal(complete: boolean, offset = 0): RecoveryJournalCheckpoint {
-  return { version: 1, complete, offset, head: null, lifecycle: null, exactMcpCall: null };
+  return {
+    version: 3,
+    complete,
+    offset,
+    head: null,
+    lifecycle: null,
+    exactMcpCall: null,
+    damagedTurnIds: [],
+    scopedDamagePrecisionLost: false
+  };
 }
 
 function compactRecoveryHead(event: SessionEvent): RecoveryHead {
   return { seq: event.seq, kind: event.kind, ...(event.turnId ? { turnId: event.turnId } : {}) };
 }
 
-function compactRecoveryLifecycle(event: Extract<SessionEvent, { kind: 'turn_start' | 'turn_end' }>): RecoveryLifecycle {
+function compactRecoveryLifecycle(
+  event: Extract<SessionEvent, { kind: 'turn_start' | 'turn_end' }>,
+  prior: RecoveryLifecycle | null = null
+): RecoveryLifecycle {
+  const sameTurn = Boolean(event.turnId && prior?.turnId === event.turnId);
+  const opening = event.kind === 'turn_start'
+    ? mergeOpeningIdentity(sameTurn ? prior!.opening : openingIdentity(), event.openingUserMessageId)
+    : sameTurn ? prior!.opening : openingIdentity();
+  const common: RecoveryLifecycleBase = {
+    seq: event.seq,
+    time: event.time,
+    ...(event.turnId ? { turnId: event.turnId } : {}),
+    opening,
+    integrity: sameTurn ? prior!.integrity : 'intact',
+    logicalStartedAt: event.kind === 'turn_start'
+      ? (sameTurn ? prior!.logicalStartedAt : event.time)
+      : sameTurn ? prior!.logicalStartedAt : null,
+    segmentStartedAt: event.kind === 'turn_start'
+      ? event.time
+      : sameTurn ? prior!.segmentStartedAt : null
+  };
   if (event.kind === 'turn_end') {
-    return { seq: event.seq, time: event.time, kind: 'turn_end', ...(event.turnId ? { turnId: event.turnId } : {}),
-      outcome: event.outcome, ...(event.reason ? { reason: event.reason } : {}) };
+    return { ...common, kind: 'turn_end', outcome: event.outcome, ...(event.reason ? { reason: event.reason } : {}) };
   }
-  return { seq: event.seq, time: event.time, kind: 'turn_start', ...(event.turnId ? { turnId: event.turnId } : {}) };
+  return { ...common, kind: 'turn_start' };
 }
 
 function compactRecoveryMcpCall(event: Extract<SessionEvent, { kind: 'tool_call' }>): RecoveryMcpCall | null {
@@ -1066,18 +1114,62 @@ function advanceRecoveryJournal(checkpoint: RecoveryJournalCheckpoint, event: Se
   let complete = checkpoint.complete;
   let lifecycle = checkpoint.lifecycle;
   let exactMcpCall = checkpoint.exactMcpCall;
+  let damagedTurnIds = new Set(checkpoint.damagedTurnIds);
+  let scopedDamagePrecisionLost = checkpoint.scopedDamagePrecisionLost;
+  const applyPendingDamage = (next: RecoveryLifecycle): RecoveryLifecycle => {
+    const damaged = next.integrity === 'damaged' || scopedDamagePrecisionLost ||
+      (next.turnId !== undefined && damagedTurnIds.has(next.turnId));
+    if (!damaged) return next;
+    if (exactMcpCall?.turnId === next.turnId) exactMcpCall = null;
+    return { ...next, integrity: 'damaged' };
+  };
   if (event.kind === 'turn_start') {
-    lifecycle = compactRecoveryLifecycle(event);
+    lifecycle = applyPendingDamage(compactRecoveryLifecycle(event, lifecycle));
     // A fresh durable turn start supersedes every pre-checkpoint source turn. From this boundary
     // forward the compact projection is complete even for a session created by an older version.
     complete = true;
     if (exactMcpCall?.turnId !== event.turnId) exactMcpCall = null;
+  } else if (event.kind === 'turn_identity') {
+    if (lifecycle?.turnId === event.turnId) {
+      lifecycle = {
+        ...lifecycle,
+        opening: mergeOpeningIdentity(lifecycle.opening, event.openingUserMessageId)
+      };
+    }
   } else if (event.kind === 'turn_end') {
-    lifecycle = compactRecoveryLifecycle(event);
+    lifecycle = applyPendingDamage(compactRecoveryLifecycle(event, lifecycle));
   } else if (event.kind === 'tool_call') {
-    exactMcpCall = compactRecoveryMcpCall(event) ?? exactMcpCall;
+    const candidate = compactRecoveryMcpCall(event);
+    exactMcpCall = candidate && !scopedDamagePrecisionLost &&
+      (!candidate.turnId || !damagedTurnIds.has(candidate.turnId)) &&
+      !(lifecycle && lifecycle.turnId === candidate.turnId && lifecycle.integrity === 'damaged')
+      ? candidate
+      : exactMcpCall;
+  } else if (event.kind === 'recording_gap' && recordingGapAffectsLifecycle(event)) {
+    if (event.affectedTurnId) {
+      if (damagedTurnIds.size < MAX_RECOVERY_DAMAGE_TURNS || damagedTurnIds.has(event.affectedTurnId)) {
+        damagedTurnIds.add(event.affectedTurnId);
+      } else {
+        damagedTurnIds.clear();
+        scopedDamagePrecisionLost = true;
+      }
+      if (exactMcpCall?.turnId === event.affectedTurnId) exactMcpCall = null;
+    }
+    if (lifecycle && (!event.affectedTurnId || lifecycle.turnId === event.affectedTurnId)) {
+      lifecycle = { ...lifecycle, integrity: 'damaged' };
+      exactMcpCall = null;
+      if (lifecycle.turnId) damagedTurnIds.add(lifecycle.turnId);
+    }
   }
-  return { ...checkpoint, complete, head: compactRecoveryHead(event), lifecycle, exactMcpCall };
+  return {
+    ...checkpoint,
+    complete,
+    head: compactRecoveryHead(event),
+    lifecycle,
+    exactMcpCall,
+    damagedTurnIds: [...damagedTurnIds],
+    scopedDamagePrecisionLost
+  };
 }
 
 function recoveryCheckpointPath(id: string): string {
@@ -1086,24 +1178,80 @@ function recoveryCheckpointPath(id: string): string {
 
 function parseRecoveryCheckpoint(raw: string): RecoveryJournalCheckpoint | null {
   try {
-    const value = JSON.parse(raw) as Partial<RecoveryJournalCheckpoint>;
-    if (value.version !== 1 || typeof value.complete !== 'boolean' || !Number.isSafeInteger(value.offset) || value.offset! < 0) return null;
+    const value = JSON.parse(raw) as Partial<RecoveryJournalCheckpoint> & { version?: number };
+    // v1/v2 were derived caches, not durable intent. Their older integrity fold could heal known
+    // damage, so rebuilding from JSONL is safer than migrating authority from them.
+    if (value.version !== 3 || typeof value.complete !== 'boolean' || !Number.isSafeInteger(value.offset) || value.offset! < 0) return null;
     const head = value.head;
     if (head && (!Number.isSafeInteger(head.seq) || head.seq < 0 || typeof head.kind !== 'string' ||
         !RECOVERY_WORK_KINDS.has(head.kind as SessionEvent['kind']) ||
         (head.turnId !== undefined && typeof head.turnId !== 'string'))) return null;
-    const lifecycle = value.lifecycle;
-    if (lifecycle && (!Number.isSafeInteger(lifecycle.seq) || lifecycle.seq < 0 || !Number.isFinite(lifecycle.time) ||
-        !['turn_start', 'turn_end'].includes(lifecycle.kind) || (lifecycle.turnId !== undefined && typeof lifecycle.turnId !== 'string') ||
-        (lifecycle.kind === 'turn_end' && (!['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown'].includes(lifecycle.outcome) ||
+    const lifecycle = value.lifecycle as (Partial<RecoveryLifecycle> & { outcome?: unknown; reason?: unknown }) | null | undefined;
+    if (lifecycle && (!Number.isSafeInteger(lifecycle.seq) || lifecycle.seq! < 0 || !Number.isFinite(lifecycle.time) ||
+        (lifecycle.kind !== 'turn_start' && lifecycle.kind !== 'turn_end') ||
+        (lifecycle.turnId !== undefined && typeof lifecycle.turnId !== 'string') ||
+        (lifecycle.kind === 'turn_end' && (typeof lifecycle.outcome !== 'string' ||
+          !['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown'].includes(lifecycle.outcome) ||
           (lifecycle.reason !== undefined && lifecycle.reason !== 'thinking_failed'))) ||
         (lifecycle.kind === 'turn_start' && ('outcome' in lifecycle || 'reason' in lifecycle)))) return null;
+    let normalizedLifecycle: RecoveryLifecycle | null = null;
+    if (lifecycle) {
+      const opening = lifecycle.opening &&
+        (lifecycle.opening.status === 'unknown' || lifecycle.opening.status === 'conflict' ||
+          (lifecycle.opening.status === 'exact' && typeof lifecycle.opening.messageId === 'string' && lifecycle.opening.messageId))
+        ? lifecycle.opening as OpeningIdentity
+        : openingIdentity();
+      if (lifecycle.integrity !== 'intact' && lifecycle.integrity !== 'damaged') return null;
+      const integrity: LineageIntegrity = lifecycle.integrity;
+      const common: RecoveryLifecycleBase = {
+        seq: lifecycle.seq!,
+        time: lifecycle.time!,
+        ...(typeof lifecycle.turnId === 'string' ? { turnId: lifecycle.turnId } : {}),
+        opening,
+        integrity,
+        logicalStartedAt: Number.isFinite(lifecycle.logicalStartedAt)
+          ? lifecycle.logicalStartedAt as number
+          : null,
+        segmentStartedAt: Number.isFinite(lifecycle.segmentStartedAt)
+          ? lifecycle.segmentStartedAt as number
+          : lifecycle.kind === 'turn_start' ? lifecycle.time! : null
+      };
+      normalizedLifecycle = lifecycle.kind === 'turn_end'
+        ? { ...common, kind: 'turn_end', outcome: lifecycle.outcome as TurnOutcome,
+            ...(lifecycle.reason === 'thinking_failed' ? { reason: lifecycle.reason } : {}) }
+        : { ...common, kind: 'turn_start' };
+    }
     const exact = value.exactMcpCall;
     if (exact && (!Number.isSafeInteger(exact.seq) || exact.seq < 0 || !Number.isFinite(exact.time) || typeof exact.turnId !== 'string' ||
         exact.call?.attribution !== 'request_id' || typeof exact.call.conversationId !== 'string' ||
         (exact.call.model !== undefined && typeof exact.call.model !== 'string') ||
         (exact.call.reasoningEffort !== undefined && !REASONING_EFFORTS.includes(exact.call.reasoningEffort)))) return null;
-    return value as RecoveryJournalCheckpoint;
+    if (!Array.isArray(value.damagedTurnIds) || value.damagedTurnIds.length > MAX_RECOVERY_DAMAGE_TURNS ||
+        value.damagedTurnIds.some(id => typeof id !== 'string' || !id || id.length > 256) ||
+        typeof value.scopedDamagePrecisionLost !== 'boolean') return null;
+    const damagedTurnIds = new Set(value.damagedTurnIds);
+    if (normalizedLifecycle?.integrity === 'damaged' && normalizedLifecycle.turnId) {
+      if (damagedTurnIds.size >= MAX_RECOVERY_DAMAGE_TURNS && !damagedTurnIds.has(normalizedLifecycle.turnId)) return null;
+      damagedTurnIds.add(normalizedLifecycle.turnId);
+    }
+    if (normalizedLifecycle && (value.scopedDamagePrecisionLost ||
+        (normalizedLifecycle.turnId !== undefined && damagedTurnIds.has(normalizedLifecycle.turnId)))) {
+      normalizedLifecycle = { ...normalizedLifecycle, integrity: 'damaged' };
+    }
+    const normalizedExact = exact && typeof exact.turnId === 'string' &&
+      !value.scopedDamagePrecisionLost && !damagedTurnIds.has(exact.turnId)
+      ? value.exactMcpCall ?? null
+      : null;
+    return {
+      version: 3,
+      complete: value.complete,
+      offset: value.offset!,
+      head: head ?? null,
+      lifecycle: normalizedLifecycle,
+      exactMcpCall: normalizedExact,
+      damagedTurnIds: [...damagedTurnIds],
+      scopedDamagePrecisionLost: value.scopedDamagePrecisionLost
+    };
   } catch {
     return null;
   }
@@ -1262,58 +1410,72 @@ export async function refuseAutomaticCompactionNow(id: string, conversationId: s
  * server both feed this store and their clocks are the same clock, but events can
  * arrive out of order when the browser batches its observations.
  */
+async function appendEventInSession(entry: OpenSession, sessionId: string, event: NewSessionEvent): Promise<SessionEvent> {
+  // Sequence assignment, durable append and projection update are one serial operation.
+  // The previous implementation incremented nextSeq and mutated the summary *before* the
+  // append succeeded. A disk failure therefore created a permanent seq gap and could even
+  // persist meta.json claiming events/tool calls/tokens that never existed in events.jsonl.
+  // Keep the append-only journal authoritative: nothing in memory advances until the line
+  // is on disk.
+  const full = { ...event, seq: entry.nextSeq } as SessionEvent;
+  const line = `${JSON.stringify(full)}\n`;
+  const lineBytes = Buffer.byteLength(line, 'utf8');
+  if (lineBytes > MAX_LINE_BYTES) {
+    throw new Error('Session event is too large to store');
+  }
+  try {
+    await fs.appendFile(path.join(sessionDir(sessionId), 'events.jsonl'), line, 'utf8');
+  } catch (error) {
+    // Windows/filesystem errors are allowed to be uncertain commits: the write may have
+    // reached disk before the promise rejected. Reconcile the authoritative tail before
+    // another queued writer is admitted. A complete line is treated as committed; a torn
+    // line is sealed and the normal browser/MCP retry may safely reuse that absent seq.
+    await sealTornTail(sessionId);
+    const durableSeq = await lastSeqOnDisk(sessionId);
+    if (durableSeq < full.seq) {
+      entry.nextSeq = Math.max(entry.nextSeq, durableSeq + 1);
+      throw error;
+    }
+    logWarn(`session ${sessionId}: append reported an error after sequence ${full.seq} was already durable`);
+  }
+  entry.nextSeq += 1;
+  entry.journalBytes += lineBytes;
+  entry.tail.push(full);
+  if (entry.tail.length > MAX_EVENT_TAIL) {
+    const removed = entry.tail.splice(0, entry.tail.length - MAX_EVENT_TAIL);
+    entry.tailFrom = removed[removed.length - 1]!.seq + 1;
+  }
+  applyToSummary(entry.summary, full);
+  noteRecoveryWork(entry, full);
+  entry.historySeq = full.seq;
+  await checkpointRecoveryJournal(entry, sessionId, full);
+  scheduleMeta(entry);
+  return full;
+}
+
 export function appendEvent(sessionId: string, event: NewSessionEvent): Promise<SessionEvent> {
-  return ensureOpen(sessionId).then((entry) => {
-    // Sequence assignment, durable append and projection update are one serial operation.
-    // The previous implementation incremented nextSeq and mutated the summary *before* the
-    // append succeeded. A disk failure therefore created a permanent seq gap and could even
-    // persist meta.json claiming events/tool calls/tokens that never existed in events.jsonl.
-    // Keep the append-only journal authoritative: nothing in memory advances until the line
-    // is on disk.
-    const write = entry.queue.then(async () => {
-      const full = { ...event, seq: entry.nextSeq } as SessionEvent;
-      const line = `${JSON.stringify(full)}\n`;
-      const lineBytes = Buffer.byteLength(line, 'utf8');
-      if (lineBytes > MAX_LINE_BYTES) {
-        throw new Error('Session event is too large to store');
-      }
-      try {
-        await fs.appendFile(path.join(sessionDir(sessionId), 'events.jsonl'), line, 'utf8');
-      } catch (error) {
-        // Windows/filesystem errors are allowed to be uncertain commits: the write may have
-        // reached disk before the promise rejected. Reconcile the authoritative tail before
-        // another queued writer is admitted. A complete line is treated as committed; a torn
-        // line is sealed and the normal browser/MCP retry may safely reuse that absent seq.
-        await sealTornTail(sessionId);
-        const durableSeq = await lastSeqOnDisk(sessionId);
-        if (durableSeq < full.seq) {
-          entry.nextSeq = Math.max(entry.nextSeq, durableSeq + 1);
-          throw error;
-        }
-        logWarn(`session ${sessionId}: append reported an error after sequence ${full.seq} was already durable`);
-      }
-      entry.nextSeq += 1;
-      entry.journalBytes += lineBytes;
-      entry.tail.push(full);
-      if (entry.tail.length > MAX_EVENT_TAIL) {
-        const removed = entry.tail.splice(0, entry.tail.length - MAX_EVENT_TAIL);
-        entry.tailFrom = removed[removed.length - 1]!.seq + 1;
-      }
-      applyToSummary(entry.summary, full);
-      noteRecoveryWork(entry, full);
-      entry.historySeq = full.seq;
-      await checkpointRecoveryJournal(entry, sessionId, full);
-      scheduleMeta(entry);
-      return full;
-    });
-    entry.queue = write.then(
-      () => undefined,
-      (err: Error) => {
-        logError(`session append failed: ${err.message}`);
-      }
-    );
-    return write;
-  });
+  return ensureOpen(sessionId).then((entry) =>
+    enqueueSessionOperation(entry, 'append', () => appendEventInSession(entry, sessionId, event))
+  );
+}
+
+/**
+ * Appends only while this session is still attached to the named ChatGPT conversation.
+ *
+ * The ownership check runs inside the same per-session lane as rebindSession. A caller may have
+ * proved source-chat authority before an await, but if Compact & Resume moves the session before
+ * this write reaches the lane, the stale source fact must not mutate the replacement chat.
+ */
+export function appendEventIfAttachedToConversation(
+  sessionId: string,
+  conversationId: string,
+  event: NewSessionEvent
+): Promise<SessionEvent | null> {
+  return ensureOpen(sessionId).then((entry) =>
+    enqueueSessionOperation(entry, 'guarded append', () =>
+      entry.summary.conversationId === conversationId ? appendEventInSession(entry, sessionId, event) : Promise.resolve(null)
+    )
+  );
 }
 
 /**
@@ -1654,7 +1816,7 @@ export async function latestCompletedAutomationSourceBoundary(sessionId: string)
 
     const canonicalKeys = new Set(entry.messages.keys());
     let scannedSeq = Number.POSITIVE_INFINITY;
-    const damaged = await scanRecentJournal(
+    const { damaged } = await scanRecentJournal(
       sessionId,
       Number.POSITIVE_INFINITY,
       (event) => {
@@ -1672,62 +1834,185 @@ export async function latestCompletedAutomationSourceBoundary(sessionId: string)
   });
 }
 
-export interface TurnStartContext {
+export interface TurnReconciliationContext {
   /** Exact newest start for this logical id, including an app-authored corrective reopen. */
-  startedAt: number;
-  /** Native user message immediately preceding that start, when one is proven. */
-  userMessageId: string | null;
+  latestSegmentStartedAt: number;
+  /** First durable start of the logical id; same-id corrective reopens retain this time. */
+  logicalStartedAt: number;
+  /** Immutable opening authority, including a durable contradiction when one exists. */
+  opening: OpeningIdentity;
+  /** Known recorder integrity for this logical lineage. */
+  integrity: LineageIntegrity;
 }
+
+export type TurnReconciliationRead =
+  | { status: 'found'; context: TurnReconciliationContext }
+  | { status: 'not-found' | 'damaged' };
 
 /**
  * Finds one named turn start and its native question without a bounded tail heuristic.
  *
  * Stop adoption and post-terminal MCP fencing both act on an exact turn identity. A damaged row in
- * the necessary suffix therefore fails closed. Once the start is found, only the newest prior
- * user/start/end boundary can name its question; canonical user revisions are compared by origin.
+ * the necessary suffix therefore fails closed. Modern page-authored starts carry their opening
+ * native user id directly; modern app-authored same-id reopens repeat that already-proven relation.
+ * Older corrective reopens are resolved by scanning back to the original start, while legacy page
+ * starts fall back to the newest proven prior user boundary.
  */
-export async function readTurnStartContext(sessionId: string, turnId: string): Promise<TurnStartContext | null> {
-  assertSessionId(sessionId);
-  if (!turnId) return null;
-  const entry = await ensureOpen(sessionId);
-  return enqueueSessionOperation(entry, 'turn start context read', async () => {
+async function readTurnReconciliationContextInSession(
+  entry: OpenSession,
+  sessionId: string,
+  turnId: string
+): Promise<TurnReconciliationRead> {
     const canonicalKeys = new Set(entry.messages.keys());
     const canonicalUsers = [...entry.messages.values()].filter(
       (event): event is Extract<MessageEvent, { kind: 'user_message' }> => event.kind === 'user_message'
     );
     const state: {
       start: Extract<SessionEvent, { kind: 'turn_start' }> | null;
+      logicalStartedAt: number | null;
+      logicalStartSeq: number | null;
+      opening: OpeningIdentity;
+      legacyPageStartSeq: number | null;
       prior: SessionEvent | null;
-      scannedSeq: number;
-    } = { start: null, prior: null, scannedSeq: Number.POSITIVE_INFINITY };
+      newestUnscopedLifecycleGapSeq: number | null;
+      newestUnscopedLegacyBoundaryGapSeq: number | null;
+      scopedLifecycleDamage: boolean;
+      scopedLegacyBoundaryDamage: boolean;
+    } = {
+      start: null,
+      logicalStartedAt: null,
+      logicalStartSeq: null,
+      opening: openingIdentity(),
+      legacyPageStartSeq: null,
+      prior: null,
+      newestUnscopedLifecycleGapSeq: null,
+      newestUnscopedLegacyBoundaryGapSeq: null,
+      scopedLifecycleDamage: false,
+      scopedLegacyBoundaryDamage: false
+    };
+    const seedLegacyPrior = (beforeSeq: number): void => {
+      state.prior = null;
+      for (const user of canonicalUsers) {
+        if (positionOf(user) < beforeSeq) state.prior = laterSemanticEvent(state.prior, user);
+      }
+    };
 
-    const damaged = await scanRecentJournal(
-      sessionId,
-      Number.POSITIVE_INFINITY,
-      (event) => {
-        state.scannedSeq = event.seq;
-        if (!state.start) {
-          if (event.kind === 'turn_start' && event.turnId === turnId) {
-            state.start = event;
-            for (const user of canonicalUsers) {
-              if (positionOf(user) < event.seq) state.prior = laterSemanticEvent(state.prior, user);
+    const { damaged } = await scanRecentJournal(
+        sessionId,
+        Number.POSITIVE_INFINITY,
+        (event) => {
+          if (event.kind === 'recording_gap') {
+            const scopedToTarget = event.affectedTurnId === turnId;
+            const unscoped = !event.affectedTurnId;
+            const lost = event.lostKinds;
+            if (recordingGapAffectsLifecycle(event)) {
+              if (scopedToTarget) state.scopedLifecycleDamage = true;
+              else if (unscoped) {
+                state.newestUnscopedLifecycleGapSeq = Math.max(state.newestUnscopedLifecycleGapSeq ?? -Infinity, event.seq);
+              }
             }
+            if (!lost || (lost.user_message ?? 0) > 0 || (lost.unknown ?? 0) > 0) {
+              if (scopedToTarget) state.scopedLegacyBoundaryDamage = true;
+              else if (unscoped) {
+                state.newestUnscopedLegacyBoundaryGapSeq = Math.max(state.newestUnscopedLegacyBoundaryGapSeq ?? -Infinity, event.seq);
+              }
+            }
+            return;
+          }
+        if (event.kind === 'turn_identity' && event.turnId === turnId) {
+          state.opening = mergeOpeningIdentity(state.opening, event.openingUserMessageId);
+          return;
+        }
+        if (event.kind === 'turn_start' && event.turnId === turnId) {
+          if (!state.start) state.start = event;
+          // Reverse scan: the last matching assignment is the original logical start.
+          state.logicalStartedAt = event.time;
+          state.logicalStartSeq = event.seq;
+          state.opening = mergeOpeningIdentity(state.opening, event.openingUserMessageId);
+          // Protocol 17 page starts did not carry opening identity. Keep moving this boundary to
+          // the oldest matching page-authored start as the backward scan proceeds; that is the
+          // original logical opening whose immediately preceding user message is the legacy proof.
+          if (!event.openingUserMessageId && event.source === 'extension') {
+            state.legacyPageStartSeq = event.seq;
+            seedLegacyPrior(event.seq);
           }
           return;
         }
-        if (event.seq >= state.start.seq) return;
+        if (state.legacyPageStartSeq === null || event.seq >= state.legacyPageStartSeq) return;
         if (event.kind !== 'user_message' && event.kind !== 'turn_start' && event.kind !== 'turn_end') return;
         if (event.kind === 'user_message' && messageKey(event) && canonicalKeys.has(messageKey(event)!)) return;
         state.prior = laterSemanticEvent(state.prior, event);
       },
-      () => state.start !== null && state.prior !== null && state.scannedSeq < positionOf(state.prior)
+      // Exact identity is immutable. Scan the complete journal so contradictory explicit ids do
+      // not become "latest wins" authority. This is a cold recovery/command read, never /activity.
+      () => false
     );
-    if (damaged > 0 || !state.start) return null;
+    if (damaged > 0) return { status: 'damaged' };
+    if (!state.start || state.logicalStartedAt === null || state.logicalStartSeq === null) return { status: 'not-found' };
+    // Exact scope outranks chronology. Only an unscoped gap needs the temporal test that asks
+    // whether the missing lifecycle could belong to this turn.
+    if (state.scopedLifecycleDamage ||
+        (state.newestUnscopedLifecycleGapSeq !== null && state.newestUnscopedLifecycleGapSeq > state.logicalStartSeq)) {
+      return { status: 'damaged' };
+    }
+    const legacyOpening = state.prior?.kind === 'user_message' && state.prior.source === 'extension'
+      ? state.prior.messageId ?? null
+      : null;
+    // Legacy page starts infer their opening from the preceding durable boundary. Missing evidence
+    // between that boundary and the start makes the inferred question unsafe even when the rest of
+    // the journal is parseable.
+    if (state.legacyPageStartSeq !== null && (state.scopedLegacyBoundaryDamage ||
+        (state.newestUnscopedLegacyBoundaryGapSeq !== null &&
+          state.newestUnscopedLegacyBoundaryGapSeq < state.legacyPageStartSeq &&
+          state.newestUnscopedLegacyBoundaryGapSeq > (state.prior ? positionOf(state.prior) : -Infinity)))) {
+      return { status: 'damaged' };
+    }
+    const opening = mergeOpeningIdentity(state.opening, legacyOpening);
     return {
-      startedAt: state.start.time,
-      userMessageId: state.prior?.kind === 'user_message' && state.prior.source === 'extension'
-        ? state.prior.messageId ?? null
-        : null
+      status: 'found',
+      context: {
+        latestSegmentStartedAt: state.start.time,
+        logicalStartedAt: state.logicalStartedAt,
+        opening,
+        integrity: 'intact'
+      }
+    };
+}
+
+export async function readTurnReconciliationContext(sessionId: string, turnId: string): Promise<TurnReconciliationRead> {
+  assertSessionId(sessionId);
+  if (!turnId) return { status: 'not-found' };
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'turn start context read', () =>
+    readTurnReconciliationContextInSession(entry, sessionId, turnId));
+}
+
+/**
+ * Current-turn authority from the bounded recovery projection, with full lineage reconstruction
+ * only for legacy/unknown checkpoints. Normal Protocol-18 Stop/adoption never scans lifetime JSONL.
+ */
+export async function readCurrentTurnAuthority(sessionId: string, turnId: string): Promise<TurnReconciliationRead> {
+  assertSessionId(sessionId);
+  if (!turnId) return { status: 'not-found' };
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'current turn authority read', async () => {
+    if (entry.summary.activeTurnId !== turnId) return { status: 'not-found' as const };
+    const lifecycle = entry.recoveryJournal.complete ? entry.recoveryJournal.lifecycle : null;
+    if (!lifecycle || lifecycle.turnId !== turnId || lifecycle.kind !== 'turn_start') {
+      return readTurnReconciliationContextInSession(entry, sessionId, turnId);
+    }
+    if (lifecycle.integrity === 'damaged') return { status: 'damaged' as const };
+    if (lifecycle.opening.status === 'unknown' || lifecycle.logicalStartedAt === null || lifecycle.segmentStartedAt === null) {
+      return readTurnReconciliationContextInSession(entry, sessionId, turnId);
+    }
+    return {
+      status: 'found' as const,
+      context: {
+        latestSegmentStartedAt: lifecycle.segmentStartedAt,
+        logicalStartedAt: lifecycle.logicalStartedAt,
+        opening: lifecycle.opening,
+        integrity: lifecycle.integrity
+      }
     };
   });
 }
@@ -1798,38 +2083,107 @@ export async function readTurnRecoveryEvidence(
     let lifecycle = entry.recoveryJournal.complete ? entry.recoveryJournal.lifecycle : null;
     let checkpointMcpCall = entry.recoveryJournal.complete ? entry.recoveryJournal.exactMcpCall : null;
     if (!entry.recoveryJournal.complete) {
-      const damaged = await scanRecentJournal(
+      // Upgrade only from one complete bounded snapshot. A reverse discovery algorithm that stops
+      // as soon as it has "a lifecycle + a call" can miss an older gap or identity inside that same
+      // logical turn. Instead collect the semantic facts across the bounded journal and publish a
+      // checkpoint only when the scan actually reaches its beginning. Larger legacy histories stay
+      // fail-closed until a fresh self-contained turn establishes the normal forward checkpoint.
+      type LifecycleEvent = Extract<SessionEvent, { kind: 'turn_start' | 'turn_end' }>;
+      const openingByTurn = new Map<string, OpeningIdentity>();
+      const startsByTurn = new Map<string, { newest: Extract<SessionEvent, { kind: 'turn_start' }>; oldest: Extract<SessionEvent, { kind: 'turn_start' }> }>();
+      const scopedDamage = new Set<string>();
+      let scopedDamageOverflow = false;
+      const mcpByTurn = new Map<string, RecoveryMcpCall>();
+      let newestUnscopedLifecycleGapSeq: number | null = null;
+      let newestLifecycle: LifecycleEvent | null = null;
+      const scan = await scanRecentJournal(
         sessionId,
         MAX_RECENT_READ_BYTES,
         (event) => {
           if ((event.kind === 'user_message' || event.kind === 'assistant_message') &&
               messageKey(event) && canonicalKeys.has(messageKey(event)!)) return;
           if (!journalHead && RECOVERY_WORK_KINDS.has(event.kind)) journalHead = compactRecoveryHead(event);
-          if (!lifecycle && (event.kind === 'turn_start' || event.kind === 'turn_end')) lifecycle = compactRecoveryLifecycle(event);
-          if (!checkpointMcpCall && event.kind === 'tool_call') checkpointMcpCall = compactRecoveryMcpCall(event);
+          if (!newestLifecycle && (event.kind === 'turn_start' || event.kind === 'turn_end')) newestLifecycle = event;
+          if (event.kind === 'turn_start' && event.turnId) {
+            const starts = startsByTurn.get(event.turnId);
+            if (starts) starts.oldest = event;
+            else startsByTurn.set(event.turnId, { newest: event, oldest: event });
+            openingByTurn.set(
+              event.turnId,
+              mergeOpeningIdentity(openingByTurn.get(event.turnId) ?? openingIdentity(), event.openingUserMessageId)
+            );
+          } else if (event.kind === 'turn_identity') {
+            openingByTurn.set(
+              event.turnId,
+              mergeOpeningIdentity(openingByTurn.get(event.turnId) ?? openingIdentity(), event.openingUserMessageId)
+            );
+          }
+          if (event.kind === 'recording_gap' && recordingGapAffectsLifecycle(event)) {
+            if (event.affectedTurnId) {
+              if (scopedDamage.size < MAX_RECOVERY_DAMAGE_TURNS || scopedDamage.has(event.affectedTurnId)) {
+                scopedDamage.add(event.affectedTurnId);
+              } else {
+                scopedDamageOverflow = true;
+              }
+            }
+            else newestUnscopedLifecycleGapSeq = Math.max(newestUnscopedLifecycleGapSeq ?? -Infinity, event.seq);
+          }
+          if (event.kind === 'tool_call') {
+            const call = compactRecoveryMcpCall(event);
+            if (call?.turnId && !mcpByTurn.has(call.turnId)) mcpByTurn.set(call.turnId, call);
+          }
         },
-        () => Boolean(journalHead && lifecycle && checkpointMcpCall)
+        () => false
       );
-      if (damaged > 0) logWarn(`session ${sessionId}: skipped ${damaged} unreadable recovery evidence line(s)`);
-      if (damaged > 0) {
+      if (scan.damaged > 0) logWarn(`session ${sessionId}: skipped ${scan.damaged} unreadable recovery evidence line(s)`);
+      if (scan.damaged > 0 || !scan.reachedStart) {
         // A damaged row could have been newer causal work. Presentation history tolerates losing
-        // one line; authority cannot. Refuse recovery until a fresh turn establishes a new complete
-        // checkpoint rather than guessing across unreadable history.
+        // one line; authority cannot. Exceeding the bounded legacy budget is the same kind of
+        // uncertainty: refuse authority rather than guessing across unseen history.
         journalHead = null;
         lifecycle = null;
         checkpointMcpCall = null;
+      } else {
+        const selectedLifecycle = newestLifecycle as LifecycleEvent | null;
+        if (!selectedLifecycle?.turnId) {
+          lifecycle = null;
+          checkpointMcpCall = null;
+        } else {
+        const selectedTurnId = selectedLifecycle.turnId;
+        const starts = startsByTurn.get(selectedTurnId);
+        if (starts) {
+          const integrity: LineageIntegrity = scopedDamageOverflow || scopedDamage.has(selectedTurnId) ||
+            (newestUnscopedLifecycleGapSeq !== null && newestUnscopedLifecycleGapSeq > starts.oldest.seq)
+            ? 'damaged'
+            : 'intact';
+          lifecycle = {
+            ...compactRecoveryLifecycle(selectedLifecycle),
+            opening: openingByTurn.get(selectedTurnId) ?? openingIdentity(),
+            integrity,
+            logicalStartedAt: starts.oldest.time,
+            segmentStartedAt: starts.newest.time
+          };
+          checkpointMcpCall = integrity === 'intact' ? mcpByTurn.get(selectedTurnId) ?? null : null;
+        } else {
+          // A terminal with no surviving start cannot establish a logical lineage.
+          lifecycle = null;
+          checkpointMcpCall = null;
+        }
+        }
       }
-      // A complete bounded discovery is enough to upgrade a pre-checkpoint active turn. Persist
-      // exactly those already-proven journal facts at EOF; later diagnostic rows can no longer push
-      // them out of reach, while an incomplete scan remains fail-closed and unpersisted.
-      if (journalHead && lifecycle && checkpointMcpCall) {
+      // A complete bounded discovery is enough to upgrade a pre-checkpoint turn even when no MCP
+      // call exists. Persisting the damaged/no-call result is useful too: repeated reads should not
+      // keep rescanning a lineage whose lack of authority is already proven.
+      if (journalHead && lifecycle) {
         const checkpoint: RecoveryJournalCheckpoint = {
-          version: 1,
+          version: 3,
           complete: true,
           offset: entry.journalBytes,
           head: journalHead,
           lifecycle,
-          exactMcpCall: checkpointMcpCall
+          exactMcpCall: checkpointMcpCall,
+          damagedTurnIds: [...scopedDamage],
+          scopedDamagePrecisionLost: scopedDamageOverflow
         };
         try {
           await writeRecoveryCheckpoint(sessionId, checkpoint);
@@ -1855,9 +2209,10 @@ async function scanRecentJournal(
   readBudget: number,
   visit: (event: SessionEvent) => void,
   done: () => boolean
-): Promise<number> {
+): Promise<{ damaged: number; reachedStart: boolean }> {
   const file = path.join(sessionDir(sessionId), 'events.jsonl');
   let damaged = 0;
+  let reachedStart = false;
   let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
   try {
     handle = await fs.open(file, 'r');
@@ -1898,13 +2253,17 @@ async function scanRecentJournal(
       }
       if (!done() && endAt > 0) accept(complete.subarray(0, endAt));
     }
-    if (cursor === 0 && !done() && carry.length > 0) accept(carry);
+    if (cursor === 0) {
+      reachedStart = true;
+      if (!done() && carry.length > 0) accept(carry);
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    reachedStart = true;
   } finally {
     await handle?.close().catch(() => undefined);
   }
-  return damaged;
+  return { damaged, reachedStart };
 }
 
 async function readRecentEventsFromDisk(
@@ -1944,7 +2303,8 @@ async function readRecentEventsFromDisk(
     }
     rawTail.push(parsed);
   };
-  damaged += await scanRecentJournal(sessionId, readBudget, accept, () => rawTail.length >= cap);
+  const scan = await scanRecentJournal(sessionId, readBudget, accept, () => rawTail.length >= cap);
+  damaged += scan.damaged;
 
   const candidates: SessionEvent[] = [...rawTail];
   for (const message of messages.values()) {

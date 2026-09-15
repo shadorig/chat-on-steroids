@@ -51,6 +51,7 @@ describe('browser command ledger', () => {
     expect(await handout).toBe(intent.command);
     expect(ledger.commands).toEqual([intent.command]);
     const durable = await readDurable<DurableCommandSnapshot>(COMMANDS_STATE);
+    expect(durable?.version).toBe(5);
     expect(durable?.commands).toEqual([expect.objectContaining({ id: intent.command.id })]);
   });
 

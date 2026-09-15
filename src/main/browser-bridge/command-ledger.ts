@@ -29,7 +29,7 @@ export type CommandSpec =
       readonly sessionId: string;
       readonly conversationId: string;
       readonly turnId: string;
-      readonly userMessageId?: string;
+      readonly openingUserMessageId: string;
     };
 
 interface MutableCommand {
@@ -66,7 +66,7 @@ export interface DurableCommandRecord {
 }
 
 export interface DurableCommandSnapshot {
-  readonly version: 4;
+  readonly version: 5;
   readonly commands: DurableCommandRecord[];
   readonly receipts: CommandReceipt[];
 }
@@ -112,7 +112,7 @@ function sameCommandGeneration(left: CommandSpec, right: CommandSpec): boolean {
   }
   if (left.type === 'stop' && right.type === 'stop') {
     return left.sessionId === right.sessionId && left.conversationId === right.conversationId &&
-      left.turnId === right.turnId && (left.userMessageId ?? null) === (right.userMessageId ?? null);
+      left.turnId === right.turnId && left.openingUserMessageId === right.openingUserMessageId;
   }
   return false;
 }
@@ -345,7 +345,7 @@ export class BrowserCommandLedger {
       .filter((receipt) => now - receipt.completedAt <= COMMAND_TTL_MS)
       .map((receipt) => ({ ...receipt }));
     if (addReceipt) receipts = [...receipts.filter((receipt) => receipt.id !== addReceipt.id), { ...addReceipt }];
-    return { version: 4, commands: records, receipts: receipts.slice(-MAX_COMMAND_RECEIPTS) };
+    return { version: 5, commands: records, receipts: receipts.slice(-MAX_COMMAND_RECEIPTS) };
   }
 
   /**

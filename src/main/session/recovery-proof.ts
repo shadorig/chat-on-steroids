@@ -31,7 +31,7 @@ export type RecoveryGrant = z.infer<typeof recoveryGrantSchema>;
 
 function evidenceMatchesKind(evidence: TurnRecoveryEvidence, proof: Pick<RecoveryProof, 'kind' | 'turnId'>): boolean {
   const { lifecycle, head } = evidence;
-  if (!lifecycle || lifecycle.turnId !== proof.turnId || !head) return false;
+  if (!lifecycle || lifecycle.turnId !== proof.turnId || lifecycle.integrity !== 'intact' || !head) return false;
   if (proof.kind === 'thinking-failed') {
     return lifecycle.kind === 'turn_end' && lifecycle.outcome === 'failed' &&
       lifecycle.reason === 'thinking_failed' && head.seq === lifecycle.seq &&

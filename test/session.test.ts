@@ -29,6 +29,7 @@ import {
 } from '../src/main/session/recorder.js';
 import {
   appendEvent,
+  appendEventIfAttachedToConversation,
   autoCompactionReady,
   observeSessionModel,
   createSession,
@@ -44,7 +45,8 @@ import {
   pruneSessions,
   readAsset,
   readEvents,
-  readTurnStartContext,
+  readCurrentTurnAuthority,
+  readTurnReconciliationContext,
   readTurnRecoveryEvidence,
   readRecentEvents,
   readHandoff,
@@ -61,6 +63,7 @@ import {
 } from '../src/main/session/store.js';
 import { summarizeToolCall } from '../src/main/session/summarize.js';
 import { HANDOFF_BRIEF_RULES, nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
+import { captureRecoveryProof } from '../src/main/session/recovery-proof.js';
 import {
   CHAT_ACTIVE_MS,
   CHAT_SILENCE_MS,
@@ -73,7 +76,7 @@ import {
   type SessionOrigin,
   type ToolOutcome
 } from '../src/shared/session.js';
-import { makeTempDir, removeTempDir } from './helpers.js';
+import { faultGate, makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;
 
@@ -478,10 +481,195 @@ describe('session store', () => {
       });
     }
 
-    expect(await readTurnStartContext(summary.id, 'target-turn')).toEqual({
-      startedAt: 101,
-      userMessageId: 'target-question'
+    expect(await readTurnReconciliationContext(summary.id, 'target-turn')).toEqual({
+      status: 'found',
+      context: {
+        latestSegmentStartedAt: 101,
+        logicalStartedAt: 101,
+        opening: { status: 'exact', messageId: 'target-question' },
+        integrity: 'intact'
+      }
     });
+  });
+
+  it('keeps the original opening question across an app-authored same-id reopen', async () => {
+    const summary = await createSession({ title: 'reopened turn context' });
+    await appendEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'original-question',
+      message: { text: 'original question', truncated: false, chars: 17 }
+    });
+    await appendEvent(summary.id, {
+      time: 101,
+      source: 'extension',
+      kind: 'turn_start',
+      turnId: 'reopened-turn',
+      openingUserMessageId: 'original-question'
+    });
+    await appendEvent(summary.id, { time: 102, source: 'extension', kind: 'turn_end', turnId: 'reopened-turn', outcome: 'completed' });
+    await appendEvent(summary.id, {
+      time: 103,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'later-question',
+      message: { text: 'later question', truncated: false, chars: 14 }
+    });
+    await appendEvent(summary.id, {
+      time: 104,
+      source: 'app',
+      kind: 'turn_start',
+      turnId: 'reopened-turn',
+      detail: 'same logical turn resumed'
+    });
+
+    expect(await readTurnReconciliationContext(summary.id, 'reopened-turn')).toEqual({
+      status: 'found',
+      context: {
+        latestSegmentStartedAt: 104,
+        logicalStartedAt: 101,
+        opening: { status: 'exact', messageId: 'original-question' },
+        integrity: 'intact'
+      }
+    });
+  });
+
+  it('recovers the original question for a protocol-17 same-id reopen with no explicit opening identity', async () => {
+    const summary = await createSession({ title: 'legacy reopened turn context' });
+    await appendEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'legacy-original-question',
+      message: { text: 'legacy original question', truncated: false, chars: 24 }
+    });
+    await appendEvent(summary.id, {
+      time: 101,
+      source: 'extension',
+      kind: 'turn_start',
+      turnId: 'legacy-reopened-turn'
+    });
+    await appendEvent(summary.id, {
+      time: 102,
+      source: 'extension',
+      kind: 'turn_end',
+      turnId: 'legacy-reopened-turn',
+      outcome: 'completed'
+    });
+    await appendEvent(summary.id, {
+      time: 103,
+      source: 'app',
+      kind: 'turn_start',
+      turnId: 'legacy-reopened-turn',
+      detail: 'legacy same logical turn resumed'
+    });
+
+    expect(await readTurnReconciliationContext(summary.id, 'legacy-reopened-turn')).toEqual({
+      status: 'found',
+      context: {
+        latestSegmentStartedAt: 103,
+        logicalStartedAt: 101,
+        opening: { status: 'exact', messageId: 'legacy-original-question' },
+        integrity: 'intact'
+      }
+    });
+  });
+
+  it('fails closed when durable rows contradict one logical turn opening identity', async () => {
+    const summary = await createSession({ title: 'conflicting turn opening identity' });
+    await appendEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'turn_start',
+      turnId: 'conflicted-turn',
+      openingUserMessageId: 'question-a'
+    });
+    await appendEvent(summary.id, {
+      time: 101,
+      source: 'app',
+      kind: 'turn_start',
+      turnId: 'conflicted-turn',
+      openingUserMessageId: 'question-b',
+      detail: 'synthetic contradictory historical row'
+    });
+
+    expect(await readTurnReconciliationContext(summary.id, 'conflicted-turn')).toMatchObject({
+      status: 'found',
+      context: { opening: { status: 'conflict' } }
+    });
+  });
+
+  it('fails closed when a modern opening contradicts the opening inferred from protocol-17 history', async () => {
+    const summary = await createSession({ title: 'mixed legacy modern opening conflict' });
+    await appendEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'user_message',
+      messageId: 'legacy-question',
+      message: { text: 'legacy question', truncated: false, chars: 15 }
+    });
+    await appendEvent(summary.id, {
+      time: 101,
+      source: 'extension',
+      kind: 'turn_start',
+      turnId: 'mixed-conflict-turn'
+    });
+    await appendEvent(summary.id, {
+      time: 102,
+      source: 'extension',
+      kind: 'turn_end',
+      turnId: 'mixed-conflict-turn',
+      outcome: 'failed'
+    });
+    await appendEvent(summary.id, {
+      time: 103,
+      source: 'app',
+      kind: 'turn_start',
+      turnId: 'mixed-conflict-turn',
+      openingUserMessageId: 'different-question',
+      detail: 'synthetic migration conflict'
+    });
+
+    expect(await readTurnReconciliationContext(summary.id, 'mixed-conflict-turn')).toMatchObject({
+      status: 'found',
+      context: { opening: { status: 'conflict' } }
+    });
+  });
+
+  it('does not let a cached opening regain reopen authority after durable history becomes contradictory', async () => {
+    const conversationId = 'c-conflicted-thinking-reopen';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: 100, messageId: 'question-a', text: 'original question' },
+      { kind: 'turn_start', time: 101, turnId: 'conflicted-reopen', openingUserMessageId: 'question-a' }
+    ]);
+    const sessionId = opened.sessionId!;
+
+    // The live recorder still knows question-a. Inject a contradictory durable row behind its
+    // cache, then let the ordinary page end make that cached turn a reopen candidate.
+    await appendEvent(sessionId, {
+      time: 102,
+      source: 'app',
+      kind: 'turn_start',
+      turnId: 'conflicted-reopen',
+      openingUserMessageId: 'question-b',
+      detail: 'synthetic conflicting durable identity'
+    });
+    await recordChatObservations(conversationId, [
+      { kind: 'turn_end', time: 103, turnId: 'conflicted-reopen', outcome: 'failed', reason: 'thinking_failed' }
+    ]);
+
+    await recordChatObservations(conversationId, [
+      { kind: 'page_tool', time: 104, turnId: 'conflicted-reopen', messageId: 'fresh-after-conflict', text: 'fresh work' }
+    ]);
+
+    expect(await readTurnReconciliationContext(sessionId, 'conflicted-reopen')).toMatchObject({
+      status: 'found',
+      context: { opening: { status: 'conflict' } }
+    });
+    expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurn).toBeNull();
+    const starts = await readEvents(sessionId, { kinds: ['turn_start'] });
+    expect(starts.filter(event => event.source === 'app')).toHaveLength(1);
   });
 
   it('preserves app-staged attachment identity and preview when native metadata observes the same user send', async () => {
@@ -987,7 +1175,7 @@ describe('session store', () => {
       await closeConversation(conversationId);
       await sessionForConversation(conversationId);
       expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
-        generating: false, activeTurnId: null
+        activeTurn: null
       });
     }
     // The older incomplete history is preserved without inventing a terminal for it.
@@ -1004,7 +1192,88 @@ describe('session store', () => {
     await closeConversation(conversationId);
     await sessionForConversation(conversationId);
     expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
-      generating: true, activeTurnId: 'g-current'
+      activeTurn: { id: 'g-current' }
+    });
+  });
+
+  it('reopens the newest failed turn by journal order even when an older turn has a later clock', async () => {
+    const conversationId = 'c-restore-opening-by-seq';
+    const recorded = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: 100, messageId: 'question-a', text: 'older clock-late question' },
+      { kind: 'turn_start', time: 101, turnId: 'turn-a', openingUserMessageId: 'question-a' },
+      { kind: 'turn_end', time: 110, turnId: 'turn-a', outcome: 'failed', reason: 'thinking_failed' },
+      { kind: 'user_message', time: 20, messageId: 'question-b', text: 'newer journal question' },
+      { kind: 'turn_start', time: 21, turnId: 'turn-b', openingUserMessageId: 'question-b' },
+      { kind: 'turn_end', time: 30, turnId: 'turn-b', outcome: 'failed', reason: 'thinking_failed' }
+    ]);
+    const sessionId = recorded.sessionId!;
+    await closeConversation(conversationId);
+    await sessionForConversation(conversationId);
+
+    await recordChatObservations(conversationId, [{
+      kind: 'page_tool',
+      time: 31,
+      turnId: 'turn-b',
+      messageId: 'fresh-b-activity',
+      text: 'Fresh B activity'
+    }]);
+
+    const starts = await readEvents(sessionId, { kinds: ['turn_start'] });
+    expect(starts.at(-1)).toMatchObject({
+      source: 'app',
+      turnId: 'turn-b',
+      openingUserMessageId: 'question-b'
+    });
+  });
+
+  it('resolves a legacy open turn opening question once during recorder restore', async () => {
+    const conversationId = 'c-restore-legacy-opening-question';
+    const recorded = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: 10, messageId: 'legacy-opening-question', text: 'Continue the work.' },
+      // Protocol 17 did not carry openingUserMessageId on turn_start.
+      { kind: 'turn_start', time: 11, turnId: 'g-legacy-open' }
+    ]);
+    expect(recorded.sessionId).toBeTruthy();
+    await closeConversation(conversationId);
+
+    await sessionForConversation(conversationId);
+    expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
+      activeTurn: {
+        id: 'g-legacy-open',
+        opening: { status: 'exact', messageId: 'legacy-opening-question' }
+      }
+    });
+  });
+
+  it('restores the authoritative active turn after its start ages beyond the bounded history cache', async () => {
+    const conversationId = 'c-restore-open-turn-beyond-tail';
+    const recorded = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: 10, messageId: 'deep-opening-question', text: 'Keep this turn open.' },
+      { kind: 'turn_start', time: 11, turnId: 'g-deep-open', openingUserMessageId: 'deep-opening-question' }
+    ]);
+    const sessionId = recorded.sessionId!;
+    await closeConversation(conversationId);
+
+    // storedHistory() intentionally keeps only 4096 selected lifecycle/page-tool rows. These
+    // diagnostic rows push the opening start outside that cache without changing durable
+    // SessionSummary.activeTurnId, which remains the authority on which logical turn is open.
+    for (let index = 0; index < 4097; index++) {
+      await appendEvent(sessionId, {
+        time: 20 + index,
+        source: 'extension',
+        kind: 'page_tool',
+        messageId: `deep-page-tool-${index}`,
+        label: `Progress ${index}`,
+        turnId: 'g-deep-open'
+      });
+    }
+
+    await sessionForConversation(conversationId);
+    expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
+      activeTurn: {
+        id: 'g-deep-open',
+        opening: { status: 'exact', messageId: 'deep-opening-question' }
+      }
     });
   });
 
@@ -1362,6 +1631,272 @@ describe('session store', () => {
     }
   });
 
+  it('folds late turn identity into a bounded pre-checkpoint recovery upgrade', async () => {
+    const conversationId = 'recovery-precheckpoint-identity';
+    const turnId = 'precheckpoint-identity-turn';
+    const summary = await createSession({ title: 'Pre-checkpoint identity', conversationId });
+    await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId });
+    await appendEvent(summary.id, {
+      time: 2,
+      source: 'mcp',
+      kind: 'tool_call',
+      turnId,
+      call: {
+        callId: 'precheckpoint-identity-call', tool: 'read', attribution: 'request_id',
+        requestId: 'wfr-precheckpoint-identity', conversationId, attributionMethod: 'request_id',
+        args: { text: '{}', truncated: false, chars: 2 }, result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok', durationMs: 1, summary: { title: 'Read', tone: 'neutral', kind: 'read' }
+      }
+    });
+    await appendEvent(summary.id, {
+      time: 3, source: 'extension', kind: 'turn_identity', turnId, openingUserMessageId: 'precheckpoint-question'
+    });
+    await flushSessions();
+    resetSessionStoreForTests();
+    await fs.rm(path.join(sessionsRoot(), summary.id, 'recovery.json'), { force: true });
+
+    const evidence = await readTurnRecoveryEvidence(summary.id, conversationId, turnId);
+    expect(evidence?.lifecycle).toMatchObject({
+      kind: 'turn_start', turnId, opening: { status: 'exact', messageId: 'precheckpoint-question' }, integrity: 'intact'
+    });
+    expect(await readCurrentTurnAuthority(summary.id, turnId)).toEqual({
+      status: 'found',
+      context: {
+        latestSegmentStartedAt: 1,
+        logicalStartedAt: 1,
+        opening: { status: 'exact', messageId: 'precheckpoint-question' },
+        integrity: 'intact'
+      }
+    });
+  });
+
+  it('keeps an unrelated scoped lifecycle gap out of a pre-checkpoint turn authority', async () => {
+    const conversationId = 'recovery-precheckpoint-scoped-gap';
+    const turnId = 'precheckpoint-gap-turn';
+    const summary = await createSession({ title: 'Pre-checkpoint scoped gap', conversationId });
+    await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'precheckpoint-gap-question'
+    });
+    await appendEvent(summary.id, {
+      time: 2,
+      source: 'mcp',
+      kind: 'tool_call',
+      turnId,
+      call: {
+        callId: 'precheckpoint-gap-call', tool: 'read', attribution: 'request_id', requestId: 'wfr-precheckpoint-gap',
+        conversationId, attributionMethod: 'request_id', args: { text: '{}', truncated: false, chars: 2 },
+        result: { text: 'ok', truncated: false, chars: 2 }, outcome: 'ok', durationMs: 1,
+        summary: { title: 'Read', tone: 'neutral', kind: 'read' }
+      }
+    });
+    await appendEvent(summary.id, {
+      time: 3, source: 'extension', kind: 'recording_gap', reason: 'worker_journal_overflow',
+      affectedTurnId: 'different-turn', lostKinds: { turn_end: 1 }
+    });
+    await flushSessions();
+    resetSessionStoreForTests();
+    await fs.rm(path.join(sessionsRoot(), summary.id, 'recovery.json'), { force: true });
+
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, turnId))?.lifecycle).toMatchObject({
+      kind: 'turn_start', turnId, integrity: 'intact', opening: { status: 'exact', messageId: 'precheckpoint-gap-question' }
+    });
+  });
+
+  it('keeps a source-turn lifecycle gap explicitly damaged during bounded pre-checkpoint recovery', async () => {
+    const conversationId = 'recovery-precheckpoint-damaged-gap';
+    const turnId = 'precheckpoint-damaged-turn';
+    const summary = await createSession({ title: 'Pre-checkpoint damaged gap', conversationId });
+    await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'precheckpoint-damaged-question'
+    });
+    await appendEvent(summary.id, {
+      time: 2,
+      source: 'mcp',
+      kind: 'tool_call',
+      turnId,
+      call: {
+        callId: 'precheckpoint-damaged-call', tool: 'read', attribution: 'request_id', requestId: 'wfr-precheckpoint-damaged',
+        conversationId, attributionMethod: 'request_id', args: { text: '{}', truncated: false, chars: 2 },
+        result: { text: 'ok', truncated: false, chars: 2 }, outcome: 'ok', durationMs: 1,
+        summary: { title: 'Read', tone: 'neutral', kind: 'read' }
+      }
+    });
+    await appendEvent(summary.id, {
+      time: 3, source: 'extension', kind: 'recording_gap', reason: 'worker_journal_overflow',
+      affectedTurnId: turnId, lostKinds: { turn_end: 1 }
+    });
+    await flushSessions();
+    resetSessionStoreForTests();
+    await fs.rm(path.join(sessionsRoot(), summary.id, 'recovery.json'), { force: true });
+
+    const evidence = await readTurnRecoveryEvidence(summary.id, conversationId, turnId);
+    expect(evidence?.lifecycle).toMatchObject({ kind: 'turn_start', turnId, integrity: 'damaged' });
+    expect(evidence?.exactMcpCall).toBeNull();
+    expect(await readCurrentTurnAuthority(summary.id, turnId)).toEqual({ status: 'damaged' });
+  });
+
+  it('does not stop a bounded legacy recovery scan before an older source-turn gap', async () => {
+    const conversationId = 'recovery-precheckpoint-terminal-gap';
+    const turnId = 'precheckpoint-terminal-gap-turn';
+    const summary = await createSession({ title: 'Pre-checkpoint terminal gap', conversationId });
+    await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'terminal-gap-question'
+    });
+    await appendEvent(summary.id, {
+      time: 2,
+      source: 'extension',
+      kind: 'recording_gap',
+      reason: 'worker_journal_overflow',
+      affectedTurnId: turnId,
+      lostKinds: { turn_end: 1 }
+    });
+    await appendEvent(summary.id, {
+      time: 3,
+      source: 'mcp',
+      kind: 'tool_call',
+      turnId,
+      call: {
+        callId: 'precheckpoint-terminal-gap-call', tool: 'read', attribution: 'request_id',
+        requestId: 'wfr-precheckpoint-terminal-gap', conversationId, attributionMethod: 'request_id',
+        model: 'gpt-5.6-sol', reasoningEffort: 'high',
+        args: { text: '{}', truncated: false, chars: 2 }, result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok', durationMs: 1, summary: { title: 'Read', tone: 'neutral', kind: 'read' }
+      }
+    });
+    await appendEvent(summary.id, {
+      time: 4, source: 'extension', kind: 'turn_end', turnId, outcome: 'failed', reason: 'thinking_failed'
+    });
+    await flushSessions();
+    resetSessionStoreForTests();
+    await fs.rm(path.join(sessionsRoot(), summary.id, 'recovery.json'), { force: true });
+
+    const evidence = await readTurnRecoveryEvidence(summary.id, conversationId, turnId);
+    expect(evidence?.lifecycle).toMatchObject({
+      kind: 'turn_end', turnId, outcome: 'failed', reason: 'thinking_failed', integrity: 'damaged'
+    });
+    expect(evidence?.exactMcpCall).toBeNull();
+    expect(await captureRecoveryProof({
+      sessionId: summary.id,
+      conversationId,
+      turnId,
+      kind: 'thinking-failed'
+    })).toBeNull();
+  });
+
+  it('keeps checkpoint lineage damage monotonic across a same-id corrective reopen', async () => {
+    const conversationId = 'recovery-checkpoint-damaged-reopen';
+    const turnId = 'checkpoint-damaged-reopen-turn';
+    const summary = await createSession({ title: 'Checkpoint damaged reopen', conversationId });
+    await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'checkpoint-question'
+    });
+    await appendEvent(summary.id, {
+      time: 2, source: 'extension', kind: 'recording_gap', reason: 'worker_journal_overflow',
+      affectedTurnId: turnId, lostKinds: { turn_end: 1 }
+    });
+    await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId, outcome: 'failed' });
+    await appendEvent(summary.id, {
+      time: 4, source: 'app', kind: 'turn_start', turnId,
+      openingUserMessageId: 'checkpoint-question', detail: 'corrective reopen'
+    });
+
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, turnId))?.lifecycle).toMatchObject({
+      kind: 'turn_start', turnId, integrity: 'damaged', opening: { status: 'exact', messageId: 'checkpoint-question' }
+    });
+    expect(await readCurrentTurnAuthority(summary.id, turnId)).toEqual({ status: 'damaged' });
+  });
+
+  it('retains earlier checkpoint damage after a different turn is damaged later', async () => {
+    const conversationId = 'recovery-checkpoint-multiple-damaged-turns';
+    const summary = await createSession({ title: 'Checkpoint multiple damaged turns', conversationId });
+    await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId: 'damaged-a', openingUserMessageId: 'question-a'
+    });
+    await appendEvent(summary.id, {
+      time: 2, source: 'extension', kind: 'recording_gap', reason: 'worker_journal_overflow',
+      affectedTurnId: 'damaged-a', lostKinds: { turn_end: 1 }
+    });
+    await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: 'damaged-a', outcome: 'failed' });
+    await appendEvent(summary.id, {
+      time: 4, source: 'extension', kind: 'turn_start', turnId: 'damaged-b', openingUserMessageId: 'question-b'
+    });
+    await appendEvent(summary.id, {
+      time: 5, source: 'extension', kind: 'recording_gap', reason: 'worker_journal_overflow',
+      affectedTurnId: 'damaged-b', lostKinds: { turn_end: 1 }
+    });
+    await appendEvent(summary.id, { time: 6, source: 'extension', kind: 'turn_end', turnId: 'damaged-b', outcome: 'failed' });
+    await appendEvent(summary.id, {
+      time: 7, source: 'app', kind: 'turn_start', turnId: 'damaged-a',
+      openingUserMessageId: 'question-a', detail: 'corrective reopen'
+    });
+
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, 'damaged-a'))?.lifecycle).toMatchObject({
+      kind: 'turn_start', turnId: 'damaged-a', integrity: 'damaged'
+    });
+    expect(await readCurrentTurnAuthority(summary.id, 'damaged-a')).toEqual({ status: 'damaged' });
+  });
+
+  it('keeps the bounded recovery checkpoint fail-closed after exact scoped-damage precision overflows', async () => {
+    const summary = await createSession({ title: 'Recovery damage precision overflow' });
+    for (let index = 0; index <= 256; index++) {
+      await appendEvent(summary.id, {
+        time: index + 1,
+        source: 'extension',
+        kind: 'recording_gap',
+        reason: 'worker_journal_overflow',
+        affectedTurnId: `damaged-${index}`,
+        lostKinds: { turn_start: 1 }
+      });
+    }
+
+    await appendEvent(summary.id, {
+      time: 300,
+      source: 'extension',
+      kind: 'turn_start',
+      turnId: 'clean-after-overflow',
+      openingUserMessageId: 'clean-question'
+    });
+    expect(await readCurrentTurnAuthority(summary.id, 'clean-after-overflow')).toEqual({ status: 'damaged' });
+
+    await appendEvent(summary.id, {
+      time: 301,
+      source: 'extension',
+      kind: 'turn_end',
+      turnId: 'clean-after-overflow',
+      outcome: 'completed'
+    });
+    await appendEvent(summary.id, {
+      time: 302,
+      source: 'extension',
+      kind: 'turn_start',
+      turnId: 'later-clean-turn',
+      openingUserMessageId: 'later-clean-question'
+    });
+    expect(await readCurrentTurnAuthority(summary.id, 'later-clean-turn')).toEqual({ status: 'damaged' });
+
+    await flushSessions();
+    resetSessionStoreForTests();
+    expect(await readCurrentTurnAuthority(summary.id, 'later-clean-turn')).toEqual({ status: 'damaged' });
+    expect(JSON.parse(await fs.readFile(path.join(sessionsRoot(), summary.id, 'recovery.json'), 'utf8'))).toMatchObject({
+      version: 3,
+      scopedDamagePrecisionLost: true
+    });
+  });
+
+  it('lets an explicitly scoped gap damage its turn even when bad historical ordering puts the marker first', async () => {
+    const turnId = 'scoped-gap-before-start';
+    const summary = await createSession({ title: 'Scoped gap chronology' });
+    await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'recording_gap', reason: 'worker_journal_overflow',
+      affectedTurnId: turnId, lostKinds: { turn_start: 1 }
+    });
+    await appendEvent(summary.id, {
+      time: 2, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'scoped-gap-question'
+    });
+
+    expect(await readTurnReconciliationContext(summary.id, turnId)).toEqual({ status: 'damaged' });
+  });
+
   it('reports exact MCP work only when this conversation and turn have request-attributed execution evidence', async () => {
     const conversationId = 'exact-mcp-evidence';
     const turnId = 'exact-mcp-turn';
@@ -1418,6 +1953,186 @@ describe('session store', () => {
       lifecycle: null,
       exactMcpCall: null
     });
+  });
+
+  it('rejects malformed current recovery integrity instead of upgrading it to intact', async () => {
+    const conversationId = 'recovery-checkpoint-integrity';
+    const turnId = 'recovery-checkpoint-integrity-turn';
+    const summary = await createSession({ title: 'Recovery checkpoint integrity', conversationId });
+    const start = await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'real-checkpoint-question'
+    });
+    await flushSessions();
+
+    const checkpointPath = path.join(sessionsRoot(), summary.id, 'recovery.json');
+    const journalBytes = (await fs.stat(path.join(sessionsRoot(), summary.id, 'events.jsonl'))).size;
+    const forged = {
+      version: 3,
+      complete: true,
+      offset: journalBytes,
+      head: { seq: start.seq, kind: 'turn_start', turnId },
+      lifecycle: {
+        seq: start.seq,
+        time: start.time,
+        kind: 'turn_start',
+        turnId,
+        opening: { status: 'exact', messageId: 'forged-checkpoint-question' },
+        integrity: 'banana',
+        logicalStartedAt: start.time,
+        segmentStartedAt: start.time
+      },
+      exactMcpCall: null,
+      damagedTurnIds: [],
+      scopedDamagePrecisionLost: false
+    };
+    await fs.writeFile(checkpointPath, JSON.stringify(forged), 'utf8');
+    resetSessionStoreForTests();
+
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, turnId))?.lifecycle).toMatchObject({
+      kind: 'turn_start',
+      turnId,
+      integrity: 'intact',
+      opening: { status: 'exact', messageId: 'real-checkpoint-question' }
+    });
+    expect(JSON.parse(await fs.readFile(checkpointPath, 'utf8'))).toMatchObject({
+      version: 3,
+      lifecycle: { integrity: 'intact', opening: { status: 'exact', messageId: 'real-checkpoint-question' } }
+    });
+  });
+
+  it('normalizes contradictory v3 recovery authority toward damage', async () => {
+    const conversationId = 'recovery-checkpoint-contradictory-damage';
+    const turnId = 'recovery-checkpoint-contradictory-turn';
+    const summary = await createSession({ title: 'Recovery checkpoint contradictory damage', conversationId });
+    const start = await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'checkpoint-question'
+    });
+    await flushSessions();
+
+    const checkpointPath = path.join(sessionsRoot(), summary.id, 'recovery.json');
+    const journalBytes = (await fs.stat(path.join(sessionsRoot(), summary.id, 'events.jsonl'))).size;
+    await fs.writeFile(checkpointPath, JSON.stringify({
+      version: 3,
+      complete: true,
+      offset: journalBytes,
+      head: { seq: start.seq, kind: 'turn_start', turnId },
+      lifecycle: {
+        seq: start.seq,
+        time: start.time,
+        kind: 'turn_start',
+        turnId,
+        opening: { status: 'exact', messageId: 'checkpoint-question' },
+        integrity: 'intact',
+        logicalStartedAt: start.time,
+        segmentStartedAt: start.time
+      },
+      exactMcpCall: {
+        seq: start.seq,
+        time: start.time,
+        turnId,
+        call: { conversationId, attribution: 'request_id' }
+      },
+      damagedTurnIds: [turnId],
+      scopedDamagePrecisionLost: false
+    }), 'utf8');
+    resetSessionStoreForTests();
+
+    const evidence = await readTurnRecoveryEvidence(summary.id, conversationId, turnId);
+    expect(evidence?.lifecycle).toMatchObject({ kind: 'turn_start', turnId, integrity: 'damaged' });
+    expect(evidence?.exactMcpCall).toBeNull();
+    expect(await readCurrentTurnAuthority(summary.id, turnId)).toEqual({ status: 'damaged' });
+  });
+
+  it('rebuilds obsolete recovery checkpoint versions from the journal instead of trusting old authority', async () => {
+    const conversationId = 'recovery-checkpoint-v2-rebuild';
+    const turnId = 'recovery-checkpoint-v2-turn';
+    const summary = await createSession({ title: 'Recovery checkpoint v2 rebuild', conversationId });
+    const start = await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'journal-question'
+    });
+    await flushSessions();
+
+    const checkpointPath = path.join(sessionsRoot(), summary.id, 'recovery.json');
+    const journalBytes = (await fs.stat(path.join(sessionsRoot(), summary.id, 'events.jsonl'))).size;
+    const obsolete = {
+      version: 2,
+      complete: true,
+      offset: journalBytes,
+      head: { seq: start.seq, kind: 'turn_start', turnId },
+      lifecycle: {
+        seq: start.seq,
+        time: start.time,
+        kind: 'turn_start',
+        turnId,
+        opening: { status: 'exact', messageId: 'obsolete-cache-question' },
+        integrity: 'intact',
+        logicalStartedAt: start.time,
+        segmentStartedAt: start.time
+      },
+      exactMcpCall: null
+    };
+    await fs.writeFile(checkpointPath, JSON.stringify(obsolete), 'utf8');
+    resetSessionStoreForTests();
+
+    expect((await readTurnRecoveryEvidence(summary.id, conversationId, turnId))?.lifecycle).toMatchObject({
+      opening: { status: 'exact', messageId: 'journal-question' }
+    });
+    expect(JSON.parse(await fs.readFile(checkpointPath, 'utf8')).version).toBe(3);
+  });
+
+  it('keeps current-turn fallback reconstruction in the same serialized session operation', async () => {
+    const conversationId = 'current-turn-authority-race';
+    const turnId = 'current-turn-authority-race-turn';
+    const summary = await createSession({ title: 'Current authority race', conversationId });
+    await appendEvent(summary.id, {
+      time: 1, source: 'extension', kind: 'turn_start', turnId, openingUserMessageId: 'authority-race-question'
+    });
+    await flushSessions();
+    resetSessionStoreForTests();
+    await fs.rm(path.join(sessionsRoot(), summary.id, 'recovery.json'), { force: true });
+    // Open the session with an intentionally incomplete recovery cache. Notes do not establish a
+    // new recovery boundary, so the authority read below must take the full lineage fallback.
+    await appendEvent(summary.id, {
+      time: 2, source: 'app', kind: 'note', message: { text: 'open incomplete cache', truncated: false, chars: 21 }
+    });
+
+    const gate = faultGate();
+    const realAppend = fs.appendFile.bind(fs);
+    const appendSpy = vi.spyOn(fs, 'appendFile').mockImplementationOnce(async (...args) => {
+      await gate.hold();
+      return realAppend(...args);
+    });
+    const blocker = appendEvent(summary.id, {
+      time: 3, source: 'app', kind: 'note', message: { text: 'serialize authority', truncated: false, chars: 19 }
+    });
+    await gate.entered;
+    const order: string[] = [];
+    const authority = readCurrentTurnAuthority(summary.id, turnId).then(value => {
+      order.push('authority');
+      return value;
+    });
+    // Let readCurrentTurnAuthority enqueue behind the blocker before the terminal write.
+    await Promise.resolve();
+    const end = appendEvent(summary.id, {
+      time: 4, source: 'extension', kind: 'turn_end', turnId, outcome: 'failed'
+    }).then(value => {
+      order.push('end');
+      return value;
+    });
+
+    try {
+      gate.release();
+      const [read] = await Promise.all([authority, end, blocker]);
+      expect(order).toEqual(['authority', 'end']);
+      expect(read).toMatchObject({
+        status: 'found',
+        context: { opening: { status: 'exact', messageId: 'authority-race-question' }, integrity: 'intact' }
+      });
+      expect((await getSession(summary.id))?.activeTurnId).toBeNull();
+    } finally {
+      gate.release();
+      appendSpy.mockRestore();
+    }
   });
 
   it('keeps causal recovery evidence discoverable across restart after more than one suffix budget of diagnostic rows', async () => {
@@ -2017,6 +2732,27 @@ describe('handoff storage', () => {
 // ---------------------------------------------------------------- recorder
 
 describe('canonical recorder 1.8', () => {
+  it('rejects a source-chat append that reaches the session lane after a rebind', async () => {
+    const source = 'conv-guarded-append-source';
+    const destination = 'conv-guarded-append-destination';
+    const sessionId = await sessionForConversation(source);
+    const move = rebindSession(sessionId!, source, destination);
+    await Promise.resolve();
+    const stale = appendEventIfAttachedToConversation(sessionId!, source, {
+      source: 'app',
+      time: Date.now(),
+      kind: 'turn_start',
+      turnId: 'stale-source-turn',
+      openingUserMessageId: 'stale-source-question'
+    });
+
+    expect(await move).toBe(true);
+    expect(await stale).toBeNull();
+    expect((await getSession(sessionId!))?.conversationId).toBe(destination);
+    expect((await getSession(sessionId!))?.activeTurnId).toBeNull();
+    expect(await readEvents(sessionId!, { kinds: ['turn_start'] })).toEqual([]);
+  });
+
   it('counts a full tool result after rebind while keeping its recorder preview bounded', async () => {
     const config = defaultConfig();
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 10000 } });
@@ -2173,7 +2909,8 @@ describe('canonical recorder 1.8', () => {
     const conversationId = 'conv-thinking-failed-native-final';
     const turnId = 'g-thinking-failed-native-final';
     const first = await recordChatObservations(conversationId, [
-      { kind: 'turn_start', time: 100, turnId },
+      { kind: 'user_message', time: 90, messageId: 'thinking-failed-opening', text: 'Finish the answer.' },
+      { kind: 'turn_start', time: 100, turnId, openingUserMessageId: 'thinking-failed-opening' },
       { kind: 'turn_end', time: 200, turnId, outcome: 'failed', reason: 'thinking_failed' }
     ]);
 
@@ -2194,7 +2931,7 @@ describe('canonical recorder 1.8', () => {
     ]);
     expect(lifecycle[2]?.kind === 'turn_start' && lifecycle[2].detail).toContain('fresh work resumed');
     expect(lifecycle[3]?.kind === 'turn_end' && lifecycle[3].detail).toContain('failed view was superseded');
-    expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurnId).toBeNull();
+    expect(liveConversations().find(row => row.conversationId === conversationId)?.activeTurn).toBeNull();
   });
 
   it('deduplicates replayed turn lifecycle boundaries from the at-least-once browser journal', async () => {
@@ -2343,9 +3080,10 @@ describe('canonical recorder 1.8', () => {
     const conversationId = 'conv-false-turn-end';
     const sessionId = await sessionForConversation(conversationId);
     const now = Date.now();
-    const active = () => liveConversations().find((entry) => entry.conversationId === conversationId)?.activeTurnId ?? null;
+    const active = () => liveConversations().find((entry) => entry.conversationId === conversationId)?.activeTurn?.id ?? null;
     await recordChatObservations(conversationId, [
-      { kind: 'turn_start', time: now, turnId: 'g-false-end' },
+      { kind: 'user_message', time: now - 1, messageId: 'false-end-question', text: 'Keep working.' },
+      { kind: 'turn_start', time: now, turnId: 'g-false-end', openingUserMessageId: 'false-end-question' },
       {
         kind: 'tool_evidence', time: now, fiberConversationId: conversationId,
         calls: [
@@ -2378,6 +3116,7 @@ describe('canonical recorder 1.8', () => {
       ['g-false-end', 'app']
     ]);
     expect(starts[1]?.kind === 'turn_start' && starts[1].detail).toMatch(/kept calling tools/);
+    expect(starts.every(event => event.kind === 'turn_start' && event.openingUserMessageId === 'false-end-question')).toBe(true);
     const causal = await readEvents(sessionId!, { kinds: ['turn_start', 'turn_end', 'tool_call'] });
     const correctiveStart = causal.find(event => event.kind === 'turn_start' && event.source === 'app' && event.turnId === 'g-false-end');
     const lateCall = causal.find(event => event.kind === 'tool_call' && event.call.requestId === 'wfr_same_turn' && event.time === now + 40);

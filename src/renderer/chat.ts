@@ -767,6 +767,7 @@ let controlledSessionId: string | null = null;
 let controlledTurnId: string | null = null;
 let controlledSelection = -1;
 let controlledStopPending = false;
+let controlledCanStop = false;
 let controlledFinishWaiting = false;
 let controlledQueueAtFinish = false;
 let controlledCanInject = false;
@@ -869,7 +870,8 @@ function paintDeliveryControls(): void {
   $('deliveryNote').hidden = !(optimizedImages && decision.visibleMode === 'auto');
   if (!canInject && !canSendDirectly && !queueAtFinish) $<HTMLSelectElement>('sendMode').value = 'auto';
   const pending = pendingComposerInput();
-  const stop = (working || !!pending) && !currentPreparedPlan() && !$<HTMLTextAreaElement>('chatInput').value.trim() && !(imageDrafts.get(draftKey())?.length);
+  const stop = ((working && controlledCanStop) || !!pending) && !currentPreparedPlan() &&
+    !$<HTMLTextAreaElement>('chatInput').value.trim() && !(imageDrafts.get(draftKey())?.length);
   // Hover selects delivery for the next message. Clicking the empty-composer
   // Stop still acts immediately; there is no second Stop action in the menu.
   $('sendOptions').hidden = !canInject && !canSendDirectly && !queueAtFinish;
@@ -1118,7 +1120,7 @@ async function refreshSessionControls(): Promise<void> {
     for (const action of ['compactSession', 'cancelCompaction']) $(action).hidden = true;
   }
   paintAutomationSwitch();
-  if (!id) { controlledSessionId = null; controlledTurnId = null; paintDeliveryControls(); menu.hidden = false;
+  if (!id) { controlledSessionId = null; controlledTurnId = null; controlledCanStop = false; paintDeliveryControls(); menu.hidden = false;
     $<HTMLTextAreaElement>('sessionObjective').disabled = false;
     paintTaskActions();
     for (const action of ['compactSession', 'cancelCompaction']) $(action).hidden = true;
@@ -1132,6 +1134,7 @@ async function refreshSessionControls(): Promise<void> {
   goalDraftView = controls?.goalDraft ?? null;
   finishGoalDraftView = controls?.finishGoalDraft ?? null;
   controlledStopPending = controls?.stopPending === true;
+  controlledCanStop = controls?.canStop === true;
   controlledFinishWaiting = controls?.finishWaiting === true;
   controlledQueueAtFinish = controls?.queueAtFinish === true;
   controlledCanInject = controls?.canInject ?? controlledTurnId !== null;
@@ -1667,12 +1670,19 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
     }
     case 'turn_start':
       return el('p', 'meta', () => event.detail ? t("Turn reopened — {0}", [event.detail]) : t("Turn started"));
+    case 'turn_identity':
+      return el('p', 'meta', t("Turn opening identity recorded"));
     case 'turn_end': {
       const line = el(
         'p',
         event.outcome === 'completed' ? 'meta' : 'meta is-warn',
         () => t("Turn {0}{1}", [t(TURN_OUTCOME_LABELS[event.outcome]), event.detail ? ` — ${event.detail}` : ''])
       );
+      return line;
+    }
+    case 'recording_gap': {
+      const line = el('p', 'meta is-warn', () => t("Part of this browser recording is incomplete."));
+      if (event.detail) line.title = event.detail;
       return line;
     }
     case 'chat_error': {
@@ -2251,9 +2261,11 @@ function paintDetail(followBottom = true): void {
       recoveryStatus.hidden = true; recoveryStatus.replaceChildren();
     }));
   for (const item of timelineItems(shown)) {
-    if (item.kind === 'compaction' || !['tool_call', 'page_tool', 'agent_message'].includes(item.event.kind)) activityBoundary = itemKey(item);
+    if (item.kind === 'compaction' || (item.event.kind !== 'turn_identity' &&
+        !['tool_call', 'page_tool', 'agent_message'].includes(item.event.kind))) activityBoundary = itemKey(item);
     if (!deps.state()?.config.ui.developerMode && item.kind === 'event' && item.event.source === 'app' && item.event.kind === 'progress' && item.event.progressId?.startsWith('browser-repair:')) continue;
-    if (!deps.state()?.config.ui.developerMode && item.kind === 'event' && ['session_start', 'session_end', 'turn_start', 'turn_end', 'note'].includes(item.event.kind)) continue;
+    if (!deps.state()?.config.ui.developerMode && item.kind === 'event' &&
+        ['session_start', 'session_end', 'turn_start', 'turn_identity', 'turn_end', 'note'].includes(item.event.kind)) continue;
     const key = itemKey(item);
     const sig = itemSignature(item) + (item.kind === 'event' && item.event.kind === 'chat_error'
       ? JSON.stringify(chatErrorPresentation(item.event, errorResolutions.get(item.event.seq))) : '');
@@ -3271,7 +3283,8 @@ async function retryPlannedInput(entry: InputEntry): Promise<void> {
 }
 async function stopCurrentTurn(): Promise<void> {
   const id = selectedId, turnId = controlledTurnId, generation = selectionGeneration;
-  if (!id || controlledSessionId !== id || controlledSelection !== generation || !turnId || controlledStopPending) return;
+  if (!id || controlledSessionId !== id || controlledSelection !== generation || !turnId ||
+      !controlledCanStop || controlledStopPending) return;
   controlledStopPending = true; paintDeliveryControls();
   try { await run(api.stopSessionTurn(id, turnId)); }
   finally { if (selectedId === id && selectionGeneration === generation) { controlledStopPending = false; void refreshSessionControls(); } }

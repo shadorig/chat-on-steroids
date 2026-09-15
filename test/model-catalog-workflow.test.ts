@@ -40,7 +40,7 @@ it.each([false, true])('holds cold discovery until composer hydration without a 
     generating: false, desktopInputBusy: false, modelCatalogBusy: false,
     location: { pathname: '/', href: `https://chatgpt.com/?cos-model-catalog=${nonce}` }, ask,
     CLF_DOM: { prepareChatModelSurface: async () => true, composerVisible: () => !!dom.window.document.querySelector('textarea'), composer: () => dom.window.document.querySelector('textarea'), generating: () => false,
-      turns: () => [], hasComposerAttachments: () => false, clearPromptExact: clear, inspectModelSettings: async () => [{ id: 'observed', label: 'Observed', efforts: ['high'] }] }
+      transcriptGroups: () => [], hasComposerAttachments: () => false, clearPromptExact: clear, inspectModelSettings: async () => [{ id: 'observed', label: 'Observed', efforts: ['high'] }] }
   });
   const wait = source.slice(source.indexOf('  function waitPageView('), source.indexOf('  async function refreshManagedPlugin('));
   vm.runInContext(`${wait}\n${section}\nglobalThis.run = inspectAppModelCatalog;`, context);
@@ -63,7 +63,7 @@ function fixture(text = '', changed = false, conversationId: string | null = nul
   const inspect = vi.fn(async (current: () => boolean) => { if (changed) composer.textContent = 'new user text'; return current() ? [{ id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol', efforts: ['high'] }] : null; });
   const context = vm.createContext({ URL, Date, alive: true, epoch: 1, conversationId, generating: false, desktopInputBusy: false, modelCatalogBusy: false,
     location: { pathname: '/', href: `https://chatgpt.com/?cos-model-catalog=${nonce}` }, ask,
-    CLF_DOM: { prepareChatModelSurface: async () => true, composerVisible: () => true, composer: () => composer, generating: () => false, turns: () => [], hasComposerAttachments: () => false, clearPromptExact: clear, inspectModelSettings: inspect } });
+    CLF_DOM: { prepareChatModelSurface: async () => true, composerVisible: () => true, composer: () => composer, generating: () => false, transcriptGroups: () => [], hasComposerAttachments: () => false, clearPromptExact: clear, inspectModelSettings: inspect } });
   vm.runInContext(`${section}\nglobalThis.run = inspectAppModelCatalog;`, context);
   return { composer, ask, clear, inspect, run: (allowPrepare = false) => (context.run as Function)({ nonce, expiresAt: Date.now() + 10000, allowPrepare }) };
 }
@@ -93,7 +93,7 @@ it.each(['generating', 'draft', 'attachment'])('defers catalog discovery on a %s
   const ask = vi.fn(async () => ({ ok: true })), prepare = vi.fn(), inspect = vi.fn(), clear = vi.fn();
   const context = vm.createContext({ URL, Date, alive: true, epoch: 1, conversationId: 'existing-chat', generating: busy === 'generating',
     desktopInputBusy: false, modelCatalogBusy: false, location: { pathname: '/c/existing-chat', href: 'https://chatgpt.com/c/existing-chat' }, ask,
-    CLF_DOM: { composerVisible: () => true, composer: () => composer, generating: () => busy === 'generating', hasComposerAttachments: () => busy === 'attachment',
+    CLF_DOM: { composerVisible: () => true, composer: () => composer, generating: () => busy === 'generating', transcriptGroups: () => [], hasComposerAttachments: () => busy === 'attachment',
       prepareChatModelSurface: prepare, inspectModelSettings: inspect, clearPromptExact: clear }
   });
   vm.runInContext(`${section}\nglobalThis.run = inspectAppModelCatalog;`, context);
@@ -109,7 +109,7 @@ it('abstains instead of failing the account catalog when a busy tab has only par
   const ask = vi.fn(async () => ({ ok: true })), prepare = vi.fn(), inspect = vi.fn(), clear = vi.fn();
   const context = vm.createContext({ URL, Date, alive: true, epoch: 1, conversationId: 'existing-chat', generating: true,
     desktopInputBusy: false, modelCatalogBusy: false, location: { pathname: '/c/existing-chat', href: 'https://chatgpt.com/c/existing-chat' }, ask,
-    CLF_DOM: { composerVisible: () => true, composer: () => composer, generating: () => true, hasComposerAttachments: () => false,
+    CLF_DOM: { composerVisible: () => true, composer: () => composer, generating: () => true, transcriptGroups: () => [], hasComposerAttachments: () => false,
       prepareChatModelSurface: prepare, inspectModelSettings: inspect, clearPromptExact: clear }
   });
   vm.runInContext(`${section}\nglobalThis.run = inspectAppModelCatalog;`, context);
@@ -126,7 +126,7 @@ it('binds discovery to the Chat composer after Work replaces its composer', asyn
   });
   const context = vm.createContext({ URL, Date, alive: true, epoch: 1, conversationId: null, generating: false, desktopInputBusy: false, modelCatalogBusy: false,
     location: { pathname: '/', href: 'https://chatgpt.com/' }, ask,
-    CLF_DOM: { prepareChatModelSurface: prepare, composerVisible: () => true, composer: () => composer, generating: () => false, turns: () => [], hasComposerAttachments: () => false,
+    CLF_DOM: { prepareChatModelSurface: prepare, composerVisible: () => true, composer: () => composer, generating: () => false, transcriptGroups: () => [], hasComposerAttachments: () => false,
       inspectModelSettings: async (current: () => boolean) => { expect(composer).not.toBe(old); expect(current()).toBe(true); return [{ id: 'observed', label: 'Observed', efforts: ['high'] }]; } }
   });
   vm.runInContext(`${section}\nglobalThis.run = inspectAppModelCatalog;`, context);
